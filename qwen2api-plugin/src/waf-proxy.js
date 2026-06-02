@@ -18,7 +18,7 @@ const puppeteer = require("puppeteer");
 
 const PORT = parseInt(process.env.WAF_PROXY_PORT || "3457");
 const TARGET = process.env.WAF_TARGET || "https://chat.qwen.ai";
-const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome";
+const CHROME_PATH = process.env.CHROME_PATH;
 const REFRESH_MS = parseInt(process.env.WAF_COOKIE_REFRESH || "300000"); // 5min
 const RESTART_MS = parseInt(process.env.WAF_BROWSER_RESTART || "1800000"); // 30min
 const STREAM_TIMEOUT = parseInt(process.env.WAF_STREAM_TIMEOUT || "600000");
@@ -31,7 +31,7 @@ let cookieJar = "";
 async function ensureBrowser() {
   if (!browser || !browser.connected) {
     browser = await puppeteer.launch({
-      executablePath: CHROME_PATH,
+      ...(CHROME_PATH ? { executablePath: CHROME_PATH } : {}),
       headless: true,
       protocolTimeout: 600000,
       args: [
