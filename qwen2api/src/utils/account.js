@@ -3,6 +3,8 @@ const DataPersistence = require("./data-persistence");
 const TokenManager = require("./token-manager");
 const AccountRotator = require("./account-rotator");
 const { logger } = require("./logger");
+const { spawn } = require("child_process");
+const path = require("path");
 /**
  * 帳戶管理器
  * 統一管理帳戶、令牌、模型等功能
@@ -24,6 +26,9 @@ class Account {
     // cli請求次數定時重新整理器
     this.cliRequestNumberInterval = null;
     this.cliDailyResetInterval = null;
+
+    // auto-get-token.js 行程 PID（防止重複觸發）
+    this._autoGetTokenPid = null;
 
     // 初始化
     this._initialize();
@@ -54,6 +59,7 @@ class Account {
     } catch (error) {
       this.isInitialized = false;
       logger.error("帳戶管理器初始化失敗", "ACCOUNT", "", error);
+      throw error; // 拋出錯誤以便呼叫者感知初始化失敗
     }
   }
 
@@ -158,7 +164,10 @@ class Account {
                   account.cli_info.access_token = refreshToken.access_token;
                   account.cli_info.refresh_token = refreshToken.refresh_token;
                   account.cli_info.expiry_date = refreshToken.expiry_date;
-                  logger.info(`CLI帳戶 ${account.email} 令牌重新整理成功`, "CLI");
+                  logger.info(
+                    `CLI帳戶 ${account.email} 令牌重新整理成功`,
+                    "CLI",
+                  );
                 }
               } catch (error) {
                 logger.error(
@@ -242,6 +251,71 @@ class Account {
   }
 
   /**
+   * 自動執行 auto-get-token.js 以更新 browser token
+   * @param {Object} account - 帳戶物件
+   * @private
+   */
+  _spawnAutoGetToken(account) {
+    const script = path.join(__dirname, "../../auto-get-token.js");
+    const email = account?.email || "unknown";
+
+    // 避免重複觸發：如果已有一個 auto-get-token 行程在跑，跳過
+    if (this._autoGetTokenPid) {
+      try {
+        process.kill(this._autoGetTokenPid, 0); // 檢查行程是否存在
+        logger.info(
+          `auto-get-token.js 已在執行中（PID ${this._autoGetTokenPid}），跳過`,
+          "TOKEN",
+        );
+        return;
+      } catch {
+        // 行程不存在，清除舊 PID
+        this._autoGetTokenPid = null;
+      }
+    }
+
+    logger.info(
+      `自動執行 auto-get-token.js 更新 ${email} 的 token...`,
+      "TOKEN",
+      "🔄",
+    );
+
+    const cp = spawn("bun", [script], {
+      stdio: "ignore",
+      detached: true,
+      env: {
+        ...process.env,
+        AUTO_TRIGGER: "true",
+        FORCE_RESTART: "true",
+      },
+    });
+    cp.unref();
+
+    // 記錄 PID 防止重複觸發
+    this._autoGetTokenPid = cp.pid;
+
+    cp.on("exit", (code) => {
+      if (code === 0) {
+        logger.success(
+          `auto-get-token.js 完成，${email} token 已更新`,
+          "TOKEN",
+        );
+      } else {
+        logger.error(
+          `auto-get-token.js 異常退出（code=${code}），${email} token 可能未更新`,
+          "TOKEN",
+        );
+      }
+      this._autoGetTokenPid = null;
+    });
+
+    cp.on("error", (err) => {
+      logger.error(`auto-get-token.js 啟動失敗: ${err.message}`, "TOKEN");
+      this._autoGetTokenPid = null;
+    });
+  }
+
+  /**
    * 驗證和清理無效令牌
    * @private
    */
@@ -267,6 +341,17 @@ class Account {
             validAccounts.push(account);
           }
         }
+      } else if (account.refresh_method === "browser" && account.email) {
+        // refresh_method = "browser"：token 透過 Chrome 取得，無密碼
+        // 不清除帳戶，自動觸發 auto-get-token.js 重新獲取
+        logger.warn(
+          `帳戶 ${account.email} 令牌已過期（refresh_method=browser），自動重新獲取...`,
+          "TOKEN",
+        );
+        this._spawnAutoGetToken(account);
+        // 保留帳戶結構但標記 token 為 null，後續請求會回傳明確錯誤
+        account.token = null;
+        validAccounts.push(account);
       }
     }
 
@@ -303,6 +388,18 @@ class Account {
 
     // 逐個重新整理帳戶，每次成功後立即儲存
     for (const account of needsRefresh) {
+      // browser 帳戶 → 自動執行 auto-get-token.js
+      if (account.refresh_method === "browser") {
+        logger.info(
+          `帳戶 ${account.email} 為 browser 類型，自動觸發 auto-get-token.js`,
+          "TOKEN",
+          "🔄",
+        );
+        this._spawnAutoGetToken(account);
+        // 不計入 success/failed，交由 auto-get-token.js 完成後處理
+        continue;
+      }
+
       try {
         const updatedAccount = await this.tokenManager.refreshToken(account);
         if (updatedAccount) {
@@ -368,9 +465,9 @@ class Account {
 
   /**
    * 獲取下一個可用的帳戶物件（包含 proxy 等完整欄位）
-   * @returns {Object|null} 帳戶物件或 null
+   * @returns {Promise<Object|null>} 帳戶物件或 null
    */
-  getAccount() {
+  async getAccount() {
     if (!this.isInitialized) {
       logger.warn("帳戶管理器尚未初始化完成", "ACCOUNT");
       return null;
@@ -381,9 +478,22 @@ class Account {
       return null;
     }
 
-    const account = this.accountRotator.getNextAccount();
+    const account = await this.accountRotator.getNextAccount();
     if (!account) {
       logger.error("所有帳戶令牌都不可用", "ACCOUNT");
+      return null;
+    }
+
+    // browser token 過期提示：帳戶存在但 token 為 null（等待 auto-get-token.js 更新）
+    if (!account.token && account.refresh_method === "browser") {
+      logger.warn(
+        `帳戶 ${account.email} token 正在自動更新（auto-get-token.js 背景執行中）`,
+        "ACCOUNT",
+      );
+      logger.warn(
+        `   請稍後再試，或手動執行 bun qwen2api/auto-get-token.js 加速更新`,
+        "ACCOUNT",
+      );
     }
 
     return account;
@@ -391,10 +501,10 @@ class Account {
 
   /**
    * 獲取可用的帳戶令牌（向後相容的便捷方法）
-   * @returns {string|null} 帳戶令牌或null
+   * @returns {Promise<string|null>} 帳戶令牌或null
    */
-  getAccountToken() {
-    const account = this.getAccount();
+  async getAccountToken() {
+    const account = await this.getAccount();
     return account ? account.token : null;
   }
 
@@ -483,14 +593,37 @@ class Account {
     return false;
   }
 
-  // 更新銷燬方法，清除定時器
+  /**
+   * 清理資源（合併所有 interval 清理邏輯）
+   */
   destroy() {
-    if (this.saveInterval) {
-      clearInterval(this.saveInterval);
-    }
+    // 清理自動重新整理定時器
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
+      this.refreshInterval = null;
     }
+
+    // 清理 CLI 請求次數重置定時器
+    if (this.cliRequestNumberInterval) {
+      clearTimeout(this.cliRequestNumberInterval);
+      this.cliRequestNumberInterval = null;
+    }
+
+    if (this.cliDailyResetInterval) {
+      clearInterval(this.cliDailyResetInterval);
+      this.cliDailyResetInterval = null;
+    }
+
+    // 清理所有 CLI 帳戶的重新整理定時器
+    this.accountTokens.forEach((account) => {
+      if (account.cli_info && account.cli_info.refresh_token_interval) {
+        clearInterval(account.cli_info.refresh_token_interval);
+        account.cli_info.refresh_token_interval = null;
+      }
+    });
+
+    this.accountRotator.reset();
+    logger.info("帳戶管理器已清理資源", "ACCOUNT", "🧹");
   }
 
   /**
@@ -732,7 +865,10 @@ class Account {
       });
       if (!saved) {
         account.proxy = oldProxy;
-        logger.error(`帳戶 ${email} 代理持久化失敗，已回滾記憶體資料`, "ACCOUNT");
+        logger.error(
+          `帳戶 ${email} 代理持久化失敗，已回滾記憶體資料`,
+          "ACCOUNT",
+        );
         return false;
       }
 
@@ -762,12 +898,19 @@ class Account {
    */
   async removeAccount(email) {
     try {
-      const index = this.accountTokens.findIndex((acc) => acc.email === email);
-      if (index === -1) {
+      const account = this.accountTokens.find((acc) => acc.email === email);
+      if (!account) {
         logger.warn(`帳戶 ${email} 不存在`, "ACCOUNT");
         return false;
       }
 
+      // 清理 CLI 定時器（若存在）
+      if (account.cli_info && account.cli_info.refresh_token_interval) {
+        clearInterval(account.cli_info.refresh_token_interval);
+        account.cli_info.refresh_token_interval = null;
+      }
+
+      const index = this.accountTokens.indexOf(account);
       // 從記憶體中移除
       this.accountTokens.splice(index, 1);
 
@@ -824,39 +967,6 @@ class Account {
    */
   async _delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /**
-   * 清理資源
-   */
-  destroy() {
-    // 清理自動重新整理定時器
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
-      this.refreshInterval = null;
-    }
-
-    // 清理CLI請求次數重置定時器
-    if (this.cliRequestNumberInterval) {
-      clearTimeout(this.cliRequestNumberInterval);
-      this.cliRequestNumberInterval = null;
-    }
-
-    if (this.cliDailyResetInterval) {
-      clearInterval(this.cliDailyResetInterval);
-      this.cliDailyResetInterval = null;
-    }
-
-    // 清理所有CLI帳戶的重新整理定時器
-    this.accountTokens.forEach((account) => {
-      if (account.cli_info && account.cli_info.refresh_token_interval) {
-        clearInterval(account.cli_info.refresh_token_interval);
-        account.cli_info.refresh_token_interval = null;
-      }
-    });
-
-    this.accountRotator.reset();
-    logger.info("帳戶管理器已清理資源", "ACCOUNT", "🧹");
   }
 }
 

@@ -1,78 +1,127 @@
-const { getLatestModels } = require('../models/models-map.js')
-const config = require('../config/index.js')
+const { getLatestModels } = require("../models/models-map.js");
+const config = require("../config/index.js");
+
+/**
+ * Claude CLI 相容模型映射表
+ * 將 Qwen 模型 ID 映射為 Claude CLI 可接受的 Anthropic 風格 ID
+ */
+const CLAUDE_COMPAT_MAP = {
+  "Qwen3.6-Max-Preview": "claude-sonnet-4-5",
+  "Qwen3.7-Max": "claude-opus-4-1",
+  "Qwen3.6-Plus": "claude-sonnet-4",
+  "Qwen3.5-Flash": "claude-haiku-3-5",
+  "Qwen3-Coder": "claude-sonnet-4-coding",
+};
 
 /**
  * 構造對外暴露的模型資訊
  * @param {object} model - 原始模型資訊
  * @param {string} suffix - 變體字尾
+ * @param {boolean} anthropicCompat - 是否啟用 Anthropic 相容模式
  * @returns {object} 對外模型資訊
  */
-const buildPublicModelData = (model, suffix = '') => {
-    const modelData = JSON.parse(JSON.stringify(model))
-    const upstreamModelID = String(model?.id || '')
-    const displayModelID = String(model?.name || model?.id || '')
+const buildPublicModelData = (model, suffix = "", anthropicCompat = false) => {
+  const modelData = JSON.parse(JSON.stringify(model));
+  const upstreamModelID = String(model?.id || "");
+  const displayModelID = String(model?.name || model?.id || "");
 
-    modelData.id = `${displayModelID}${suffix}`
-    modelData.name = `${upstreamModelID}${suffix}`
-    modelData.upstream_id = upstreamModelID
-    modelData.display_name = displayModelID
+  const fullId = `${displayModelID}${suffix}`;
 
-    return modelData
-}
+  // 若啟用 Anthropic 相容模式且存在映射，使用映射後的 ID
+  const compatId = anthropicCompat ? CLAUDE_COMPAT_MAP[fullId] : null;
+
+  modelData.id = compatId || fullId;
+  modelData.name = `${upstreamModelID}${suffix}`;
+  modelData.upstream_id = upstreamModelID;
+  modelData.display_name = displayModelID;
+
+  // 保留原始 Qwen ID 供內部使用
+  if (compatId) {
+    modelData.original_id = fullId;
+  }
+
+  return modelData;
+};
 
 const handleGetModels = async (req, res) => {
-    const models = []
+  const models = [];
 
-    const ModelsMap = await getLatestModels()
+  const ModelsMap = await getLatestModels();
 
-    for (const model of ModelsMap) {
-        models.push(buildPublicModelData(model))
+  // 檢測是否為 Claude CLI 請求（透過 User-Agent 或特定 header）
+  const isClaudeCli =
+    req.headers["user-agent"]?.includes("claude-cli") ||
+    req.headers["x-claude-compat"] === "true";
 
-        if (config.simpleModelMap) {
-            continue
-        }
+  for (const model of ModelsMap) {
+    models.push(buildPublicModelData(model, "", isClaudeCli));
 
-        const isThinking = model?.info?.meta?.abilities?.thinking
-        const isSearch = model?.info?.meta?.chat_type?.includes('search')
-        const isImage = model?.info?.meta?.chat_type?.includes('t2i')
-        const isVideo = model?.info?.meta?.chat_type?.includes('t2v')
-        const isImageEdit = model?.info?.meta?.chat_type?.includes('image_edit')
-        const isDeepResearch = model?.info?.meta?.chat_type?.includes('deep_research')
-
-        if (isThinking) {
-            models.push(buildPublicModelData(model, '-thinking'))
-        }
-
-        if (isSearch) {
-            models.push(buildPublicModelData(model, '-search'))
-        }
-
-        if (isThinking && isSearch) {
-            models.push(buildPublicModelData(model, '-thinking-search'))
-        }
-
-        if (isImage) {
-            models.push(buildPublicModelData(model, '-image'))
-        }
-
-        if (isVideo) {
-            models.push(buildPublicModelData(model, '-video'))
-        }
-
-        if (isImageEdit) {
-            models.push(buildPublicModelData(model, '-image-edit'))
-        }
-
-        // if (isDeepResearch) {
-        //     models.push(buildPublicModelData(model, '-deep-research'))
-        // }
+    if (config.simpleModelMap) {
+      continue;
     }
-    res.json({
-        "object": "list",
-        "data": models
-    })
-}
 
+    const isThinking = model?.info?.meta?.abilities?.thinking;
+    const isSearch = model?.info?.meta?.chat_type?.includes("search");
+    const isImage = model?.info?.meta?.chat_type?.includes("t2i");
+    const isVideo = model?.info?.meta?.chat_type?.includes("t2v");
+    const isImageEdit = model?.info?.meta?.chat_type?.includes("image_edit");
+    const isDeepResearch =
+      model?.info?.meta?.chat_type?.includes("deep_research");
+    const isCoder =
+      model?.info?.meta?.abilities?.coding ||
+      model?.info?.meta?.chat_type?.includes("coder") ||
+      model?.id?.includes("coder") ||
+      model?.name?.includes("coder") ||
+      (model?.info?.meta?.mcp || []).includes("code-interpreter");
+
+    if (isThinking) {
+      models.push(buildPublicModelData(model, "-thinking", isClaudeCli));
+    }
+
+    if (isSearch) {
+      models.push(buildPublicModelData(model, "-search", isClaudeCli));
+    }
+
+    if (isThinking && isSearch) {
+      models.push(buildPublicModelData(model, "-thinking-search", isClaudeCli));
+    }
+
+    if (isImage) {
+      models.push(buildPublicModelData(model, "-image", isClaudeCli));
+    }
+
+    if (isVideo) {
+      models.push(buildPublicModelData(model, "-video", isClaudeCli));
+    }
+
+    if (isImageEdit) {
+      models.push(buildPublicModelData(model, "-image-edit", isClaudeCli));
+    }
+
+    // 添加對 coder 模型的支持
+    if (isCoder) {
+      models.push(buildPublicModelData(model, "-coder", isClaudeCli));
+    }
+
+    if (isThinking && isCoder) {
+      models.push(buildPublicModelData(model, "-thinking-coder", isClaudeCli));
+    }
+
+    if (isSearch && isCoder) {
+      models.push(buildPublicModelData(model, "-search-coder", isClaudeCli));
+    }
+
+    if (isThinking && isSearch && isCoder) {
+      models.push(
+        buildPublicModelData(model, "-thinking-search-coder", isClaudeCli),
+      );
+    }
+  }
+  res.json({
+    object: "list",
+    data: models,
+  });
+};
 module.exports = {
-    handleGetModels
-}
+  handleGetModels,
+};

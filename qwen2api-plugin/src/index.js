@@ -17,7 +17,7 @@
  * 環境變數：
  *   QWEN2API_PORT  — qwen2api 端口（預設 3000）
  *   QWEN2API_HOST  — qwen2api 主機（預設 localhost）
- *   QWEN2API_KEY   — API 金鑰（預設 sk-123456）
+ *   QWEN2API_KEY   — API 金鑰（預設 CHANGE_ME）
  */
 
 import { spawn, execSync } from "node:child_process";
@@ -26,6 +26,7 @@ import path from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { startProxy, PROXY_PORT } from "./chat-proxy.js";
 import { killPort, getPath } from "./platform.js";
+import { autoJudge } from "./auto-judge.js";
 import {
   checkAndRepair,
   resolvePackage,
@@ -67,7 +68,7 @@ const QWEN2API_HOST = process.env.QWEN2API_HOST || "127.0.0.1";
 const _QWEN2API_HOST = QWEN2API_HOST.includes(":")
   ? `[${QWEN2API_HOST}]`
   : QWEN2API_HOST;
-const QWEN2API_KEY = process.env.QWEN2API_KEY || "sk-123456";
+const QWEN2API_KEY = process.env.QWEN2API_KEY || "CHANGE_ME";
 const QWEN2API_DIR = getPath("qwen2api");
 const QWEN2API_URL = `http://${_QWEN2API_HOST}:${QWEN2API_PORT}`;
 const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}`;
@@ -90,17 +91,62 @@ const circuitState = {
   threshold: 5, // 連續失敗閾值
 };
 
+// ─── 失敗上下文追蹤（供 auto-judge fix 判斷） ───
+let lastFailCtx = null; // { title, detail, source, ts }
+
 function recordSuccess() {
+  const prevFails = circuitState.failures;
   circuitState.failures = 0;
   circuitState.closed = true;
+  // 成功 → 狀態機回 idle（不再檢查）
+  if (svcState !== SVC.IDLE) {
+    svcFailCount = 0;
+    svcState = SVC.IDLE;
+    log.info("✅ 請求成功，狀態機回歸 idle");
+  }
+  // 如果之前有失敗，現在成功了 → 記錄修復（非同步，不阻塞）
+  if (prevFails > 0 && lastFailCtx) {
+    const ctx = { ...lastFailCtx };
+    lastFailCtx = null;
+    const elapsed = Date.now() - ctx.ts;
+    autoJudge({
+      type: "fix",
+      title: `[已修復] ${ctx.title}`,
+      detail: ctx.detail,
+      fix: `自動恢復（經過 ${Math.round(elapsed / 1000)}s，前次失敗 ${prevFails} 次後恢復正常）`,
+      source: "auto-detect",
+    }).catch(() => {});
+  }
 }
 
-function recordFailure() {
+function recordFailure(errMsg) {
   circuitState.failures += 1;
   circuitState.lastFailure = Date.now();
   if (circuitState.failures >= circuitState.threshold) {
     circuitState.closed = false;
     log.warn(`⚠️ 斷路器開啟（連續失敗 ${circuitState.failures} 次）`);
+  }
+  // 記錄失敗上下文供後續 fix 判斷
+  lastFailCtx = {
+    title: errMsg ? errMsg.slice(0, 80) : "請求失敗",
+    detail: errMsg || `連續失敗 ${circuitState.failures} 次`,
+    source: "request",
+    ts: Date.now(),
+  };
+  // 非同步自動判斷（不阻塞請求）
+  autoJudge({
+    type: "error",
+    title: lastFailCtx.title,
+    detail: lastFailCtx.detail,
+    count: 1,
+    source: "request",
+  }).catch(() => {});
+  // 失敗 → 觸發檢查（僅在 idle 時，避免疊加）
+  if (svcState === SVC.IDLE) {
+    svcState = SVC.CHECKING;
+    svcEnter().catch(() => {
+      svcState = SVC.IDLE;
+    });
   }
 }
 
@@ -191,7 +237,7 @@ async function fetchWithRetry(
     }
   }
 
-  recordFailure();
+  recordFailure(lastErr?.message);
   return null;
 }
 
@@ -357,29 +403,70 @@ const autoStartProxy = async () => {
   return "failed";
 };
 
-// ─── 健康監控（30 秒間隔，自動重啟） ───
-let monitorTimer = null;
-const startMonitor = () => {
-  if (monitorTimer) return;
-  log.info("🔄 啟動健康監控（30s 間隔）");
-  monitorTimer = setInterval(async () => {
-    try {
-      const qUp = await isUp();
-      if (!qUp) {
-        log.warn("⚠️ qwen2api 無回應，嘗試重啟...");
-        autoStart()
-          .then((s) => log.info(`qwen2api 重啟: ${s}`))
-          .catch(() => {});
+// ─── 事件驅動狀態機（非常駐，有事才動） ───
+// 狀態: idle → checking → repairing → degraded → idle (冷卻後自動回歸)
+// idle: 零資源，不做任何事
+// checking: 觸發健康檢查（僅一次）
+// repairing: 正在重啟服務
+// degraded: 重啟失敗，進入冷卻
+let svcState = "idle"; // idle|checking|repairing|degraded
+let svcFailCount = 0; // 連續失敗次數
+const SVC = {
+  IDLE: "idle",
+  CHECKING: "checking",
+  REPAIRING: "repairing",
+  DEGRADED: "degraded",
+};
+const SVC_COOLDOWN_MS = 60000; // degraded 冷卻 60s
+const SVC_FAIL_LIMIT = 3; // 連續失敗上限
+
+const svcEnter = async () => {
+  if (svcState !== SVC.CHECKING) return; // 避免重入
+  log.info("🔍 觸發健康檢查（事件驅動）");
+  const qUp = await isUp();
+  if (!qUp) {
+    svcState = SVC.REPAIRING;
+    log.warn("⚠️ qwen2api 無回應，嘗試重啟...");
+    const r = await autoStart();
+    if (r === "failed") {
+      svcFailCount++;
+      svcState = svcFailCount >= SVC_FAIL_LIMIT ? SVC.DEGRADED : SVC.IDLE;
+      log.warn(
+        `qwen2api 重啟失敗 (${svcFailCount}/${SVC_FAIL_LIMIT})，狀態=${svcState}`,
+      );
+      if (svcState === SVC.DEGRADED) {
+        setTimeout(() => {
+          svcFailCount = 0;
+          svcState = SVC.IDLE;
+        }, SVC_COOLDOWN_MS);
       }
-      const pUp = await isProxyUp();
-      if (!pUp) {
-        log.warn("⚠️ Chat Proxy 無回應，嘗試重啟...");
-        autoStartProxy()
-          .then((s) => log.info(`proxy 重啟: ${s}`))
-          .catch(() => {});
+      return;
+    }
+  }
+  const pUp = await isProxyUp();
+  if (!pUp) {
+    svcState = SVC.REPAIRING;
+    log.warn("⚠️ Chat Proxy 無回應，嘗試重啟...");
+    const r = await autoStartProxy();
+    if (r === "failed") {
+      svcFailCount++;
+      svcState = svcFailCount >= SVC_FAIL_LIMIT ? SVC.DEGRADED : SVC.IDLE;
+      log.warn(
+        `proxy 重啟失敗 (${svcFailCount}/${SVC_FAIL_LIMIT})，狀態=${svcState}`,
+      );
+      if (svcState === SVC.DEGRADED) {
+        setTimeout(() => {
+          svcFailCount = 0;
+          svcState = SVC.IDLE;
+        }, SVC_COOLDOWN_MS);
       }
-    } catch (_) {}
-  }, 30000);
+      return;
+    }
+  }
+  // 成功 → 重置回 idle
+  svcFailCount = 0;
+  svcState = SVC.IDLE;
+  log.info("✅ 健康檢查通過，狀態回歸 idle");
 };
 
 // ─── 自動修復共享依賴 ───
@@ -506,7 +593,7 @@ const Plugin = async (ctx) => {
       const p = await autoStartProxy();
       log.info(`proxy: ${p}`);
     }
-    startMonitor();
+    // 無定時器 — 純事件驅動，無事待命
     // 檢查 token
     try {
       const h = await get("/health");
@@ -643,15 +730,30 @@ const Plugin = async (ctx) => {
         args: {},
         async execute() {
           const h = await get("/health");
-          if (!h) return "❌ Qwen2API 服務無法連線";
+          const stateIcon = {
+            idle: "💤",
+            checking: "🔍",
+            repairing: "🔧",
+            degraded: "⚠️",
+          };
+          const s = stateIcon[svcState] || "💤";
+          const base = !h
+            ? "❌ Qwen2API 服務無法連線"
+            : [
+                `📊 **Qwen2API 狀態**`,
+                `  服務: ${h.status === "healthy" ? "✅ 正常" : "⚠️ 降級"}`,
+                `  運轉: ${h.uptime}`,
+                `  記憶體: ${h.memory?.rss} / ${h.memory?.heapUsed}`,
+                `  帳戶: ${h.accounts?.valid}/${h.accounts?.total} 有效`,
+                `  Token 過期: ${h.accounts?.expired || 0} 個`,
+                `  CPU: ${h.os?.cpu}`,
+              ].join("\n");
           return [
-            `📊 **Qwen2API 狀態**`,
-            `  狀態: ${h.status === "healthy" ? "✅ 正常" : "⚠️ 降級"}`,
-            `  運行時間: ${h.uptime}`,
-            `  記憶體: ${h.memory?.rss} / ${h.memory?.heapUsed}`,
-            `  帳戶: ${h.accounts?.valid}/${h.accounts?.total} 有效`,
-            `  Token 過期: ${h.accounts?.expired || 0} 個`,
-            `  CPU: ${h.os?.cpu}`,
+            base,
+            `\n🤖 **狀態機**`,
+            `  當前狀態: ${s} ${svcState}`,
+            `  連續失敗: ${svcFailCount}/${SVC_FAIL_LIMIT}`,
+            `  斷路器: ${circuitState.closed ? "✅ closed" : "🔴 open (cooldown)"}`,
           ].join("\n");
         },
       }),
@@ -778,22 +880,27 @@ const Plugin = async (ctx) => {
       }),
     },
 
-    // ═══ 事件：異常自動修復 ═══
+    // ═══ 事件：異常事件驅動檢查 + 自動判斷 ═══
     event: async ({ event }) => {
       if (event?.type?.includes("error") || event?.name === "Service.Error") {
-        // 觸發立即健康檢查（非同步，不阻塞事件）
-        (async () => {
-          try {
-            if (!(await isUp())) {
-              log.warn("🔧 異常事件觸發 qwen2api 重啟...");
-              await autoStart();
-            }
-            if (!(await isProxyUp())) {
-              log.warn("🔧 異常事件觸發 proxy 重啟...");
-              await autoStartProxy();
-            }
-          } catch (_) {}
-        })();
+        // 非同步自動判斷事件是否值得記錄（不阻塞）
+        const detail =
+          event?.message || event?.error || event?.name || "未知事件";
+        autoJudge({
+          type: "error",
+          title: `[事件] ${(event?.name || event?.type || "系統錯誤").slice(0, 60)}`,
+          detail,
+          source: "event",
+        }).catch(() => {});
+        // 狀態機：僅在 idle 時觸發檢查，避免疊加
+        if (svcState === SVC.IDLE) {
+          svcState = SVC.CHECKING;
+          svcEnter().catch(() => {
+            svcState = SVC.IDLE;
+          });
+        } else {
+          log.debug(`事件觸發跳過（狀態=${svcState}，已在處理中）`);
+        }
       }
     },
 
@@ -805,7 +912,7 @@ const Plugin = async (ctx) => {
       log.info(
         `qwen2api: ${q === "failed" ? "❌" : "✅"} / proxy: ${p === "failed" ? "❌" : "✅"}`,
       );
-      startMonitor();
+      // 無定時器 — 純事件驅動
     },
   };
 };

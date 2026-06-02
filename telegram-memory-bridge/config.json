@@ -1,0 +1,9 @@
+{
+  "api_port": 4377,
+  "memory_path": "../../.opencode/memory",
+  "knowledge_path": "../../.opencode/knowledge",
+  "wiki_path": "../../.opencode/wiki",
+  "sync_interval_ms": 300000,
+  "max_results": 10,
+  "peers": ["http://100.71.40.106:4377", "http://100.116.204.53:4377"]
+}

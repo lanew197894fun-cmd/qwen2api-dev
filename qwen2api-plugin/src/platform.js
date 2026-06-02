@@ -24,10 +24,12 @@ export const IS_LINUX = PLATFORM === "linux";
 
 const PATH_TABLE = {
   qwen2api: {
-    linux: "/home/reamaster/opencode-manager/projects/independent/qwen2api",
-    darwin: "/Users/reamaster/opencode-manager/projects/independent/qwen2api",
+    linux:
+      "/home/reamaster/opencode-manager/projects/independent/qwen2api-dev/qwen2api",
+    darwin:
+      "/Users/reamaster/opencode-manager/projects/independent/qwen2api-dev/qwen2api",
     win32:
-      "D:\\Tools\\opencode\\opencode-manager\\projects\\independent\\qwen2api",
+      "D:\\Tools\\opencode\\opencode-manager\\projects\\independent\\qwen2api-dev\\qwen2api",
   },
   projectDir: {
     linux: "/home/reamaster/opencode-manager/projects/system/packages/opencode",

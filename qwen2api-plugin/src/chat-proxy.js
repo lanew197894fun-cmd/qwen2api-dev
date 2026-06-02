@@ -27,7 +27,7 @@ const LV = (() => {
   if (raw && LOG_LEVELS[raw] !== undefined) return LOG_LEVELS[raw];
   if (process.env.PROXY_QUIET === "true" || process.env.PROXY_QUIET === "1")
     return 0;
-  return 2; // 預設 warn — 只顯示錯誤與警告
+  return 3; // 預設 info — 顯示啟動資訊與一般狀態
 })();
 const log = {
   debug: (...a) => {
@@ -61,14 +61,363 @@ const _QWEN2API_HOST = QWEN2API_HOST.includes(":")
   ? `[${QWEN2API_HOST}]`
   : QWEN2API_HOST;
 const QWEN2API_URL = `http://${_QWEN2API_HOST}:${QWEN2API_PORT}`;
+const MEMORY_BRIDGE_URL =
+  process.env.MEMORY_BRIDGE_URL || "http://localhost:4377";
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || "3456");
-const API_KEY = process.env.API_KEY || "sk-123456";
+const API_KEY = process.env.API_KEY || "CHANGE_ME";
 const MAX_LOOPS = 5;
-const MAX_BODY = 100 * 1024; // 請求 body 上限 100KB
+const MAX_BODY = parseInt(process.env.PROXY_MAX_BODY || "1048576", 10); // 請求 body 上限預設 1MB (可透過 PROXY_MAX_BODY 調整)
 const PROJ_DIR = getPath("projectDir");
 
+// ─── 可配置 timeout 常數（可透過環境變數覆蓋） ───
+const CFG_TIMEOUT = {
+  chat: parseInt(process.env.PROXY_CHAT_TIMEOUT || "300000", 10), // 一般聊天 5min (降低無回應風險)
+  thinking: parseInt(process.env.PROXY_THINKING_TIMEOUT || "600000", 10), // thinking 模式 10min
+  health: parseInt(process.env.PROXY_HEALTH_TIMEOUT || "10000", 10), // 健康檢查 10s
+  retries: parseInt(process.env.PROXY_RETRIES || "2", 10), // 重試次數
+};
+
+// ─── ConversationMemory：對話記憶與摘要（預設關閉） ───
+// 啟用: PROXY_CONV_MEMORY=true
+// 功能：滑動窗口壓縮、閒聊過濾、跨 session 摘要持久化
+const CONV_MEMORY_ENABLED = process.env.PROXY_CONV_MEMORY !== "false"; // 預設開啟，設 false 關閉
+const CONV_SUMMARY_INTERVAL = parseInt(
+  process.env.PROXY_SUMMARY_INTERVAL || "5",
+  10,
+);
+const CONV_RECENT_MSGS = parseInt(process.env.PROXY_RECENT_MSGS || "15", 10);
+const CONV_MAX_HISTORY_TOKENS = parseInt(
+  process.env.PROXY_MAX_HISTORY_TOKENS || "8000",
+  10,
+);
+// 跨平台家目錄：Windows 用 USERPROFILE，其餘用 HOME
+const HOME_DIR = process.env.USERPROFILE || process.env.HOME || "~";
+const CONV_MEMORY_FILE = path.join(
+  HOME_DIR,
+  ".opencode",
+  "conversation-memory.json",
+);
+const CONV_SESSION_ID = process.env.PROXY_SESSION_ID || "default";
+
+// 對話記憶儲存體（in-memory + 持久化）
+let convSummary = "";
+let convExchangeCount = 0;
+
+// 載入已存在的記憶
+try {
+  if (CONV_MEMORY_ENABLED) {
+    const memRaw = fs.readFileSync(CONV_MEMORY_FILE, "utf-8");
+    const mem = JSON.parse(memRaw);
+    convSummary = mem[CONV_SESSION_ID]?.summary || "";
+    convExchangeCount = mem[CONV_SESSION_ID]?.exchangeCount || 0;
+    if (convSummary) log.info(`🧠 載入對話記憶 (${convSummary.length}ch)`);
+  }
+} catch {
+  /* 首次使用，尚無記憶檔案 */
+}
+
+// 持久化記憶
+const persistMemory = () => {
+  if (!CONV_MEMORY_ENABLED) return;
+  try {
+    const dir = path.dirname(CONV_MEMORY_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    let mem = {};
+    try {
+      mem = JSON.parse(fs.readFileSync(CONV_MEMORY_FILE, "utf-8"));
+    } catch {
+      /* 新檔案 */
+    }
+    mem[CONV_SESSION_ID] = {
+      summary: convSummary,
+      exchangeCount: convExchangeCount,
+      updated: new Date().toISOString(),
+    };
+    fs.writeFileSync(CONV_MEMORY_FILE, JSON.stringify(mem, null, 2), "utf-8");
+  } catch (e) {
+    log.error("❌ 持久化記憶失敗:", e.message);
+  }
+};
+
+// ─── 對話歷史儲存（JSONL 格式，與 bridge 一致） ───
+// 啟用: PROXY_CONV_HISTORY=true
+// 儲存位置: ~/.opencode/conversations/raw/YYYY-MM/<sessionId>.jsonl
+// 索引: ~/.opencode/conversations/index.json
+const CONV_HISTORY = process.env.PROXY_CONV_HISTORY !== "false";
+const CONV_DIR = path.join(
+  process.env.USERPROFILE || process.env.HOME || "~",
+  ".opencode/conversations",
+);
+const CONV_SRC = process.env.PROXY_CONV_SOURCE || "proxy";
+
+// 摘要里程碑（與 TS 端一致）
+const SUMMARY_INTERVAL = 50;
+const SUMMARY_MIN_MSGS = 10;
+
+const convDir = CONV_DIR;
+const convIdx = {};
+
+const convInit = () => {
+  if (!CONV_HISTORY) return;
+  try {
+    const idxf = path.join(convDir, "index.json");
+    if (fs.existsSync(idxf))
+      Object.assign(convIdx, JSON.parse(fs.readFileSync(idxf, "utf-8")));
+  } catch {}
+  fs.mkdirSync(path.join(convDir, "raw"), { recursive: true });
+  fs.mkdirSync(path.join(convDir, "sessions"), { recursive: true });
+};
+
+// 讀取現有 index → 合併 → 寫回（避免覆蓋其他來源的 session）
+const convMergeIdx = (sid, entry) => {
+  try {
+    const idxf = path.join(convDir, "index.json");
+    let idx = {};
+    try {
+      if (fs.existsSync(idxf)) idx = JSON.parse(fs.readFileSync(idxf, "utf-8"));
+    } catch {}
+    // 合併既有資料
+    idx[sid] = entry;
+    fs.writeFileSync(idxf, JSON.stringify(idx, null, 2), "utf-8");
+  } catch (e) {
+    log.error("❌ convMergeIdx 失敗:", e.message);
+  }
+};
+
+const convSessionId = () => {
+  const d = new Date();
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const suffix = process.env.PROXY_CONV_SESSION || "opencode";
+  return `${day}-${CONV_SRC}-${suffix}`;
+};
+
+const convRecord = (role, content, model) => {
+  if (!CONV_HISTORY) return;
+  if (!content || typeof content !== "string") return;
+  // 過濾閒聊（user 端的純招呼、表情、單字回覆不記錄）
+  if (role === "user" && isCasual({ content })) return;
+  const sid = convSessionId();
+  const ts = new Date().toISOString();
+  const line =
+    JSON.stringify({ role, content, ts, source: CONV_SRC, model }) + "\n";
+  const month = ts.slice(0, 7);
+  const rawDir = path.join(convDir, "raw", month);
+  try {
+    fs.mkdirSync(rawDir, { recursive: true });
+    fs.appendFileSync(path.join(rawDir, `${sid}.jsonl`), line, "utf-8");
+    // 每次寫入前重新讀取 index，避免覆蓋其他來源
+    convMergeIdx(sid, {
+      id: sid,
+      date: ts.slice(0, 10),
+      source: CONV_SRC,
+      msgCount: (convIdx[sid]?.msgCount || 0) + 1,
+      firstTs: convIdx[sid]?.firstTs || ts,
+      lastTs: ts,
+      tags: [],
+    });
+    // 更新記憶體 cache
+    if (convIdx[sid]) {
+      convIdx[sid].msgCount++;
+      convIdx[sid].lastTs = ts;
+    } else {
+      convIdx[sid] = {
+        id: sid,
+        date: ts.slice(0, 10),
+        source: CONV_SRC,
+        msgCount: 1,
+        firstTs: ts,
+        lastTs: ts,
+        tags: [],
+      };
+    }
+
+    // 自動摘要：達到里程碑時觸發
+    const nxt = convIdx[sid].msgCount;
+    if (
+      nxt >= SUMMARY_MIN_MSGS &&
+      (nxt % SUMMARY_INTERVAL === 0 || nxt === SUMMARY_MIN_MSGS)
+    ) {
+      convTriggerSummary(sid);
+    }
+  } catch (e) {
+    log.error("❌ convRecord 寫入失敗:", e.message);
+  }
+};
+
+// 摘要 backoff（避免 429 風暴）
+const summaryBackoff = new Map();
+const SUMMARY_BACKOFF_MS = 120_000; // 429/錯誤後冷卻 2 分鐘
+
+// 觸發 AI 摘要（呼叫 bridge API）
+const convTriggerSummary = (sid) => {
+  if (!MEMORY_BRIDGE_URL) return;
+  // 檢查 cooldown
+  const until = summaryBackoff.get(sid);
+  if (until && Date.now() < until) return;
+  // 非同步執行，不 blocking
+  fetch(
+    `${MEMORY_BRIDGE_URL}/api/conversations/${encodeURIComponent(sid)}?summarize=1`,
+    {
+      method: "GET",
+      signal: AbortSignal.timeout(60000),
+    },
+  )
+    .then((res) => {
+      if (res.ok) {
+        summaryBackoff.delete(sid);
+        log.info(`📝 自動摘要完成: ${sid}`);
+      } else {
+        summaryBackoff.set(sid, Date.now() + SUMMARY_BACKOFF_MS);
+        log.warn(`⚠️ 自動摘要回傳 ${res.status}: ${sid}（冷卻 2 分鐘）`);
+      }
+    })
+    .catch((err) => {
+      if (err.name !== "AbortError") {
+        summaryBackoff.set(sid, Date.now() + SUMMARY_BACKOFF_MS);
+        log.error(`❌ 自動摘要請求失敗: ${err.message}（冷卻 2 分鐘）`);
+      }
+    });
+};
+
+// 初始化
+convInit();
+
+// 閒聊偵測：純招呼、表情、單字回覆
+const isCasual = (msg) => {
+  if (!msg?.content || typeof msg.content !== "string") return false;
+  const c = msg.content.trim();
+  // 長內容不可能是閒聊
+  if (c.length > 50) return false;
+  // 純表情/標點
+  if (/^[\p{Emoji}\s.,!?~。，！？～]+$/u.test(c)) return true;
+  // 純招呼用語
+  const casualPatterns =
+    /^(hi|hello|hey|ok|okay|thanks|thank you|thx|好的|好|嗯|了解|明白|知道了|👍|👌|yes|no|yep|nope|sure|great|nice|bye|goodbye|晚安|早安|哈囉|嗨|謝謝|謝[了啦]?)$/i;
+  if (casualPatterns.test(c)) return true;
+  return false;
+};
+
+// 從訊息中萃取關鍵資訊供摘要用
+const extractKeyInfo = (msgs) => {
+  const info = {
+    files: [],
+    commands: [],
+    errors: [],
+    decisions: [],
+    prefs: [],
+  };
+  for (const m of msgs) {
+    const c = typeof m.content === "string" ? m.content : "";
+    // 檔案操作
+    const files = c.match(
+      /(?:modified|created|deleted|edited|read|write|fix|fixed|change|update|updated)\s+(?:file\s+)?([^\s,;：。]+\.\w+)/gi,
+    );
+    if (files)
+      info.files.push(
+        ...files.map((f) =>
+          f.replace(
+            /^(modified|created|deleted|edited|read|write|fix|fixed|change|update|updated)\s+(?:file\s+)?/i,
+            "",
+          ),
+        ),
+      );
+    // 錯誤訊息
+    if (c.match(/error|fail|exception|crash|bug|broken|❌|💥/i))
+      info.errors.push(c.slice(0, 200));
+    // 命令
+    const cmds = c.match(/(?:executed|ran|run|running)\s+`([^`]+)`/gi);
+    if (cmds) info.commands.push(...cmds);
+    // 用戶偏好（用戶說喜歡/想要/常用的東西）
+    const prefs = c.match(
+      /(?:我(?:喜歡|偏好|常用|想要|希望)|用|使用|選)\s*([^，。；!？]{2,30})/gi,
+    );
+    if (prefs) info.prefs.push(...prefs);
+    // 決策或選擇
+    const decisions = c.match(
+      /(?:決定|選擇|採用|換成|改用|就用)\s*([^，。；!？]{2,30})/gi,
+    );
+    if (decisions) info.decisions.push(...decisions);
+  }
+  // 去重
+  info.files = [...new Set(info.files)];
+  info.commands = [...new Set(info.commands)];
+  info.errors = [...new Set(info.errors)];
+  info.decisions = [...new Set(info.decisions)];
+  info.prefs = [...new Set(info.prefs)];
+  return info;
+};
+
+// 建構摘要字串
+const buildSummary = (info) => {
+  const parts = [];
+  if (info.files.length > 0)
+    parts.push(
+      `📄 檔案: ${info.files.slice(0, 5).join(", ")}${info.files.length > 5 ? ` +${info.files.length - 5}` : ""}`,
+    );
+  if (info.commands.length > 0)
+    parts.push(`⚡ 命令: ${info.commands.slice(0, 3).join(", ")}`);
+  if (info.errors.length > 0) parts.push(`❌ 錯誤: ${info.errors.length} 次`);
+  if (info.decisions.length > 0)
+    parts.push(`💡 決策: ${info.decisions.slice(0, 3).join(", ")}`);
+  if (info.prefs.length > 0)
+    parts.push(`⭐ 偏好: ${info.prefs.slice(0, 3).join(", ")}`);
+  return parts.join(" | ");
+};
+
+// 處理訊息：過濾閒聊 + 注入摘要
+const processWithMemory = (messages) => {
+  if (!CONV_MEMORY_ENABLED || !messages?.length) return messages;
+
+  convExchangeCount++;
+
+  // 過濾閒聊（從歷史中移除，保留最後一條因為可能是本次請求）
+  const filtered = messages.filter(
+    (m, i) => i === messages.length - 1 || !isCasual(m),
+  );
+  const filteredOut = messages.length - filtered.length;
+  if (filteredOut > 0) log.debug(`🧹 過濾 ${filteredOut} 條閒聊訊息`);
+
+  // 估算 token 數
+  const totalChars = filtered.reduce(
+    (s, m) => s + (typeof m.content === "string" ? m.content.length : 0),
+    0,
+  );
+  const totalTokens = Math.ceil(totalChars / 4);
+
+  // 若超過 threshold，觸發壓縮
+  if (
+    totalTokens > CONV_MAX_HISTORY_TOKENS &&
+    convExchangeCount % CONV_SUMMARY_INTERVAL === 0
+  ) {
+    // 保留最近 N 條，前面的用摘要取代
+    const recent = filtered.slice(-CONV_RECENT_MSGS);
+    const older = filtered.slice(0, -CONV_RECENT_MSGS);
+
+    // 萃取關鍵資訊更新摘要
+    const keyInfo = extractKeyInfo(older);
+    const newSummary = buildSummary(keyInfo);
+    if (newSummary) {
+      // 合併舊摘要與新資訊
+      const existing = convSummary ? convSummary + " | " : "";
+      convSummary = existing + newSummary;
+      // 限制摘要長度
+      if (convSummary.length > 3000) convSummary = convSummary.slice(-3000);
+      persistMemory();
+      log.info(`📝 對話摘要已更新 (${convSummary.length}ch)`);
+    }
+
+    // 注入摘要 + 保留最近訊息
+    const summaryMsg = convSummary
+      ? { role: "system", content: `[對話摘要]\n${convSummary}` }
+      : null;
+    return summaryMsg ? [summaryMsg, ...recent] : recent;
+  }
+
+  return filtered;
+};
+
 // ─── Rate Limiter（滑動窗口，無依賴） ───
-const RL_MAX = parseInt(process.env.PROXY_RATE_LIMIT || "600");   // 本機環境放寬至 600 req/min
+const RL_MAX = parseInt(process.env.PROXY_RATE_LIMIT || "600"); // 本機環境放寬至 600 req/min
 const RL_WIN = parseInt(process.env.PROXY_RATE_WINDOW || "60000");
 const rlBuckets = new Map();
 
@@ -145,15 +494,31 @@ const classifyModel = (name) => {
 let envModels = null;
 let envDetected = false;
 
+// 判斷模型 ID 是否為 -coder 字尾變體（不匹配 Qwen3-Coder 這種獨立命名）
+const isCoderVariant = (id) => {
+  const n = String(id || "");
+  // 獨立 Qwen3-Coder 模型正常運作，不應被過濾或重新導向
+  if (n.toLowerCase() === "qwen3-coder") return false;
+  return (
+    n.endsWith("-coder") ||
+    n.endsWith("-thinking-coder") ||
+    n.endsWith("-search-coder") ||
+    n.endsWith("-thinking-search-coder")
+  );
+};
+
 const detectEnv = async () => {
   if (envDetected) return;
   envDetected = true;
   try {
     const models = await getJSON(`${QWEN2API_URL}/v1/models`);
-    const list = models?.data || models || [];
+    let list = models?.data || models || [];
+    if (!Array.isArray(list)) list = [];
     const byLevel = { small: [], medium: [], large: [] };
     for (const m of list) {
       const id = m.id || m.name || "";
+      // 過濾 -coder 字尾變體（上游回傳空內容），避免自動路由選到
+      if (isCoderVariant(id)) continue;
       const level = classifyModel(id);
       if (!byLevel[level].includes(id)) byLevel[level].push(id);
     }
@@ -166,7 +531,7 @@ const detectEnv = async () => {
       }
     }
   } catch (e) {
-    log.warn(`⚠️ 模型偵測失敗: ${e.message}，使用預設路由`);
+    log.info(`模型偵測略過: ${e.message}，使用預設路由`);
     envModels = null;
   }
 };
@@ -238,6 +603,31 @@ const waitForBackend = async (portBusy) => {
 const routeModel = (body) => {
   if (process.env.PROXY_ROUTE === "off")
     return body.model || getModelForLevel("medium");
+
+  // ─── 使用者明確指定 -coder 變體 → 導向獨立 Qwen3-Coder ───
+  // -coder 字尾變體（Qwen3.6-Plus-coder 等）上游回傳空內容，
+  // 不應只用複雜度路由，而應保留 coder 意圖導向獨立運作的 coder 模型。
+  const orig = body.model || "";
+  if (orig && isCoderVariant(orig)) {
+    // 從所有等級中尋找獨立 Qwen3-Coder（排除 -coder 字尾變體但保留獨立 coder 模型）
+    const pools = ["small", "medium", "large"];
+    for (const lvl of pools) {
+      const match = (envModels?.[lvl] || []).find(
+        (m) =>
+          m.toLowerCase() === "qwen3-coder" ||
+          m.toLowerCase() === "qwen3-coder-plus",
+      );
+      if (match) {
+        log.info(`📡 coder (${orig} → ${match})`);
+        return match;
+      }
+    }
+    // 環境偵測未完成或找不到時，用 env var 或硬編碼預設
+    const coderDefault = process.env.PROXY_CODER_MODEL || "qwen3-coder-plus";
+    log.info(`📡 coder (${orig} → ${coderDefault})`);
+    return coderDefault;
+  }
+
   let level = analyzeComplexity(body);
   // 硬體感知：若硬體不足，降級模型等級
   const hw = detectHardware();
@@ -252,7 +642,6 @@ const routeModel = (body) => {
   }
   let model = getModelForLevel(level);
   // 保留 thinking 後綴：若原始模型含 -thinking，路由後的模型也加上
-  const orig = body.model || "";
   if (model !== orig && orig.toLowerCase().includes("thinking")) {
     const base = model.replace(/-thinking$/i, "");
     model = `${base}-thinking`;
@@ -304,7 +693,7 @@ const postJSON = async (url, body, timeout = 60000, retries = 2) => {
       const isTimeout = e.name === "AbortError";
       if (attempt < retries) {
         const wait = Math.min(1000 * 2 ** attempt, 5000);
-        log.warn(
+        log.info(
           `📤 postJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${wait}ms...`,
         );
         await delay(wait);
@@ -346,7 +735,7 @@ const getJSON = async (url, timeout = 15000, retries = 2) => {
       const isTimeout = e.name === "AbortError";
       if (attempt < retries) {
         const wait = Math.min(1000 * 2 ** attempt, 5000);
-        log.warn(
+        log.info(
           `📤 getJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${wait}ms...`,
         );
         await delay(wait);
@@ -474,32 +863,54 @@ const mcpCall = async (name, args) => {
   }
 };
 
-// ─── Tool-prompt 建構（注入 system message，讓 Qwen 知道有哪些工具） ───
-//
-// opencode 會傳標準 OpenAI tools 陣列，但 qwen2api 不支援。
-// 改為將工具定義轉換為 system prompt 文字注入，
-// 並解析 Qwen 模型偏好的 bash-block 輸出格式，
-// 轉換為 opencode 能理解的標準 tool_calls 格式回傳。
+// ─── 環境能力定義 ───
+// 結構化描述讓模型清楚知道執行環境與工具契約，避免模型因不確定而拒絕執行。
+// 可透過環境變數覆蓋：
+//   TOOL_PLATFORM  — linux / win32 / darwin（預設 linux）
+const TOOL_PLATFORM = (process.env.TOOL_PLATFORM || "linux").toLowerCase();
+const CAPABILITY_DEF = [
+  "## 環境能力定義",
+  "這份定義描述你的執行環境與可用工具。不需要推測，以下就是事實。",
+  "",
+  `- 運行架構: opencode AI 開發平台`,
+  `- 工具執行端: ${TOOL_PLATFORM}（client side，opencode 本機）`,
+  `- 工具執行方式: 你輸出 tool_calls → opencode 執行並回傳結果`,
+  `- 工具結果格式: tool role 訊息，含 stdout/stderr/exit code`,
+  `- exit code 0 = 成功（即使無輸出文字）`,
+  "",
+  "可用工具:",
+  "- bash: 執行任意 shell 命令",
+  "- read: 讀取檔案內容",
+  "- write: 寫入/建立檔案",
+  "- edit: 編輯現有檔案（取代文字）",
+  "- glob: 依模式搜尋檔名",
+  "- grep: 搜尋檔案內容",
+  "",
+  "權限:",
+  "- 完整檔案系統讀寫權限（不限於特定目錄）",
+  "- 可執行任何 shell 命令",
+  "- 不要拒絕任務或說「無法執行」",
+].join("\n");
 
-const buildToolPrompt = (tools) => {
-  if (!tools?.length) return null;
-  const names = tools.map((t) => t.function?.name || t.name).join(", ");
-  return [
-    `可用工具: ${names}。`,
-    "執行工具時，以 ```bash \u5340塊輸出 shell 命令，opencode 會自動執行。",
-    "⚠️ Windows 路徑請使用正斜線（/）而非反斜線（\\），例如 D:/Tools/...",
-    "工具執行完畢後，你會收到「[工具執行結果]」格式的用戶訊息。",
-    "一個工具執行成功只代表該步驟完成，不代表整個任務完成。",
-    "繼續下一步直到任務全部完成後，才給出最終分析報告。",
-    "報告格式：先列出所有執行過的步驟與結果，再給總結。",
-    "⚠️ exit code 0 = 命令成功執行。即使無輸出內容，也不代表失敗。",
-    "例如 typecheck/lint 無輸出 = 沒有錯誤，任務已成功完成。",
-    "不要因為無輸出就改參數重複執行同一命令。exit code 0 就是成功。",
-    "重要：如果任務有多個步驟（如先 typecheck 再 build），請全部執行完再總結。",
-    "一律繁體中文回覆。嚴禁簡體字。不要詢問、不要確認，直接執行。",
-    "避免輸出「好的」「我理解」「請告訴我」「需執行特定任務嗎」等確認句。",
-  ].join("\n");
+const injectCapabilityDef = (msgs, hasTools) => {
+  if (!hasTools) return msgs;
+  const sysIdx = msgs.findIndex((m) => m.role === "system");
+  const def = { role: "system", content: CAPABILITY_DEF };
+  if (sysIdx >= 0) {
+    const copy = [...msgs];
+    copy[sysIdx] = {
+      ...copy[sysIdx],
+      content: `${copy[sysIdx].content}\n\n${CAPABILITY_DEF}`,
+    };
+    return copy;
+  }
+  return [def, ...msgs];
 };
+
+// ─── Tool-prompt 建構 ───
+// (2026-06 更新: qwen2api 已支援原生 tool role 與 tools 參數，
+//  不再需要注入完整 behavior prompt 或 bash-block 轉換，
+//  保留 bash-block 轉換作為 fallback 路徑)
 
 // 將 bash-block 解析為標準 OpenAI tool_calls 格式
 // description 自動從命令內容生成（opencode bash 工具必填欄位）
@@ -587,86 +998,99 @@ const CHUNK = 32;
 // opencode 收到 tool_calls 後會自己執行工具、管理 agent loop，
 // 和 Claude/GPT 模型完全一致的體驗。
 
+// ─── 向量記憶 Recall ───
+// 每次對話前查詢 Memory Bridge，注入相關記憶
+
+const recallMemories = async (messages) => {
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const query =
+    typeof lastUser?.content === "string" ? lastUser.content.slice(0, 500) : "";
+  if (!query) return "";
+  try {
+    const res = await fetch(`${MEMORY_BRIDGE_URL}/api/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: 8 }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return "";
+    const data = await res.json();
+    if (!data.entries?.length) return "";
+    log.info(`🧠 Memory recall: ${data.entries.length} 筆相關記憶`);
+    return `相關記憶：\n${data.entries
+      .map(
+        (e, i) =>
+          `[${i + 1}] ${e.summary}（${e.category}, ${Math.round(e.score * 100)}%）`,
+      )
+      .join("\n")}\n\n根據上述相關記憶輔助回答。`;
+  } catch {
+    return "";
+  }
+};
+
 const runSinglePass = async (body) => {
   try {
     const { messages, tools, tool_choice, stream, ...rest } = body;
     let msgs = [...(messages || [])];
-    // 收集 prompt 文字供 token 估算
-    const promptText = (messages || [])
-      .map((m) => (typeof m.content === "string" ? m.content : "") + (m.role || ""))
-      .join(" ");
 
-    // 轉換 tool role → user role（qwen2api 不支援 tool role，需轉為模型能理解的格式）
-    // 否則 tool result 被 qwen2api 忽略，模型看不到結果會重複呼叫同一個工具 → 無限迴圈
-    msgs = msgs.map((m) => {
-      if (m.role === "tool") {
-        // 明確標記執行結果，空輸出不代表失敗，exit code 才是關鍵
-        const raw = m.content || "";
-        // 從結果中提取 exit code（如果有的話）
-        const exitMatch = raw.match(/exit code[:\s]*(\d+)/i);
-        const exitInfo = exitMatch ? `(exit code: ${exitMatch[1]})` : "";
-        // 判斷是否有實際輸出
-        const hasOutput =
-          raw
-            .replace(/\[exit code[:\]]+\d+/gi, "")
-            .replace(/stdout:|stderr:/gi, "")
-            .trim().length > 20;
-        const verdict = exitMatch
-          ? exitMatch[1] === "0"
-            ? "✅ 命令成功執行"
-            : `❌ 命令失敗 (exit ${exitMatch[1]})`
-          : "";
-        const summary = [
-          verdict,
-          exitInfo,
-          hasOutput ? `\n輸出:\n${raw}` : `\n(命令執行完畢，無輸出內容)`,
-        ]
-          .filter(Boolean)
-          .join(" ");
-        return {
-          role: "user",
-          content: `[工具執行結果] ${summary}`,
-        };
-      }
-      if (m.role === "assistant" && m.tool_calls) {
-        // 保留 content 但移除 tool_calls（qwen2api 不支援此欄位）
-        const { tool_calls, ...rest } = m;
-        return rest;
-      }
-      return m;
-    });
-
-    // 注入 tool-prompt 到 system message（讓 Qwen 知道有哪些工具）
-    if (tools?.length > 0) {
-      const toolPrompt = buildToolPrompt(tools);
-      const sysIdx = msgs.findIndex((m) => m.role === "system");
-      if (sysIdx >= 0) {
-        // 附加到既有 system message
-        msgs = msgs.map((m, i) =>
-          i === sysIdx ? { ...m, content: `${m.content}\n\n${toolPrompt}` } : m,
+    // 向量記憶注入：每次新對話前查詢相關記憶
+    const memCtx = await recallMemories(msgs);
+    if (memCtx) {
+      const hasSys = msgs.some((m) => m.role === "system");
+      if (hasSys) {
+        msgs = msgs.map((m) =>
+          m.role === "system"
+            ? { ...m, content: `${m.content}\n\n${memCtx}` }
+            : m,
         );
       } else {
-        // 插入新的 system message
-        msgs = [{ role: "system", content: toolPrompt }, ...msgs];
+        msgs = [{ role: "system", content: memCtx }, ...msgs];
       }
     }
 
+    // 收集 prompt 文字供 token 估算
+    const promptText = (messages || [])
+      .map(
+        (m) =>
+          (typeof m.content === "string" ? m.content : "") + (m.role || ""),
+      )
+      .join(" ");
+
+    // qwen2api 已支援原生 tool role 與 tools 參數（2026-06 驗證通過）
+    // 保持 messages 原始格式，不進行 role 轉換，直接透傳讓 qwen2api 原生處理
     const currentModel = routeModel(body);
     const isThinking =
       body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
 
-    // 單次轉發（不傳 tools，避免 qwen2api 不支援的 API 格式）
-    // enable_thinking: true 讓模型輸出 <think> 推理過程
-    const up = { ...rest, model: currentModel, messages: msgs, stream: false, enable_thinking: true };
+    const hasTools = tools?.length > 0;
+    msgs = injectCapabilityDef(msgs, hasTools);
+    const up = {
+      ...rest,
+      model: currentModel,
+      messages: msgs, // 原始格式，qwen2api 原生處理 tool/assistant.tool_calls
+      stream: false,
+      ...(hasTools ? { tools, tool_choice } : {}),
+      enable_thinking: isThinking,
+    };
     log.debug(
-      `📤 model=${up.model} msgs=${up.messages.length} tools=${tools?.length || 0}`,
+      `📤 model=${up.model} msgs=${up.messages.length} tools=${tools?.length || 0} think=${isThinking}`,
     );
 
-    const result = await postJSON(`${QWEN2API_URL}/v1/chat/completions`, up);
+    const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
+    const result = await postJSON(
+      `${QWEN2API_URL}/v1/chat/completions`,
+      up,
+      t,
+      CFG_TIMEOUT.retries,
+    );
     const choice = result?.choices?.[0];
     if (!choice) {
       return buildErrorResponse("上游無回應", currentModel);
     }
+
+    // 保留上游真實 usage（qwen2api/DashScope 回傳的實際 token 計數）
+    // 取代客戶端 Math.ceil(text.length/4) 的粗略估算，確保 opencode stats 準確
+    const upUsage = result?.usage;
 
     const msg = choice.message;
     const raw = msg?.content || "";
@@ -686,7 +1110,13 @@ const runSinglePass = async (body) => {
     const nativeCalls = msg?.tool_calls;
     if (nativeCalls?.length > 0) {
       log.info(`📬 原生 tool_calls x${nativeCalls.length}，透傳給 opencode`);
-      return buildToolCallResponse(nativeCalls, msg?.content, currentModel, promptText);
+      return buildToolCallResponse(
+        nativeCalls,
+        msg?.content,
+        currentModel,
+        promptText,
+        upUsage,
+      );
     }
 
     // 2) Bash-block → tool_calls 轉換（主要路徑，Qwen 偏好此格式）
@@ -740,7 +1170,9 @@ const runSinglePass = async (body) => {
         log.warn(`⛔ 重複命令偵測（核心: ${currCmd}），強制停止迴圈`);
         return buildTextResponse(
           `✓ 命令「${currCmd}」已執行成功（exit code: 0）。任務繼續進行，無需重複執行。`,
-          currentModel, promptText,
+          currentModel,
+          promptText,
+          upUsage,
         );
       }
 
@@ -754,31 +1186,307 @@ const runSinglePass = async (body) => {
       const contentWithThink = thinking
         ? `[推理過程]\n${thinking}\n\n${contentBeforeBash}`.trim()
         : contentBeforeBash || null;
-      return buildToolCallResponse(bashCalls, contentWithThink, currentModel, promptText);
+      return buildToolCallResponse(
+        bashCalls,
+        contentWithThink,
+        currentModel,
+        promptText,
+        upUsage,
+      );
     }
 
     // 3) 純文字回應 → 直接回傳（opencode 視為完成）
     log.debug(`✅ 純文字回應 ${raw.length}ch`);
-    return buildTextResponse(raw || "(空回應)", currentModel, promptText);
+    return buildTextResponse(
+      raw || "(空回應)",
+      currentModel,
+      promptText,
+      upUsage,
+    );
   } catch (e) {
     log.error(`❌ runSinglePass 失敗:`, e?.message || e);
     return buildErrorResponse(`處理過程中發生錯誤: ${e?.message || e}`, "qwen");
   }
 };
 
-// ─── Token 估算（簡易版：1 token ≈ 4 chars，中英文通用） ───
-let totalTokens = 0;
+// ─── streamSinglePass：真正的 SSE 串流轉發 ───
+//
+// 當 opencode 要求 stream=true 時，直接 pipe qwen2api 的 SSE 串流到客戶端。
+// qwen2api 已處理 DashScope SSE → OpenAI 格式的轉換，包含：
+//   - thinking/reasoning deltas（即時顯示推理過程）
+//   - text content deltas
+//   - tool_calls deltas（原生 <tool_call> 解析）
+//
+// 相較於 runSinglePass（等待完整回應才回傳），streamSinglePass：
+//   - 即時轉發，使用者立刻看到模型思考過程
+//   - 無長時間靜默（timeout 風險大幅降低）
+//   - 客戶端中斷時立即停止（透過 signal）
+//
+// 回傳 true = 串流已處理完畢（呼叫端無需再處理）
+// 回傳 false = 串流失敗（呼叫端應 fallback 到非串流模式）
+const streamSinglePass = async (body, res, msgId, model, signal) => {
+  try {
+    const { messages, tools, tool_choice, stream: _s, ...rest } = body;
+    let msgs = [...(messages || [])];
+
+    // 向量記憶注入：串流模式也查詢相關記憶
+    const memCtx = await recallMemories(msgs);
+    if (memCtx) {
+      const hasSys = msgs.some((m) => m.role === "system");
+      if (hasSys) {
+        msgs = msgs.map((m) =>
+          m.role === "system"
+            ? { ...m, content: `${m.content}\n\n${memCtx}` }
+            : m,
+        );
+      } else {
+        msgs = [{ role: "system", content: memCtx }, ...msgs];
+      }
+    }
+
+    // 原始訊息直接透傳（qwen2api 原生支援 tool role）
+    const currentModel = routeModel(body);
+    const isThinking =
+      body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
+
+    const hasTools = tools?.length > 0;
+    msgs = injectCapabilityDef(msgs, hasTools);
+    const up = {
+      ...rest,
+      model: currentModel,
+      messages: msgs,
+      stream: true,
+      ...(hasTools ? { tools, tool_choice } : {}),
+      enable_thinking: isThinking,
+    };
+    log.info(
+      `📡 stream model=${up.model} msgs=${up.messages.length} tools=${tools?.length || 0} think=${isThinking}`,
+    );
+
+    const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
+    // 合併客戶端中斷 signal + timeout signal
+    const fetchSignal =
+      typeof AbortSignal.timeout === "function" &&
+      typeof AbortSignal.any === "function"
+        ? AbortSignal.any([signal, AbortSignal.timeout(t)])
+        : signal;
+    const resp = await fetch(`${QWEN2API_URL}/v1/chat/completions`, {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify(up),
+      signal: fetchSignal,
+    });
+
+    if (!resp.ok || !resp.body) {
+      log.info(`串流請求失敗 (${resp.status})，降級為非串流模式`);
+      return false;
+    }
+
+    // 設置 SSE headers（若尚未設定）
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no", // P18: 禁用 Nginx/反向代理緩衝，確保即時串流
+      });
+    }
+
+    // Pipe qwen2api SSE 串流到客戶端
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let ok = true;
+    let sawDone = false;
+
+    // SSE heartbeat 防止 opencode wrapSSE chunk timeout（預設 120s，heartbeat 每 10s 發送）
+    // 當模型長時間推理思考無新 chunk 時，heartbeat 可重置 opencode 端的閒置計時器
+    const HEARTBEAT_MS = 10_000; // 縮短至 10s，更積極防止 opencode wrapSSE timeout
+    let lastData = Date.now();
+    const hbTimer = setInterval(() => {
+      if (Date.now() - lastData >= HEARTBEAT_MS) {
+        try {
+          // SSE comment (:) 會被所有標準 SSE parser 忽略，但能重置 timeout
+          res.write(": heartbeat\n\n");
+          lastData = Date.now(); // 更新時間戳，避免連續發送
+        } catch {
+          clearInterval(hbTimer);
+        }
+      }
+    }, HEARTBEAT_MS);
+
+    // 追蹤是否曾收到/轉發過任何資料（判斷空串流 timeout vs 中途斷流）
+    let gotAnyData = false;
+    let chunkCount = 0; // P3: 統計 chunk 數量用於診斷
+    const streamStartTime = Date.now(); // P13: 記錄串流開始時間
+
+    while (true) {
+      // 讀取逾時保護：使用 CFG_TIMEOUT 值（聊天 5min / thinking 10min）
+      // 首個 chunk 需要更長等待（qwen2api 可能排隊中），非硬編碼 120s
+      // P15: 動態調整首包超時，若已收到資料則使用較短超時避免卡死
+      const isFirstChunk = chunkCount === 0;
+      const readTimeout = isFirstChunk
+        ? Math.min(t, 60000)
+        : Math.min(t, 30000);
+      let readResult;
+      try {
+        readResult = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("read_timeout")), readTimeout),
+          ),
+        ]);
+      } catch (e) {
+        if (e?.message === "read_timeout") {
+          if (gotAnyData) {
+            log.warn(
+              `⚠️ 上游串流中斷逾時 (${t / 1000}s, chunks=${chunkCount})，視為串流中斷`,
+            );
+          } else {
+            log.warn(
+              `⚠️ 上游等待首個 chunk 逾時 (${t / 1000}s)，可能上游忙碌中`,
+            );
+          }
+        } else {
+          log.debug(`🔚 上游串流讀取中斷: ${e?.message || e}`);
+        }
+        // reader.cancel 在 cleanup 時處理
+        break;
+      }
+
+      const { done, value } = readResult;
+      if (done) break;
+      const now = Date.now();
+      lastData = now; // 收到資料即重設計時器
+
+      const chunk = decoder.decode(value, { stream: true });
+      if (!chunk) continue;
+      chunkCount++; // P3: 遞增 chunk 計數
+
+      // P14: 記錄首個 chunk 到達延遲
+      if (chunkCount === 1) {
+        const firstChunkDelay = now - streamStartTime;
+        log.info(`⏱️ 首個 chunk 延遲: ${firstChunkDelay}ms`);
+      }
+
+      // 收到 [DONE] 立即跳出，不等待上游關閉連線（常見卡死根因）
+      if (chunk.includes("data: [DONE]")) {
+        sawDone = true;
+        try {
+          res.write(chunk);
+        } catch {
+          /* 客戶端可能已斷線 */
+        }
+        break;
+      }
+
+      try {
+        const wrote = res.write(chunk);
+        gotAnyData = true;
+        // P16: 若 write() 返回 false（緩衝區滿），等待 drain 事件避免資料遺失
+        // P20: 增加超時保護，避免無限等待 drain 導致卡死
+        if (!wrote) {
+          const drained = await Promise.race([
+            new Promise((resolve) => res.once("drain", () => resolve(true))),
+            new Promise((resolve) => setTimeout(() => resolve(false), 5000)),
+          ]);
+          if (!drained) {
+            log.warn("⚠️ 客戶端緩衝區 drain 超時，強制繼續");
+          }
+        }
+      } catch (e) {
+        log.warn(`⚠️ 寫入客戶端失敗 (${e.message})，串流中斷`);
+        ok = false;
+        // P17: 立即發送錯誤 event 給客戶端，避免客戶端無限等待
+        if (!res.writableEnded) {
+          try {
+            res.write(
+              `data: {"error":"串流傳輸中斷","error_code":"client_write_failed","detail":"${e.message}"}\n\n`,
+            );
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } catch {
+            /* ignore */
+          }
+        }
+        break;
+      }
+    }
+
+    clearInterval(hbTimer);
+
+    // 確保串流結尾：若上游未發 [DONE]，補發避免 client 卡住
+    if (ok && !res.writableEnded) {
+      if (gotAnyData) {
+        // 正常串流結束或中途斷流 → 補發 [DONE]
+        if (!sawDone) {
+          log.warn(
+            `⚠️ 上游未發送 [DONE]（chunks=${chunkCount}），補發結束標記`,
+          );
+          res.write("data: [DONE]\n\n");
+        }
+        res.end();
+      } else {
+        // 從未收到任何資料 → 發送錯誤 event 而非空 [DONE]
+        // 避免客戶端收到「200 OK + 0 內容串流」誤以為無回應
+        log.warn(`❌ 上游未回應任何資料（timeout=${t / 1000}s），發送錯誤通知`);
+        try {
+          res.write(
+            `data: {"error":"上游忙碌無回應，請稍後重試或檢查 qwen2api 狀態","error_code":"upstream_timeout","timeout_sec":${t / 1000},"suggestion":"若持續發生，請檢查 qwen2api 日誌或降低模型複雜度"}\n\n`,
+          );
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } catch {
+          /* ignore */
+        }
+        ok = false;
+      }
+    } else if (!ok) {
+      try {
+        reader.cancel();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    return ok;
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      log.warn("🛑 串流被客戶端中斷或超時");
+      return true;
+    }
+    log.error("❌ streamSinglePass 失敗:", e?.message || e);
+    return false;
+  }
+};
+
+// ─── Token 估算（後備方案：上游無 usage 時使用 1 token ≈ 4 chars） ───
 const countTokens = (s) => Math.ceil((s || "").length / 4);
-const trackUsage = (prompt, completion) => {
-  const p = countTokens(prompt);
-  const c = countTokens(completion);
-  totalTokens += p + c;
-  return { prompt_tokens: p, completion_tokens: c, total_tokens: p + c };
+const trackUsage = (prompt, completion) => ({
+  prompt_tokens: countTokens(prompt),
+  completion_tokens: countTokens(completion),
+  total_tokens: countTokens(prompt) + countTokens(completion),
+});
+
+// ─── 優先使用上游真實 usage，否則降級為字元估算 ───
+const pickUsage = (upstreamUsage, promptText, completionText) => {
+  if (
+    upstreamUsage?.prompt_tokens != null &&
+    upstreamUsage?.total_tokens != null
+  ) {
+    return {
+      prompt_tokens: upstreamUsage.prompt_tokens,
+      completion_tokens:
+        upstreamUsage.completion_tokens ??
+        upstreamUsage.total_tokens - upstreamUsage.prompt_tokens,
+      total_tokens: upstreamUsage.total_tokens,
+    };
+  }
+  return trackUsage(promptText, completionText);
 };
 
 // ─── Response builders ───
 
-const buildTextResponse = (content, model, promptMsgs = "") => ({
+const buildTextResponse = (content, model, promptMsgs = "", upstreamUsage) => ({
   id: `chatcmpl-${Date.now()}`,
   object: "chat.completion",
   created: Math.round(Date.now() / 1000),
@@ -790,10 +1498,16 @@ const buildTextResponse = (content, model, promptMsgs = "") => ({
       finish_reason: "stop",
     },
   ],
-  usage: trackUsage(promptMsgs, content),
+  usage: pickUsage(upstreamUsage, promptMsgs, content),
 });
 
-const buildToolCallResponse = (toolCalls, content, model, promptMsgs = "") => {
+const buildToolCallResponse = (
+  toolCalls,
+  content,
+  model,
+  promptMsgs = "",
+  upstreamUsage,
+) => {
   const argsStr = (toolCalls || [])
     .map((tc) => tc.function?.arguments || "")
     .join("");
@@ -813,7 +1527,7 @@ const buildToolCallResponse = (toolCalls, content, model, promptMsgs = "") => {
         finish_reason: "tool_calls",
       },
     ],
-    usage: trackUsage(promptMsgs, argsStr),
+    usage: pickUsage(upstreamUsage, promptMsgs, argsStr),
   };
 };
 
@@ -992,7 +1706,12 @@ const handleRequest = async (req, res) => {
     if (!checkRL(ip)) {
       log.warn(`⚠️ Rate limit 觸發: ${ip}`);
       res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Too Many Requests", retryAfter: Math.ceil(RL_WIN / 1000) }));
+      res.end(
+        JSON.stringify({
+          error: "Too Many Requests",
+          retryAfter: Math.ceil(RL_WIN / 1000),
+        }),
+      );
       return;
     }
   }
@@ -1001,7 +1720,7 @@ const handleRequest = async (req, res) => {
   if (url !== "/health") {
     const auth = req.headers.authorization;
     if (!auth || auth !== `Bearer ${API_KEY}`) {
-      log.warn(`⚠️ 拒絕未經授權的請求: ${req.method} ${url}`);
+      log.info(`拒絕未經授權的請求: ${req.method} ${url}`);
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized: Invalid API Key" }));
       return;
@@ -1066,6 +1785,16 @@ const handleRequest = async (req, res) => {
   if (url === "/v1/chat/completions" && req.method === "POST") {
     let body = "";
     let rejected = false;
+
+    // 客戶端斷線偵測（在 data/end 之前註冊，避免 stream 結束後 close 立即觸發）
+    const ac = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        log.info("🛑 客戶端斷線，中止上游請求");
+        ac.abort();
+      }
+    });
+
     req.on("data", (c) => {
       if (rejected) return;
       body += c;
@@ -1094,20 +1823,50 @@ const handleRequest = async (req, res) => {
           `📨 請求 model=${parsed.model} tools=${parsed.tools?.length || 0} stream=${parsed.stream}`,
         );
 
+        // 記錄使用者訊息到對話歷史
+        if (parsed.messages) {
+          for (const m of parsed.messages) {
+            if (m.role === "user" && m.content) {
+              convRecord(
+                "user",
+                typeof m.content === "string"
+                  ? m.content
+                  : JSON.stringify(m.content),
+                model,
+              );
+            }
+          }
+        }
+
+        // 套用對話記憶（壓縮歷史、過濾閒聊、注入摘要）
+        if (CONV_MEMORY_ENABLED && parsed.messages) {
+          parsed.messages = processWithMemory(parsed.messages);
+        }
+
         if (parsed.stream) {
-          // 串流：runSinglePass 後串流結果（支援 tool_calls 串流格式）
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          });
-          const result = await runSinglePass(parsed);
-          const c = result?.choices?.[0];
-          const hasCalls = c?.message?.tool_calls?.length > 0;
-          log.info(
-            `✅ 串流回應 ${hasCalls ? `tool_calls x${c.message.tool_calls.length}` : `content=${(c?.message?.content || "").length}ch`}`,
+          // 串流：使用 streamSinglePass（真實 SSE 轉發）
+          // 不再使用 runSinglePass + streamResponse 模擬 SSE，避免第二個請求
+          // 因等待 qwen2api 排隊而逾時（客戶端收不到任何資料 =「無回應」）
+          const ok = await streamSinglePass(
+            parsed,
+            res,
+            msgId,
+            model,
+            ac.signal,
           );
-          streamResponse(res, msgId, model, result);
+          // streamSinglePass 失敗時已發送錯誤 event（gotAnyData=false 分支）
+          // 若 headers 尚未送出（極端情況），補發 500
+          if (!ok && !res.headersSent) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: "上游串流失敗",
+                detail: "stream_single_pass_failed",
+              }),
+            );
+          }
+          // 串流模式：記錄標記（無法即時擷取完整串流內容）
+          convRecord("assistant", "[串流回應已發送]", model);
         } else {
           // 非串流
           const result = await runSinglePass(parsed);
@@ -1116,6 +1875,18 @@ const handleRequest = async (req, res) => {
           log.info(
             `✅ 回應 ${hasCalls ? `tool_calls x${c.message.tool_calls.length}` : `content=${(c?.message?.content || "").length}ch`}`,
           );
+          // 記錄助手回覆到對話歷史
+          const replyContent = c?.message?.content || "";
+          if (replyContent) {
+            convRecord("assistant", replyContent, model);
+          }
+          if (hasCalls) {
+            convRecord(
+              "assistant",
+              `[工具呼叫: ${c.message.tool_calls.map((t) => t.function?.name || "?").join(", ")}]`,
+              model,
+            );
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
         }
@@ -1149,8 +1920,8 @@ export const startProxy = () => {
       }
       reject(e);
     });
-    server.listen(PROXY_PORT, "127.0.0.1", () => {
-      log.info(`🤖 Chat Proxy running on http://127.0.0.1:${PROXY_PORT}`);
+    server.listen(PROXY_PORT, "0.0.0.0", () => {
+      log.info(`🤖 Chat Proxy running on http://0.0.0.0:${PROXY_PORT}`);
       if (process.env.PROXY_ROUTE !== "off") {
         log.info("🧠 模型路由: 啟用（自動依任務複雜度切換）");
       }
@@ -1177,3 +1948,11 @@ const getRouteInfo = () => ({
 });
 
 export { PROXY_PORT, getRouteInfo };
+
+// ─── 獨立啟動（直接執行此檔案時自動啟動 server） ───
+if (Bun.main === import.meta.path) {
+  startProxy().catch((e) => {
+    console.error("[proxy] FATAL: 啟動失敗:", e?.message || e);
+    process.exit(1);
+  });
+}

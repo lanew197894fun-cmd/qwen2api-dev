@@ -1,5 +1,8 @@
 const { isJson, generateUUID } = require("../utils/tools.js");
-const { createUsageObject } = require("../utils/precise-tokenizer.js");
+const {
+  countTokens,
+  createUsageObject,
+} = require("../utils/precise-tokenizer.js");
 const { sendChatRequest } = require("../utils/request.js");
 const {
   createToolCallStreamParser,
@@ -100,6 +103,15 @@ const handleStreamResponse = async (
   requestBody = null,
   options = {},
 ) => {
+  // P0-2: 客戶端斷線偵測
+  const abortController = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      abortController.abort();
+      logger.info("客戶端斷線，中止上游請求", "CHAT");
+    }
+  });
+
   try {
     const message_id = generateUUID();
     let web_search_info = null;
@@ -118,7 +130,8 @@ const handleStreamResponse = async (
       completion_tokens: 0,
       total_tokens: 0,
     };
-    let completionContent = ""; // 收集完整的回覆內容用於token估算
+    // P0: 移除 completionContent，改用增量 token 計數器以避免記憶體洩漏
+    let completionTokenCount = 0;
 
     // 提取prompt文本用於token估算
     let promptText = "";
@@ -136,7 +149,7 @@ const handleStreamResponse = async (
     }
 
     /**
-     * 寫一個標準 OpenAI 文本增量
+     * 寫一個標準 OpenAI 文本增量（content）
      * @param {string} text - 文本內容
      */
     const writeContentDelta = (text) => {
@@ -150,6 +163,29 @@ const handleStreamResponse = async (
             {
               index: 0,
               delta: { content: text },
+              finish_reason: null,
+            },
+          ],
+        })}\n\n`,
+      );
+    };
+
+    /**
+     * 寫一個 reasoning 增量（OpenAI 標準 reasoning_content）
+     * 讓 AI SDK 正確識別為 reasoning part，而非一般文字
+     * @param {string} text - reasoning 內容
+     */
+    const writeReasoningDelta = (text) => {
+      if (!text) return;
+      res.write(
+        `data: ${JSON.stringify({
+          id: `chatcmpl-${message_id}`,
+          object: "chat.completion.chunk",
+          created: Math.round(new Date().getTime() / 1000),
+          choices: [
+            {
+              index: 0,
+              delta: { reasoning_content: text },
               finish_reason: null,
             },
           ],
@@ -270,7 +306,8 @@ const handleStreamResponse = async (
           }
         } else if (newImageMarkdownList.length > 0) {
           const imageContent = `${newImageMarkdownList.join("\n\n")}\n\n`;
-          completionContent += imageContent;
+          // P0: 增量計算 token
+          completionTokenCount += countTokens(imageContent);
           newImageMarkdownList.forEach((item) =>
             emittedImageMarkdownSet.add(item),
           );
@@ -287,32 +324,41 @@ const handleStreamResponse = async (
       }
 
       let content = delta.content;
-      completionContent += content;
 
-      if (delta.phase === "think" && !thinking_start) {
-        thinking_start = true;
-        if (web_search_info) {
-          content = `<think>\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n${content}`;
-        } else {
-          content = `<think>\n\n${content}`;
+      if (delta.phase === "think") {
+        if (!thinking_start) {
+          thinking_start = true;
+          // 在 reasoning 開頭嵌入 web_search 資訊
+          if (web_search_info) {
+            writeReasoningDelta(
+              `\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n`,
+            );
+          }
         }
+        // P0: 增量計算 token，避免儲存完整字串
+        completionTokenCount += countTokens(content);
+        writeReasoningDelta(content);
+        return; // thinking 內容只走 reasoning_content，不走 content
       }
-      if (delta.phase === "answer" && !thinking_end && thinking_start) {
+
+      // delta.phase === "answer"
+      if (!thinking_end && thinking_start) {
         thinking_end = true;
+        // 切換到 answer 時，flush 在 thinking 期間累積的圖片
         if (pendingImageMarkdownList.length > 0) {
           const pendingImageContent = `${pendingImageMarkdownList.join("\n\n")}\n\n`;
-          content = `\n\n</think>\n${pendingImageContent}${content}`;
-          completionContent += pendingImageContent;
+          completionTokenCount += countTokens(pendingImageContent);
           pendingImageMarkdownList.forEach((item) =>
             emittedImageMarkdownSet.add(item),
           );
           pendingImageMarkdownList = [];
-        } else {
-          content = `\n\n</think>\n${content}`;
+          writeContentDelta(pendingImageContent);
         }
       }
 
-      if (toolParser && delta.phase === "answer") {
+      completionTokenCount += countTokens(content);
+
+      if (toolParser) {
         const parsed = toolParser.push(content);
         if (parsed.textDelta) writeContentDelta(parsed.textDelta);
         if (parsed.completedCalls.length > 0)
@@ -325,48 +371,164 @@ const handleStreamResponse = async (
     /**
      * 把一個上游響應流接入解析與轉發管線，等其結束
      * @param {object} upstreamResponse - axios stream 響應
+     * @param {AbortController} [abortController] - 客戶端斷線中止控制器
      * @returns {Promise<void>} 流處理完成的 Promise
      */
-    const pipeUpstream = (upstreamResponse) =>
+    const pipeUpstream = (upstreamResponse, abortController = null) =>
       new Promise((resolve, reject) => {
         const decoder = new TextDecoder("utf-8");
-        let buffer = "";
+        // P1: 改用 Buffer 物件避免字串拼接記憶體洩漏
+        let buffer = Buffer.alloc(0);
+        let processing = false;
+        const queue = [];
+        const MAX_QUEUE_SIZE = 3000; // P0-1: 降低佇列上限，更早觸發背壓保護
+        const DROP_THRESHOLD = 2000; // P2: 佇列達到 66% 時開始丟棄舊數據
+        let isPaused = false;
+        let drainTimer = null; // P21: 防止 resume 後再次快速填滿
 
-        upstreamResponse.on("data", async (chunk) => {
-          const decodeText = decoder.decode(chunk, { stream: true });
-          buffer += decodeText;
+        // 非同步處理佇列，避免阻塞 stream data 事件
+        const processQueue = async () => {
+          if (processing || queue.length === 0) return;
+          processing = true;
+          try {
+            // P22: 批次處理，避免單個 chunk 處理過慢導致整體卡住
+            const batchSize = Math.min(queue.length, 50);
+            for (let i = 0; i < batchSize; i++) {
+              const item = queue.shift();
+              if (!item) break;
+              try {
+                await processSSEPayload(item);
+              } catch (error) {
+                logger.error("流式資料處理錯誤", "CHAT", "", error);
+              }
+            }
+          } finally {
+            processing = false;
+            // P12: 若佇列低於閾值且曾暫停，立即恢復上游
+            if (isPaused && queue.length < DROP_THRESHOLD) {
+              isPaused = false;
+              upstreamResponse.resume();
+              logger.info(`🔄 佇列降至 ${queue.length} (<${DROP_THRESHOLD})，恢復上游 stream`, "CHAT");
+              // P21: 設定冷卻時間，避免瞬間再次填滿
+              if (drainTimer) clearTimeout(drainTimer);
+              drainTimer = setTimeout(() => { drainTimer = null; }, 2000);
+            }
+            if (queue.length > 0) {
+              setImmediate(processQueue);
+            }
+          }
+        };
 
-          const chunks = [];
+        upstreamResponse.on("data", (chunk) => {
+          // P0-2: 客戶端斷線時立即中止
+          if (abortController?.signal.aborted) {
+            upstreamResponse.destroy();
+            return;
+          }
+
+          // P1: 使用 Buffer.concat 避免字串拼接
+          buffer = Buffer.concat([buffer, chunk]);
+
           let startIndex = 0;
-
           while (true) {
             const dataStart = buffer.indexOf("data: ", startIndex);
             if (dataStart === -1) break;
             const dataEnd = buffer.indexOf("\n\n", dataStart);
             if (dataEnd === -1) break;
-            const dataChunk = buffer.substring(dataStart, dataEnd).trim();
-            chunks.push(dataChunk);
+            // P1: 使用 subarray 避免底層記憶體共享
+            const dataChunk = buffer
+              .subarray(dataStart + 6, dataEnd)
+              .toString("utf-8")
+              .trim();
+            if (dataChunk) {
+              // P2: 激進背壓 - 丟棄舊數據
+              if (queue.length >= DROP_THRESHOLD) {
+                const dropCount = queue.length - DROP_THRESHOLD;
+                queue.splice(0, dropCount);
+                logger.warn(`佇列過載，丟棄 ${dropCount} 條舊數據`, "CHAT");
+              }
+              queue.push(dataChunk);
+            }
             startIndex = dataEnd + 2;
           }
 
           if (startIndex > 0) {
-            buffer = buffer.substring(startIndex);
+            buffer = buffer.subarray(startIndex);
           }
 
-          for (const item of chunks) {
-            try {
-              await processSSEPayload(item.replace("data: ", ""));
-            } catch (error) {
-              logger.error("流式資料處理錯誤", "CHAT", "", error);
-            }
+          // P1: 定期重置 buffer 避免長期持有大塊記憶體
+          if (buffer.length > 1024 * 1024) {
+            buffer = Buffer.from(buffer);
+          }
+
+          // P0-1: 背壓控制 - 佇列過大時暫停上游
+          if (queue.length >= MAX_QUEUE_SIZE && !isPaused && !drainTimer) {
+            isPaused = true;
+            upstreamResponse.pause();
+            logger.warn(`⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游 (chunks=${chunkCount}, queue=${queue.length})`, "CHAT");
+          }
+
+          // P11: 偵測上游是否已自動恢復（某些情況下 pause/resume 可能不同步）
+          // P21: 加入 drainTimer 檢查，避免在冷卻期間頻繁觸發 resume
+          if (isPaused && queue.length < DROP_THRESHOLD && !processing && !drainTimer) {
+            // 若佇列已低於閾值且未在处理中，但上游仍處於暫停狀態，強制恢復
+            // 這防止因 processQueue 延遲導致上游長時間暫停
+            logger.debug(`🔄 佇列降至 ${queue.length}，檢查上游狀態`, "CHAT");
+          }
+
+          if (!processing) {
+            setImmediate(processQueue);
           }
         });
 
-        upstreamResponse.on("end", () => resolve());
-        upstreamResponse.on("error", (err) => reject(err));
+        upstreamResponse.on("end", () => {
+          logger.debug(`上游 stream 結束，佇列剩餘: ${queue.length}`, "CHAT");
+          // P23: 強制刷新殘留佇列，避免最後幾個 chunk 遺失導致客戶端卡住
+          const flushRemaining = async () => {
+            while (queue.length > 0) {
+              const item = queue.shift();
+              try {
+                await processSSEPayload(item);
+              } catch (error) {
+                logger.error("流式資料處理錯誤 (flush)", "CHAT", "", error);
+              }
+            }
+            logger.debug("佇列已清空，resolve pipeUpstream", "CHAT");
+            resolve();
+          };
+          flushRemaining();
+        });
+
+        upstreamResponse.on("error", (err) => {
+          logger.error(`流式響應讀取錯誤: ${err.message}`, "CHAT", "", err);
+          // 僅在回應尚未結束時嘗試發送錯誤訊息
+          if (!res.writableEnded) {
+            try {
+              res.write(
+                `data: ${JSON.stringify({
+                  id: `chatcmpl-${message_id}`,
+                  object: "chat.completion.chunk",
+                  created: Math.round(new Date().getTime() / 1000),
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason: "error",
+                    },
+                  ],
+                })}\n\n`,
+              );
+              res.end();
+            } catch (_) {
+              /* response may already be closed */
+            }
+          }
+          reject(err); // 改為 reject，讓呼叫者感知錯誤
+        });
       });
 
-    await pipeUpstream(response);
+    // P0-2: 傳遞 abortController 給 pipeUpstream
+    await pipeUpstream(response, options.abortController || null);
 
     // tool_choice="required" 強校驗：未觸發任何工具呼叫則追加更強提示重試一次
     if (
@@ -376,8 +538,10 @@ const handleStreamResponse = async (
       requiresToolCall(toolChoice)
     ) {
       const retryHint = buildRequiredRetryHint(toolChoice);
+      // P2-1: 重試時保留 requestId 以維持冪等性
       const retryBody = {
         ...requestBody,
+        requestId: requestBody.requestId,
         messages: [
           ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
           { role: "system", content: retryHint },
@@ -390,7 +554,10 @@ const handleStreamResponse = async (
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
-          await pipeUpstream(retryResp.response);
+          await pipeUpstream(
+            retryResp.response,
+            options.abortController || null,
+          );
         }
       } catch (e) {
         logger.error("required 模式重試失敗", "CHAT", "", e);
@@ -405,9 +572,9 @@ const handleStreamResponse = async (
         writeToolCallsDelta(tail.completedCalls);
     }
 
-    // 處理最終的搜尋資訊
+    // 處理最終的搜尋資訊（僅在 thinking 未發生時才補在結尾）
     if (
-      (config.outThink === false || !enable_thinking) &&
+      !thinking_start &&
       web_search_info &&
       config.searchInfoMode === "text"
     ) {
@@ -418,18 +585,23 @@ const handleStreamResponse = async (
       writeContentDelta(`\n\n---\n${webSearchTable}`);
     }
 
-    // 計算最終的token使用量
+    // P0: 使用增量 token 計數器計算最終使用量，避免傳遞大字串
     if (
       totalTokens.prompt_tokens === 0 &&
       totalTokens.completion_tokens === 0
     ) {
-      totalTokens = createUsageObject(
-        requestBody?.messages || promptText,
-        completionContent,
-        null,
+      const promptTokens = countTokens(
+        requestBody?.messages
+          ? JSON.stringify(requestBody.messages)
+          : promptText,
       );
+      totalTokens = {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokenCount,
+        total_tokens: promptTokens + completionTokenCount,
+      };
       logger.debug(
-        `流式使用tiktoken計算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
+        `流式使用tiktoken增量計算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
         "CHAT",
       );
     } else {
@@ -507,7 +679,8 @@ const handleNonStreamResponse = async (
   options = {},
 ) => {
   try {
-    let fullContent = "";
+    let answerContent = "";
+    let thinkingContent = "";
     let web_search_info = null;
     let thinking_start = false;
     let thinking_end = false;
@@ -549,7 +722,7 @@ const handleNonStreamResponse = async (
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
 
-        upstreamResponse.on("data", async (chunk) => {
+        upstreamResponse.on("data", (chunk) => {
           const decodeText = decoder.decode(chunk, { stream: true });
           buffer += decodeText;
 
@@ -615,7 +788,7 @@ const handleNonStreamResponse = async (
                     }
                   }
                 } else if (newImageMarkdownList.length > 0) {
-                  fullContent += `${newImageMarkdownList.join("\n\n")}\n\n`;
+                  answerContent += `${newImageMarkdownList.join("\n\n")}\n\n`;
                   newImageMarkdownList.forEach((it) =>
                     appendedImageMarkdownSet.add(it),
                   );
@@ -632,33 +805,26 @@ const handleNonStreamResponse = async (
 
               let content = delta.content;
 
-              if (delta.phase === "think" && !thinking_start) {
+              if (delta.phase === "think") {
                 thinking_start = true;
-                if (web_search_info) {
-                  const webSearchTable =
-                    await accountManager.generateMarkdownTable(
-                      web_search_info,
-                      config.searchInfoMode,
-                    );
-                  content = `<think>\n\n${webSearchTable}\n\n${content}`;
-                } else {
-                  content = `<think>\n\n${content}`;
-                }
+                thinkingContent += content;
+                continue; // thinking 不進 answerContent
               }
-              if (delta.phase === "answer" && !thinking_end && thinking_start) {
+
+              // delta.phase === "answer"
+              if (!thinking_end && thinking_start) {
                 thinking_end = true;
+                // flush pending images on transition
                 if (pendingImageMarkdownList.length > 0) {
-                  content = `\n\n</think>\n${pendingImageMarkdownList.join("\n\n")}\n\n${content}`;
+                  answerContent += `${pendingImageMarkdownList.join("\n\n")}\n\n`;
                   pendingImageMarkdownList.forEach((it) =>
                     appendedImageMarkdownSet.add(it),
                   );
                   pendingImageMarkdownList = [];
-                } else {
-                  content = `\n\n</think>\n${content}`;
                 }
               }
 
-              fullContent += content;
+              answerContent += content;
             } catch (error) {
               logger.error("非流式資料處理錯誤", "CHAT", "", error);
             }
@@ -667,18 +833,24 @@ const handleNonStreamResponse = async (
 
         upstreamResponse.on("end", () => resolve());
         upstreamResponse.on("error", (err) => {
-          logger.error("非流式響應流讀取錯誤", "CHAT", "", err);
-          reject(err);
+          logger.error(
+            "非流式響應讀取錯誤，以已累積資料繼續處理",
+            "CHAT",
+            "",
+            err,
+          );
+          logger.error(`錯誤詳情: ${err.message}\n堆疊: ${err.stack}`, "CHAT");
+          resolve();
         });
       });
 
     await accumulateUpstream(response);
 
-    // 工具呼叫解析：從 fullContent 抽取 <tool_call> 塊
-    let assistantContent = fullContent;
+    // 工具呼叫解析：從 answerContent 抽取 <tool_call> 塊
+    let assistantContent = answerContent;
     let toolCalls = [];
     if (hasTools) {
-      const parsed = parseToolCallsFromText(fullContent);
+      const parsed = parseToolCallsFromText(answerContent);
       assistantContent = parsed.cleanedText;
       toolCalls = parsed.toolCalls;
     }
@@ -686,8 +858,10 @@ const handleNonStreamResponse = async (
     // tool_choice="required" 強校驗：未觸發則重試一次
     if (hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)) {
       const retryHint = buildRequiredRetryHint(toolChoice);
+      // P2-1: 重試時保留 requestId 以維持冪等性
       const retryBody = {
         ...requestBody,
+        requestId: requestBody.requestId,
         messages: [
           ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
           { role: "system", content: retryHint },
@@ -700,13 +874,14 @@ const handleNonStreamResponse = async (
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
-          const before = fullContent;
+          const before = answerContent;
           await accumulateUpstream(retryResp.response);
-          const retriedText = fullContent.slice(before.length);
+          const retriedText = answerContent.slice(before.length);
           const parsedRetry = parseToolCallsFromText(retriedText);
           if (parsedRetry.toolCalls.length > 0) {
             toolCalls = parsedRetry.toolCalls;
-            assistantContent = parseToolCallsFromText(fullContent).cleanedText;
+            assistantContent =
+              parseToolCallsFromText(answerContent).cleanedText;
           }
         }
       } catch (e) {
@@ -714,9 +889,9 @@ const handleNonStreamResponse = async (
       }
     }
 
-    // 處理最終的搜尋資訊
+    // 處理最終的搜尋資訊（僅在 thinking 未發生時才補在結尾）
     if (
-      (config.outThink === false || !enable_thinking) &&
+      !thinking_start &&
       web_search_info &&
       config.searchInfoMode === "text"
     ) {
@@ -726,6 +901,11 @@ const handleNonStreamResponse = async (
       );
       assistantContent += `\n\n---\n${webSearchTable}`;
     }
+
+    // 合併 thinking + answer 用於 token 估算
+    const fullContent = thinkingContent
+      ? `${thinkingContent}\n\n${assistantContent}`
+      : assistantContent;
 
     // 計算最終的token使用量
     if (
@@ -760,6 +940,9 @@ const handleNonStreamResponse = async (
       role: "assistant",
       content: assistantContent || null,
     };
+    if (thinkingContent) {
+      assistantMessage.reasoning_content = thinkingContent;
+    }
     if (toolCalls.length > 0) {
       assistantMessage.tool_calls = toolCalls;
     }
@@ -802,21 +985,40 @@ const handleChatCompletion = async (req, res) => {
     const response_data = await sendChatRequest(req.body);
 
     if (!response_data.status || !response_data.response) {
-      res.status(500).json({
-        error: "請求傳送失敗！！！",
+      const errDetail = response_data.error || "未知錯誤";
+      const userMsg = response_data.userMessage;
+      res.status(503).json({
+        error: userMsg || `請求傳送失敗: ${errDetail}`,
+        detail: errDetail,
+        hint:
+          errDetail === "no_token"
+            ? "Token 已過期，系統正在背景自動更新（auto-get-token.js）。請稍後再試，或手動執行: cd qwen2api && bun auto-get-token.js"
+            : undefined,
       });
       return;
     }
 
     if (stream) {
       setResponseHeaders(res, true);
+      // P0-2: 傳遞 abortController 以支援客戶端斷線中止
+      const abortController = new AbortController();
+      req.on("close", () => {
+        if (!res.writableEnded) {
+          abortController.abort();
+          logger.info("客戶端請求中斷，中止上游", "CHAT");
+        }
+      });
       await handleStreamResponse(
         res,
         response_data.response,
         enable_thinking,
         enable_web_search,
         req.body,
-        { has_tools: req.has_tools, tool_choice: req.tool_choice },
+        {
+          has_tools: req.has_tools,
+          tool_choice: req.tool_choice,
+          abortController,
+        },
       );
     } else {
       setResponseHeaders(res, false);
@@ -832,8 +1034,14 @@ const handleChatCompletion = async (req, res) => {
     }
   } catch (error) {
     logger.error("聊天處理錯誤", "CHAT", "", error);
+    const isAuth =
+      error.message?.includes("401") ||
+      error.message?.includes("403") ||
+      error.message?.includes("token");
     res.status(500).json({
-      error: "token無效,請求傳送失敗！！！",
+      error: isAuth
+        ? "token無效,請求傳送失敗"
+        : `請求傳送失敗: ${error.message || "未知錯誤"}`,
     });
   }
 };

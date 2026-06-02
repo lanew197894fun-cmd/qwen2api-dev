@@ -7,3 +7,7 @@ logs/
 dist/
 .idea
 /public/dist
+*.bak
+*.backup*
+*.orig
+telegram-memory-bridge/.env

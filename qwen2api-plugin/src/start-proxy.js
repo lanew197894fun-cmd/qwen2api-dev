@@ -16,7 +16,7 @@ const LV = (() => {
   if (raw && LOG_LEVELS[raw] !== undefined) return LOG_LEVELS[raw];
   if (process.env.PROXY_QUIET === "true" || process.env.PROXY_QUIET === "1")
     return 0;
-  return 2; // 預設 warn
+  return 3; // 預設 info
 })();
 const log = {
   info: (...a) => {

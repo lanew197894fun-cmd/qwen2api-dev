@@ -1,41 +1,230 @@
 #!/usr/bin/env bun
-/**
- * Unified cross-platform launcher for qwen2api-dev
- * Usage: bun start.js
- *
- * Linux:   spawns detached background processes
- * Windows: uses CIM + start to create visible cmd windows (escapes SSH Job Object)
- *
- * Close the visible windows on Windows to stop services.
- * Use `pkill -f qwen2api` or `kill` on Linux.
- */
-import { spawn, execSync } from "node:child_process";
-import {
-  createWriteStream,
+// start.js - qwen2api-dev unified launcher (single-terminal mode)
+// Both platforms: kills old processes, launches services in same terminal
+// Never exits prematurely - stays alive until Ctrl+C so errors stay visible
+
+const { spawn, execSync } = require("child_process");
+const {
   existsSync,
   mkdirSync,
-  writeFileSync,
-} from "node:fs";
-import { join } from "node:path";
+  openSync,
+  writeSync,
+  closeSync,
+  readdirSync,
+  unlinkSync,
+  rmdirSync,
+} = require("fs");
+const { join } = require("path");
+const os = require("os");
 
-const IS_WIN = process.platform === "win32";
-const ROOT = import.meta.dir;
-const LOG_DIR = join(ROOT, "logs");
-const QWEN_DIR = join(ROOT, "qwen2api");
-const PLUGIN_DIR = join(ROOT, "qwen2api-plugin");
-const API_KEY = "sk-123456";
-const PORTS = [3000, 3456];
+const ROOT = __dirname;
+const LOGS = join(ROOT, "logs");
+const children = [];
 
-if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+// Load .env file to get API_KEY
+const fs = require("fs");
+const envFile = join(ROOT, ".env");
+if (fs.existsSync(envFile)) {
+  const content = fs.readFileSync(envFile, "utf-8");
+  const lines = content.split("\n");
+  for (const line of lines) {
+    if (line.startsWith("API_KEY=")) {
+      process.env.API_KEY = line.substring("API_KEY=".length).trim();
+      break;
+    }
+  }
+}
+
+// ─── helpers ───
 
 const log = (msg) => console.log(`[start] ${msg}`);
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const BUN = (() => {
+  if (os.platform() === "win32") {
+    for (const x of ["bun.exe", join(os.homedir(), ".bun", "bin", "bun.exe")]) {
+      try {
+        execSync(`where ${x} 2>nul`, { stdio: "pipe" });
+        return x;
+      } catch {
+        /* next */
+      }
+    }
+    return "bun.exe";
+  }
+  return "bun";
+})();
+
+const IS_WIN = os.platform() === "win32";
+const LOG_RUN = join(LOGS, `run-${Date.now()}`); // unique per-run dir
+
+// ─── token prompt (desktop only, interactive) ───
+
+function isInteractive() {
+  try {
+    return process.stdin.isTTY;
+  } catch {
+    return false;
+  }
+}
+
+async function promptToken() {
+  const { createInterface } = require("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((r) => {
+    rl.question("  > ", (ans) => {
+      rl.close();
+      r(ans.trim());
+    });
+  });
+}
+
+async function ensureToken() {
+  // Only prompt on desktop (Windows) with an interactive terminal
+  if (!IS_WIN || !isInteractive()) return;
+  const { existsSync, readFileSync, writeFileSync } = require("fs");
+  const envFile = join(ROOT, ".env");
+  // Check if .env already has TELEGRAM_BOT_TOKEN
+  if (existsSync(envFile)) {
+    const content = readFileSync(envFile, "utf-8");
+    if (content.includes("TELEGRAM_BOT_TOKEN=")) return;
+  }
+  console.log("");
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║   Telegram Bridge 設定                          ║");
+  console.log("╠══════════════════════════════════════════════════╣");
+  console.log("║  TELEGRAM_BOT_TOKEN 未設定                      ║");
+  console.log("║  請輸入你的 Telegram Bot Token：                ║");
+  console.log("║                                                 ║");
+  console.log("║  申請方式：                                     ║");
+  console.log("║  1. 開啟 Telegram，搜尋 @BotFather              ║");
+  console.log("║  2. 發送 /newbot 建立新 Bot                     ║");
+  console.log("║  3. 複製取得的 HTTP API Token                    ║");
+  console.log("║  4. 貼到下方輸入框按 Enter                      ║");
+  console.log("╚══════════════════════════════════════════════════╝");
+  console.log("  Token（輸入後按 Enter，或留空跳過）：");
+  const token = await promptToken();
+  if (!token) {
+    console.log("  ⚠️  未輸入，跳過 Telegram Bridge\n");
+    return;
+  }
+  writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${token}\n`, "utf-8");
+  process.env.TELEGRAM_BOT_TOKEN = token;
+  console.log("  ✅ 已寫入 .env\n");
+}
+
+// ─── clean old run dirs before start ───
+
+function cleanLogs() {
+  try {
+    if (!existsSync(LOGS)) return;
+    for (const f of readdirSync(LOGS)) {
+      if (f.startsWith("run-")) {
+        try {
+          const dir = join(LOGS, f);
+          for (const sub of readdirSync(dir)) unlinkSync(join(dir, sub));
+          rmdirSync(dir);
+        } catch {
+          /* locked, skip */
+        }
+      }
+    }
+    log("old logs cleaned");
+  } catch {
+    /* best effort */
+  }
+}
+
+// ─── stop PM2-managed qwen2api ───
+
+function stopPm2Qwen() {
+  try {
+    execSync("pm2 stop qwen2api 2>/dev/null", { timeout: 3000 });
+    execSync("pm2 delete qwen2api 2>/dev/null", { timeout: 3000 });
+    log("PM2 qwen2api stopped");
+  } catch {
+    /* no PM2 or already stopped */
+  }
+}
+
+// ─── stop systemd qwen services (auto-restart on boot) ───
+// 注意：systemd Restart=always 會與 start.js 打架，需先 disable 再 stop
+
+function stopSystemdQwen() {
+  if (IS_WIN) return;
+  for (const srv of ["qwen2api.service", "qwen-proxy.service"]) {
+    try {
+      // 先停掉 Restart=always 的自動重啟循環
+      execSync(`systemctl --user disable ${srv} 2>/dev/null`, {
+        timeout: 3000,
+      });
+      execSync(`systemctl --user stop ${srv} 2>/dev/null`, { timeout: 5000 });
+      log(`systemd ${srv} stopped`);
+    } catch {
+      /* not a systemd service or already stopped */
+    }
+  }
+}
+
+// ─── kill process on port ───
+
+function killByPort(port) {
+  if (!port) return;
+  try {
+    if (IS_WIN) {
+      const out = execSync(`netstat -ano | findstr ":${port}"`, {
+        encoding: "utf8",
+        timeout: 3000,
+      });
+      for (const line of out.split("\n").filter(Boolean)) {
+        const pid = line.match(/(\d+)\s*$/)?.[1];
+        const addr = line.match(/:(\d+)/);
+        if (pid && addr && addr[1] === String(port)) {
+          try {
+            execSync(`taskkill /F /PID ${pid} 2>nul`);
+          } catch {
+            /* already gone */
+          }
+        }
+      }
+    } else {
+      execSync(`lsof -ti :${port} | xargs -r kill -9 2>/dev/null`, {
+        timeout: 3000,
+      });
+    }
+  } catch {
+    /* no process on port */
+  }
+}
+
+// ─── kill ALL qwen2api-related processes (cluster master + workers) ───
+// 🛡️ 排除自身：pkill 不能匹配到當前 start.js 進程
+
+function killAllQwen() {
+  if (IS_WIN) return;
+  const pid = process.pid;
+  try {
+    // 只殺 qwen2api/ 目錄下的進程（含尾斜線避免匹配 qwen2api-dev/start.js）
+    execSync(
+      `pkill -f '/home/reamaster/opencode-manager/projects/independent/qwen2api/' 2>/dev/null; true`,
+      { timeout: 3000 },
+    );
+    // 殺掉舊版 start.js（用 pgrep 輸出 PID，排除自身 PID）
+    execSync(
+      `pgrep -f 'start\\.js' | grep -v ${pid} | xargs -r kill 2>/dev/null; true`,
+      { timeout: 3000 },
+    );
+    log("All qwen2api processes killed");
+  } catch {
+    /* none found */
+  }
+}
+
+// ─── health check helpers ───
 
 async function isAlive(url, ms = 2000) {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(ms) });
-    return res.ok;
+    return (await fetch(url, { signal: AbortSignal.timeout(ms) })).ok;
   } catch {
     return false;
   }
@@ -49,243 +238,263 @@ async function waitFor(url, label, timeout = 30) {
     }
     await sleep(1000);
   }
-  log(`${label} NOT ready after ${timeout}s`);
+  log(`WARNING: ${label} health check failed`);
   return false;
 }
 
-// ─── Linux: kill process on port ───
-function linuxKillPort(port) {
-  try {
-    const out = execSync(`ss -tlnp "sport = :${port}" 2>/dev/null`, {
-      encoding: "utf8",
-      timeout: 3000,
+// ─── port availability check ───
+
+const net = require("net");
+
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on("error", () => resolve(false));
+    srv.on("listening", () => {
+      srv.close();
+      resolve(true);
     });
-    for (const line of out.split("\n")) {
-      const m = line.match(/pid=(\d+)/);
-      if (m) {
+    srv.listen(port, "127.0.0.1");
+  });
+}
+
+async function ensurePortsFree(ports, maxRetries = 6) {
+  for (let i = 0; i < maxRetries; i++) {
+    const busy = [];
+    for (const p of ports) {
+      if (!(await isPortFree(p))) busy.push(p);
+    }
+    if (busy.length === 0) return true;
+    if (i < maxRetries - 1) {
+      log(
+        `Ports ${busy.join(",")} still occupied, retrying (${i + 1}/${maxRetries - 1})...`,
+      );
+      for (const p of busy) killByPort(p);
+      await sleep(2000);
+    }
+  }
+  return false;
+}
+
+// ─── unified launch (same terminal, both platforms) ───
+
+function launch(srv) {
+  try {
+    if (!existsSync(LOG_RUN)) mkdirSync(LOG_RUN, { recursive: true });
+
+    // Try to open log files in per-run dir (never conflicts with locked old files)
+    let lfd, efd;
+    try {
+      lfd = openSync(join(LOG_RUN, `${srv.name}.log`), "a");
+      efd = openSync(join(LOG_RUN, `${srv.name}.err`), "a");
+    } catch {
+      log(`${srv.name} log files locked, console only`);
+    }
+
+    const proc = spawn(srv.cmd[0], srv.cmd.slice(1), {
+      cwd: srv.cwd,
+      env: { ...process.env, ...srv.env },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    const pfx = srv.name.padEnd(15);
+    proc.stdout.on("data", (d) => {
+      if (lfd !== undefined)
         try {
-          process.kill(parseInt(m[1]), "SIGTERM");
-          log(`killed pid ${m[1]} on port ${port}`);
-        } catch {
-          // already gone
+          writeSync(lfd, d);
+        } catch {}
+      for (const l of d.toString().split("\n").filter(Boolean))
+        console.log(`  [${pfx}] ${l}`);
+    });
+    proc.stderr.on("data", (d) => {
+      if (efd !== undefined)
+        try {
+          writeSync(efd, d);
+        } catch {}
+      for (const l of d.toString().split("\n").filter(Boolean))
+        console.error(`  [${pfx}] ${l}`);
+    });
+
+    proc.on("exit", (code, sig) => {
+      if (lfd !== undefined)
+        try {
+          closeSync(lfd);
+        } catch {}
+      if (efd !== undefined)
+        try {
+          closeSync(efd);
+        } catch {}
+      log(`${srv.name} exited (${sig ? `signal ${sig}` : `code ${code}`})`);
+      const idx = children.indexOf(proc);
+      if (idx >= 0) children.splice(idx, 1);
+    });
+    proc.on("error", (err) => log(`${srv.name} error: ${err.message}`));
+    children.push(proc);
+    log(`${srv.name} started (PID: ${proc.pid})`);
+  } catch (err) {
+    log(`Failed to launch ${srv.name}: ${err.message}`);
+  }
+}
+
+// ─── cleanup ───
+
+function cleanup() {
+  log("Shutting down...");
+  for (const proc of children) {
+    try {
+      if (IS_WIN) execSync(`taskkill /PID ${proc.pid} /T /F 2>nul`);
+      else proc.kill("SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  log(`Stopped ${children.length} service(s)`);
+  process.exit(0);
+}
+
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
+
+// ─── main ───
+
+async function main() {
+  // Prompt for token if missing (desktop only, interactive)
+  await ensureToken();
+
+  // ─── services (defined here so env vars from ensureToken() are available) ───
+  const SRV = [
+    // embed-server is a stub on Windows ("Not implemented"), skip it
+    ...(IS_WIN
+      ? []
+      : [
+          {
+            name: "embed-server",
+            port: 11436,
+            cwd: join(ROOT, "..", "scripts"),
+            cmd: [BUN, "embed-server.ts"],
+            env: {},
+            waitUrl: null,
+          },
+        ]),
+    {
+      name: "waf-proxy",
+      port: 3457,
+      cwd: join(ROOT, "qwen2api-plugin"),
+      cmd: [BUN, "src/waf-proxy.js"],
+      env: {},
+      waitUrl: "http://127.0.0.1:3457/",
+      waitTimeout: 30,
+    },
+    {
+      name: "qwen2api",
+      port: 3000,
+      cwd: join(ROOT, "qwen2api"),
+      cmd: [BUN, "src/start.js", "--force"],
+      env: { API_KEY: process.env.API_KEY || "CHANGE_ME" },
+      waitUrl: "http://127.0.0.1:3000/health",
+      waitTimeout: 30,
+    },
+    {
+      name: "chat-proxy",
+      port: 3456,
+      cwd: join(ROOT, "qwen2api-plugin"),
+      cmd: [BUN, "src/start-proxy.js"],
+      env: {
+        API_KEY: process.env.API_KEY || "CHANGE_ME",
+        PROXY_LOG_LEVEL: "info",
+        PROXY_ROUTE: "off",
+      },
+      waitUrl: "http://127.0.0.1:3456/health",
+      waitTimeout: 15,
+    },
+    // telegram-bridge: 統一入口，自動偵測角色
+    // 有 TELEGRAM_BOT_TOKEN → master（bot + API + push receiver）
+    // 無 token + Tailscale + peers → peer（fs.watch + push sender）
+    {
+      name: "telegram-bridge",
+      port: 4377,
+      cwd: join(ROOT, "telegram-memory-bridge"),
+      cmd: [BUN, "src/index.ts"],
+      env: {},
+      waitUrl: "http://127.0.0.1:4377/api/health",
+      waitTimeout: 20,
+    },
+  ];
+
+  try {
+    log(`qwen2api-dev (${os.platform()}, ${BUN})`);
+    log(`Logs: ${LOG_RUN}`);
+
+    // Kill old processes on all relevant ports
+    const PORTS = [3000, 3456, 3457, 4377, 11436];
+    log("Cleaning old processes...");
+    stopPm2Qwen();
+    stopSystemdQwen();
+    killAllQwen();
+    await sleep(800);
+    for (const p of PORTS) killByPort(p);
+    await sleep(2000);
+
+    // Verify all ports are actually free (retry if needed — handles fast restart)
+    const allFree = await ensurePortsFree(PORTS);
+    if (!allFree) {
+      console.error(
+        "[start] FATAL: Could not free ports after multiple retries.",
+      );
+      console.error(
+        "[start] Close other apps using ports 3000/3456/4377 and try again.",
+      );
+      log("Press Ctrl+C to exit.");
+      await new Promise(() => {});
+      return;
+    }
+    log("All ports free");
+
+    // Clean old logs - uses per-run dir, never conflicts with locked files
+    cleanLogs();
+
+    if (IS_WIN) log("embed-server: skipped (stub on Windows)");
+
+    // Launch services sequentially with health checks (with retry for qwen2api)
+    for (const s of SRV) {
+      log(`Starting ${s.name}...`);
+      launch(s);
+      await sleep(1500);
+      if (s.waitUrl) {
+        const ok = await waitFor(s.waitUrl, s.name, s.waitTimeout);
+        // Retry once for qwen2api — port may be re-occupied by auto-restart
+        if (!ok && s.name === "qwen2api") {
+          log("qwen2api health check failed, retrying with cleanup...");
+          killAllQwen();
+          killByPort(3000);
+          await sleep(1000);
+          launch(s);
+          await waitFor(s.waitUrl, s.name, s.waitTimeout);
         }
       }
     }
-  } catch {
-    // no process on port
+
+    log("All services launched.");
+    log(`──────────────────────────────────────`);
+    log(`  waf-proxy:    http://127.0.0.1:3457`);
+    log(`  qwen2api:     http://127.0.0.1:3000`);
+    log(`  chat-proxy:   http://127.0.0.1:3456`);
+    if (!IS_WIN) log(`  embed-server: http://127.0.0.1:11436`);
+    log(`  telegram:     port 4377`);
+    log(`──────────────────────────────────────`);
+    log(`Press Ctrl+C to stop services.`);
+  } catch (err) {
+    console.error("[start] Startup error:", err.message);
   }
+
+  // Never exit prematurely - keep terminal open so errors stay visible
+  await new Promise(() => {});
 }
 
-// ─── Windows: write .cmd wrappers + PS script ───
-function runWindows() {
-  // Normalize paths: C:/foo/bar → C:\foo\bar (Windows convention, safe in PS "" strings)
-  function winPath(p) {
-    // On Windows, import.meta.dir uses \, but if we see /, convert
-    return p.replace(/\//g, "\\");
-  }
-  const qwenDir = winPath(QWEN_DIR);
-  const pluginDir = winPath(PLUGIN_DIR);
-  const logDir = winPath(LOG_DIR);
-
-  // ── Write wrapper .ps1 files (PS5/PS7 compatible, avoids batch encoding bugs) ──
-  const qwenPsFile = logDir + "\\start-qwen2api.ps1";
-  const proxyPsFile = logDir + "\\start-chat-proxy.ps1";
-  const bunPath = "$env:USERPROFILE\\.bun\\bin\\bun.exe";
-  const qwenPsContent = [
-    "#Requires -Version 5.0",
-    '$ErrorActionPreference = "Continue"',
-    '$env:API_KEY = "' + API_KEY + '"',
-    '& "' + bunPath + '" "' + qwenDir + '\\src\\start.js" --force',
-    "",
-  ].join("\r\n");
-  const proxyPsContent = [
-    "#Requires -Version 5.0",
-    '$ErrorActionPreference = "Continue"',
-    '$env:API_KEY = "' + API_KEY + '"',
-    '$env:PROXY_LOG_LEVEL = "info"',
-    '& "' + bunPath + '" "' + pluginDir + '\\src\\start-proxy.js"',
-    "",
-  ].join("\r\n");
-  writeFileSync(qwenPsFile, qwenPsContent, "utf-8");
-  writeFileSync(proxyPsFile, proxyPsContent, "utf-8");
-
-  // ── Write CIM launcher script ──
-  // Uses CIM (Win32_Process Create) to escape SSH Job Object,
-  // then `start` with powershell -NoExit to create a visible window.
-  //
-  // PS quoting: inside "..." use "" to produce one literal "
-  //   full: "start ""title"" powershell -NoExit -ExecutionPolicy Bypass -File ""path\file.ps1"""
-  //   → CIM receives: start "title" powershell -NoExit -ExecutionPolicy Bypass -File "path\file.ps1"
-
-  const lines = [];
-  lines.push("#Requires -Version 5.0");
-  lines.push(
-    "# qwen2api-dev Windows launcher via CIM (escapes SSH Job Object)",
-  );
-  lines.push("");
-
-  // Kill old
-  lines.push("# ── Kill old processes ──");
-  lines.push('Write-Host "[start] Cleaning up ports 3000, 3456..."');
-  lines.push(
-    "Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue | ForEach-Object {",
-  );
-  lines.push(
-    "  Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue",
-  );
-  lines.push(
-    '  Write-Host "[start] killed PID $($_.OwningProcess) on port 3000"',
-  );
-  lines.push("}");
-  lines.push(
-    "Get-NetTCPConnection -LocalPort 3456 -ErrorAction SilentlyContinue | ForEach-Object {",
-  );
-  lines.push(
-    "  Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue",
-  );
-  lines.push(
-    '  Write-Host "[start] killed PID $($_.OwningProcess) on port 3456"',
-  );
-  lines.push("}");
-  lines.push("Start-Sleep -Seconds 1");
-  lines.push("");
-
-  // Start qwen2api
-  lines.push("# ── Start qwen2api (port 3000) ──");
-  lines.push('Write-Host "[start] Launching qwen2api..."');
-  // "" inside PS "..." → one "
-  // CommandLine = "start ""title"" powershell -NoExit -File ""path\file.ps1""",
-  lines.push(
-    "$null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{",
-    '  CommandLine = "start ""qwen2api"" powershell -NoExit -ExecutionPolicy Bypass -File ""' +
-      qwenPsFile +
-      '"""',
-    "}",
-  );
-  lines.push("Start-Sleep -Seconds 1");
-  lines.push("");
-
-  // Start chat proxy
-  lines.push("# ── Start chat proxy (port 3456) ──");
-  lines.push('Write-Host "[start] Launching chat-proxy..."');
-  lines.push(
-    "$null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{",
-    '  CommandLine = "start ""chat-proxy"" powershell -NoExit -ExecutionPolicy Bypass -File ""' +
-      proxyPsFile +
-      '"""',
-    "}",
-  );
-  lines.push("");
-
-  lines.push(
-    'Write-Host "[start] Both services launched in separate visible windows."',
-  );
-  lines.push('Write-Host "[start] Close the windows to stop the services."');
-  lines.push('Write-Host ""');
-  lines.push('Write-Host "Press Enter to close this window..."');
-  lines.push("Read-Host");
-
-  const psContent = lines.join("\n");
-  const psFile = logDir + "\\start-services.ps1";
-  writeFileSync(psFile, psContent, "utf-8");
-
-  log("Windows mode: launching via CIM...");
-  try {
-    execSync('powershell -ExecutionPolicy Bypass -File "' + psFile + '"', {
-      stdio: "inherit",
-      timeout: 30000,
-      shell: true,
-    });
-  } catch (e) {
-    if (e.status === undefined) log("PowerShell launch failed, check logs");
-  }
-}
-
-// ─── Linux: spawn processes with visible logs ───
-async function runLinux() {
-  log("Linux mode: starting services...");
-
-  // Kill old processes
-  for (const port of PORTS) linuxKillPort(port);
-  await sleep(1500);
-
-  // Log files for live tailing
-  const qwenLog = join(LOG_DIR, "qwen2api.log");
-  const proxyLog = join(LOG_DIR, "chat-proxy.log");
-
-  // qwen2api
-  log("Starting qwen2api (port 3000)...");
-  const qwenOut = createWriteStream(qwenLog);
-  const qwen = spawn("bun", ["src/start.js", "--force"], {
-    cwd: QWEN_DIR,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, FORCE_RESTART: "true", API_KEY },
-    detached: true,
-  });
-  qwen.stdout.pipe(qwenOut);
-  qwen.stderr.pipe(qwenOut);
-  qwen.unref();
-
-  const qwenOk = await waitFor("http://127.0.0.1:3000/health", "qwen2api");
-  if (!qwenOk) {
-    log("WARNING: qwen2api health check failed, continuing anyway");
-  }
-
-  // chat-proxy
-  log("Starting chat-proxy (port 3456)...");
-  const proxyOut = createWriteStream(proxyLog);
-  const proxy = spawn("bun", ["src/start-proxy.js"], {
-    cwd: PLUGIN_DIR,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, API_KEY, PROXY_LOG_LEVEL: "info" },
-    detached: true,
-  });
-  proxy.stdout.pipe(proxyOut);
-  proxy.stderr.pipe(proxyOut);
-  proxy.unref();
-
-  await sleep(2000);
-
-  // Print status and tail logs to keep terminal visible
-  console.log("");
-  console.log("═══════════════════════════════════════════");
-  console.log("  Both services are running.");
-  console.log("  Logs are being shown below in real-time.");
-  console.log("  Press Ctrl+C to stop watching");
-  console.log("  (services will keep running in background)");
-  console.log("═══════════════════════════════════════════");
-  console.log("");
-
-  // Tail log files - keeps terminal open showing live output
-  try {
-    const tail = spawn("tail", ["-f", qwenLog, proxyLog], {
-      stdio: "inherit",
-    });
-    // Wait for tail to finish (Ctrl+C)
-    await new Promise((resolve) => {
-      tail.on("exit", resolve);
-    });
-  } catch {
-    // tail not available, just keep alive with periodic status
-    log("tail not available, showing periodic status (Ctrl+C to stop)...");
-    while (true) {
-      await sleep(30000);
-      log("Services still running. Press Ctrl+C to stop monitoring.");
-    }
-  }
-}
-
-// ─── Main ───
-async function main() {
-  log(`Platform: ${process.platform}`);
-  if (IS_WIN) {
-    runWindows();
-  } else {
-    await runLinux();
-  }
-}
-
-main().catch((e) => {
-  console.error("[start] Fatal:", e);
-  process.exit(1);
+main().catch((err) => {
+  console.error("[start] Unhandled:", err.message);
 });
+
+// Stay alive even if unhandled error
+process.stdin.resume();
