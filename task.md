@@ -1,7 +1,8 @@
 在測試 千問 模型認知 
-/home/reamaster/opencode-manager/projects/independent/qwen2api-dev
-協助修復 不是協助執行
-模型 執行後容易中途停止 需要再做 強制指令優化指令邏輯  查找主因 並修復完善
+協助修復 不是協助執行  以下兩個 原碼 共用 支持  跨裝置
+/home/reamaster/opencode-manager/projects/independent/qwen2api-dev 嘗試 跟 千問模型 溝通 並查看 反應速度 做自動微調  或  智能微調  
+模型對話中 或者工作中 會忽然停止 /home/reamaster/opencode-manager/projects/system  查找主因 並修復完善  測試看看穩定性 如發現 主因 立即修復完善它
+
 
 reamaster@reamaster-Aspire-E5-573G:~/opencode-manager/projects/system$ bun dev -- run --log-level DEBUG "測試訊息"
 
@@ -13,8 +14,7 @@ bun dev -- run --model qwen-direct/Qwen3.6-Max-Preview "測試訊息"
 修復 測試完善後 建議  系統包備份在 架構  Win D:\Tools\opencode\opencode-manager\projects\independent\system-packages 
   Linux    /home/reamaster/opencode-manager/projects/independent/system-packages
   
-嘗試 連接 主力機 ssh 用戶名 ReaMasTer 密碼Love94Fun 使用 Trayscale 連線 100.71.40.106 開發模式開啟bun dev 幫找出主因並修復 opencode D:\Tools\opencode\opencode-manager\projects\system 開發模式 
-使用opencode供應商  千問模型 D:\Tools\opencode\opencode-manager\projects\independent\qwen2api-dev無反應  查找對話無反應 主因並修復它  建議 先研究看看 在實施 修改的動作
+嘗試 連接 主力機 ssh 用戶名 ReaMasTer 密碼Love94Fun 使用 Trayscale 連線 100.71.40.106 D:\Tools\opencode\opencode-manager\projects\independent\qwen2api-dev
 
 連接 主力機 ssh 幫找出主因並修復 opencode D:\Tools\opencode\opencode-manager\projects\independent\qwen2api-dev
 用戶名 ReaMasTer 密碼Love94Fun 使用 Trayscale 連線 100.71.40.106 確保千問模型正常使用

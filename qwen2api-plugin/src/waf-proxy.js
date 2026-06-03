@@ -1,86 +1,329 @@
 #!/usr/bin/env bun
 /**
- * waf-proxy.js — WAF Bypass Proxy v9 (Browser-Only Streaming + Status Passthrough)
+ * waf-proxy.js — WAF Bypass Proxy v10 (Page Pool + Request Queue + Throttle)
+ *
+ * Changes from v9:
+ *   - Page POOL instead of createPage per request (reuse 1-2 pages)
+ *   - Request QUEUE with max concurrency 1 (laptop-friendly)
+ *   - Queue timeout to prevent cascade (don't let requests pile up forever)
+ *   - Browser session health check before queue processing
+ *   - Reduced concurrent page limit from 8 to 2
  *
  * Architecture:
- *   - Aliyun WAF NC is JavaScript-based (requires real browser JS engine).
- *   - Node.js fetch CANNOT bypass it — ALL streaming requests go through browser.
- *   - Pre-flight status check in browser before writing HTTP headers.
- *   - Upstream 401/403 → real HTTP error code passes through to qwen2api's retry.
- *   - Memory controlled via periodic browser restart (no --single-process).
- *
- * qwen2api → QWEN_CHAT_PROXY_URL=http://127.0.0.1:3457
- *   → waf-proxy:3457 → chat.qwen.ai
+ *   qwen2api → QWEN_CHAT_PROXY_URL=http://127.0.0.1:3457
+ *     → waf-proxy:3457 → chat.qwen.ai
  */
 
 const http = require("http");
 const puppeteer = require("puppeteer");
 
 const PORT = parseInt(process.env.WAF_PROXY_PORT || "3457");
+const WAF_HOST = process.env.WAF_PROXY_HOST || "127.0.0.1";
 const TARGET = process.env.WAF_TARGET || "https://chat.qwen.ai";
 const CHROME_PATH = process.env.CHROME_PATH;
 const REFRESH_MS = parseInt(process.env.WAF_COOKIE_REFRESH || "300000"); // 5min
-const RESTART_MS = parseInt(process.env.WAF_BROWSER_RESTART || "1800000"); // 30min
+const RESTART_MS = parseInt(process.env.WAF_BROWSER_RESTART || "3600000"); // 60min
+const MEM_CHECK_MS = parseInt(process.env.WAF_MEM_CHECK || "60000"); // 60s
+const MEM_RESTART_MB = parseInt(process.env.WAF_MEM_RESTART_MB || "1500"); // 1.5GB
 const STREAM_TIMEOUT = parseInt(process.env.WAF_STREAM_TIMEOUT || "600000");
+
+// ─── Queue / Pool config ───
+const POOL_SIZE = parseInt(process.env.WAF_POOL_SIZE || "2"); // keep 2 pages warm
+const MAX_CONCURRENT = parseInt(
+  process.env.WAF_MAX_CONCURRENT || String(POOL_SIZE),
+); // match pool size by default
+const QUEUE_TIMEOUT = parseInt(process.env.WAF_QUEUE_TIMEOUT || "30000"); // max 30s wait in queue
 
 let browser;
 let cookieJar = "";
+let browserPromise = null;
+let restartState = { active: false };
+let restartTimer = null;
 
-// ─── Browser management ───
+// ─── Page pool ───
+const pagePool = [];
+let poolReady = false;
+
+// ─── Request queue ───
+const reqQueue = [];
+let activeCount = 0;
+let processingQueue = false;
+
+// ─── Utils: suppress benign browser console noise ───
+const SUPPRESS_PATTERNS = [
+  "unload is not allowed",
+  "Permissions policy violation",
+  "[date Date]",
+  "Failed to load resource",
+];
+function isSuppressed(txt) {
+  if (!txt) return true;
+  return SUPPRESS_PATTERNS.some((p) => txt.includes(p));
+}
+
+function suppressConsole(msg) {
+  const t = msg.type();
+  const txt = msg.text();
+  if (!txt || isSuppressed(txt)) return;
+  if (txt.startsWith("[waf]")) return;
+  if (t === "error" || t === "warning") console.log(`[browser] ${t}: ${txt}`);
+}
+
+// ─── Queue entry ───
+// { method, url, headers, body, res, startedAt }
+
+// ─── Browser管理 ───
+
+// 瀏覽器健康狀態追蹤
+let browserHealth = {
+  consecutiveTimeouts: 0,
+  lastTimeoutAt: 0,
+  totalRequests: 0,
+  failedRequests: 0,
+};
+
+async function doLaunch() {
+  browser = await puppeteer.launch({
+    ...(CHROME_PATH ? { executablePath: CHROME_PATH } : {}),
+    headless: true,
+    protocolTimeout: 600000,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-component-extensions-with-background-pages",
+      "--disable-sync",
+      "--disable-extensions",
+      "--disable-domain-reliability",
+      "--disable-features=Translate,ChromeWhatsNewUI,OptimizationHints,MediaRouter,PermissionsPolicy",
+      "--mute-audio",
+      "--no-first-run",
+      "--disable-features=Unload",
+    ],
+  });
+  const pages = await browser.pages();
+  for (const p of pages) p.close().catch(() => {});
+  // Grace period: let browser settle to avoid "Requesting main frame too early"
+  await new Promise((r) => setTimeout(r, 1000));
+  return browser;
+}
 
 async function ensureBrowser() {
-  if (!browser || !browser.connected) {
-    browser = await puppeteer.launch({
-      ...(CHROME_PATH ? { executablePath: CHROME_PATH } : {}),
-      headless: true,
-      protocolTimeout: 600000,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-background-networking",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-component-extensions-with-background-pages",
-        "--disable-sync",
-        "--disable-extensions",
-        "--disable-domain-reliability",
-        "--disable-features=Translate,ChromeWhatsNewUI,OptimizationHints,MediaRouter",
-        "--mute-audio",
-        "--no-first-run",
-      ],
-    });
-    const pages = await browser.pages();
-    for (const p of pages) p.close().catch(() => {});
+  if (browser && browser.connected) return browser;
+  if (browserPromise) return browserPromise;
+  browserPromise = doLaunch();
+  try {
+    const b = await browserPromise;
+    await initPool(b);
+    return b;
+  } finally {
+    browserPromise = null;
   }
-  return browser;
+}
+
+// ─── Page pool: create and maintain reusable pages ───
+
+async function initPool(b) {
+  if (poolReady) return;
+  await ensurePoolSize(b, POOL_SIZE);
+  poolReady = true;
+  console.log(`[waf] Page pool ready: ${pagePool.length} pages`);
+}
+
+async function ensurePoolSize(b, n) {
+  while (pagePool.length < n) {
+    try {
+      const p = await b.newPage();
+      await p.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+      );
+      p.on("pageerror", () => {});
+      p.on("console", suppressConsole);
+      await p
+        .goto(TARGET + "/", { waitUntil: "domcontentloaded", timeout: 15000 })
+        .catch(() => {});
+      // 不要導航到 about:blank — 保留在 TARGET 上使瀏覽器 fetch 的 origin 正確 (chat.qwen.ai)，
+      // 避免 CORS 錯誤 (origin=null 被上游拒絕)
+      pagePool.push(p);
+    } catch (e) {
+      console.error(`[waf] Pool create page error: ${e.message}`);
+    }
+  }
+}
+
+async function acquirePage() {
+  await ensureBrowser();
+  let p = pagePool.pop();
+  if (!p || p.isClosed()) {
+    p = null;
+  }
+  // 頁面 JS 執行能力檢查 — 拋棄幽靈頁面
+  if (p) {
+    try {
+      await p.evaluate("1", { timeout: 5000 });
+    } catch {
+      console.log(`[waf] Page JS dead, discarding from pool`);
+      try {
+        if (!p.isClosed()) await p.close().catch(() => {});
+      } catch {}
+      p = null;
+      browserHealth.failedRequests++;
+    }
+  }
+  if (!p) {
+    try {
+      p = await browser.newPage();
+      await p.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36",
+      );
+      p.on("pageerror", () => {});
+      p.on("console", suppressConsole);
+      // 新頁面導航到 TARGET 以獲得正確的 origin + cookies
+      await p
+        .goto(TARGET + "/", { waitUntil: "domcontentloaded", timeout: 15000 })
+        .catch(() => {});
+    } catch (e) {
+      console.error(`[waf] acquirePage new: ${e.message}`);
+      return null;
+    }
+  }
+  return p;
+}
+
+function releasePage(p) {
+  if (!p || p.isClosed()) return;
+  if (pagePool.length < POOL_SIZE * 2) {
+    // 頁面保留在 TARGET origin 上（上次 fetch 後已在 chat.qwen.ai）
+    // 不要導航 — 避免重載 React app（MB 級 JS），直接復用
+    // 若瀏覽器 GC 回收了頁面上下文，下次 acquirePage 會重新導航
+    pagePool.push(p);
+  } else {
+    p.close().catch(() => {});
+  }
+}
+
+// ─── Request queue processing ───
+
+function enqueueRequest(method, url, headers, body, res) {
+  reqQueue.push({ method, url, headers, body, res, startedAt: Date.now() });
+  if (!processingQueue) processQueue();
+  // If queue is growing too fast, drain oldest
+  while (reqQueue.length > 10) {
+    const oldest = reqQueue.shift();
+    if (oldest && !oldest.res.writableEnded) {
+      try {
+        oldest.res.writeHead(503, {
+          "Content-Type": "application/json",
+          "Retry-After": "5",
+        });
+        oldest.res.end(JSON.stringify({ error: "queue_full" }));
+      } catch {}
+    }
+  }
+}
+
+async function processQueue() {
+  if (processingQueue) return;
+  processingQueue = true;
+  while (reqQueue.length > 0) {
+    // Concurrency throttle
+    if (activeCount >= MAX_CONCURRENT) {
+      await new Promise((r) => setTimeout(r, 200));
+      continue;
+    }
+    const entry = reqQueue.shift();
+    if (!entry) continue;
+    // Check queue timeout
+    if (Date.now() - entry.startedAt > QUEUE_TIMEOUT) {
+      if (!entry.res.writableEnded) {
+        try {
+          entry.res.writeHead(504, { "Content-Type": "application/json" });
+          entry.res.end(JSON.stringify({ error: "queue_timeout" }));
+        } catch {}
+      }
+      continue;
+    }
+    activeCount++;
+    processEntry(entry).finally(() => {
+      activeCount--;
+    });
+  }
+  processingQueue = false;
+}
+
+async function processEntry(entry) {
+  const { method, url, headers, body, res } = entry;
+  try {
+    const isStream = url && url.includes("/chat/completions");
+    if (isStream) {
+      await proxyStreaming(method, url, headers, body, res);
+    } else {
+      const r = await proxySimple(method, url, headers, body);
+      if (!res.headersSent) {
+        res.writeHead(r.status, r.headers);
+        res.end(r.body);
+      } else if (!res.writableEnded) res.end();
+    }
+  } catch (e) {
+    console.error(`[waf] processEntry: ${e.message}`);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    } else if (!res.writableEnded) res.end();
+  }
 }
 
 async function restartBrowser() {
   console.log("[waf] Restarting browser (memory maintenance)...");
+  restartState.active = true;
+  browserPromise = null;
+  // Close all pooled pages
+  for (const p of pagePool) {
+    try {
+      if (!p.isClosed()) await p.close().catch(() => {});
+    } catch {}
+  }
+  pagePool.length = 0;
+  poolReady = false;
   try {
     if (browser && browser.connected) await browser.close().catch(() => {});
   } catch {}
   browser = null;
   await ensureBrowser();
+  await new Promise((r) => setTimeout(r, 3000));
+  restartState.active = false;
+  console.log("[waf] Browser restart complete, accepting requests");
+}
+
+function scheduleRestart() {
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = setTimeout(async () => {
+    await restartBrowser();
+    scheduleRestart(); // reschedule for next cycle
+  }, RESTART_MS).unref();
+}
+
+async function checkMemory() {
+  const mem = process.memoryUsage();
+  const rssMB = Math.round(mem.rss / 1024 / 1024);
+  if (rssMB > MEM_RESTART_MB) {
+    console.log(`[waf] Memory ${rssMB}MB > ${MEM_RESTART_MB}MB, early restart`);
+    await restartBrowser();
+    scheduleRestart(); // reset timer from now
+  }
 }
 
 // ─── Page creation ───
 
 async function createPage() {
-  await ensureBrowser();
-  const page = await browser.newPage();
-  await page.setUserAgent(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-  );
-  // Navigate to establish origin (React error #418 may occur but doesn't prevent fetch)
-  page.on("pageerror", () => {}); // suppress React errors
-  await page
-    .goto(TARGET + "/", { waitUntil: "domcontentloaded", timeout: 15000 })
-    .catch(() => {});
-  return page;
+  // Use the page pool instead of creating new pages per request
+  if (restartState.active) return null;
+  return acquirePage();
 }
 
 // ─── Cookie helpers ───
@@ -123,12 +366,17 @@ async function syncCookies(page) {
 
 async function refreshCookies() {
   try {
+    // Bypass page semaphore — maintenance task must not contend with request pages.
+    // During restart (restartState.active), ensureBrowser may wait for new browser.
     await ensureBrowser();
+    if (restartState.active) return; // still restarting, skip this cycle
     const page = await browser.newPage();
     try {
       await page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/148.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
       );
+      page.on("pageerror", () => {});
+      page.on("console", suppressConsole);
       await page
         .goto(TARGET + "/", { waitUntil: "networkidle0", timeout: 30000 })
         .catch(() => {});
@@ -248,16 +496,7 @@ async function proxyStreaming(method, path, headers, body, res) {
   };
 
   try {
-    page.on("console", (msg) => {
-      const t = msg.type();
-      const txt = msg.text();
-      if (txt === "[date Date]") return;
-      if (txt.includes("401") || txt.includes("Failed to load resource"))
-        return;
-      if (txt.startsWith("[waf]")) return;
-      if (t === "error" || t === "warning")
-        console.log(`[browser] ${t}: ${txt}`);
-    });
+    page.on("console", suppressConsole);
     page.on("pageerror", () => {});
 
     const uid = Date.now() + "_" + Math.random().toString(36).slice(2, 6);
@@ -392,7 +631,20 @@ async function proxyStreaming(method, path, headers, body, res) {
 
     if (status === 0) {
       // Browser didn't respond — timeout
-      console.error(`[waf] Browser status timeout`);
+      browserHealth.consecutiveTimeouts++;
+      browserHealth.lastTimeoutAt = Date.now();
+      browserHealth.failedRequests++;
+      console.error(
+        `[waf] Browser status timeout (x${browserHealth.consecutiveTimeouts})`,
+      );
+      // 達到連續逾時閾值 → 立即重啟瀏覽器
+      if (browserHealth.consecutiveTimeouts >= 3) {
+        console.error(
+          `[waf] ⚠️ 連續 ${browserHealth.consecutiveTimeouts} 次逾時，強制重啟瀏覽器`,
+        );
+        browserHealth.consecutiveTimeouts = 0;
+        restartBrowser().catch(() => {});
+      }
       if (!res.headersSent) {
         res.writeHead(504, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "browser_timeout" }));
@@ -437,7 +689,20 @@ async function proxyStreaming(method, path, headers, body, res) {
     } else if (!res.writableEnded) res.end();
   } finally {
     await syncCookies(page);
-    await page.close().catch(() => {});
+    // 若頁面已死，不要放回 pool
+    if (page && !page.isClosed()) {
+      try {
+        await page.evaluate("1", { timeout: 2000 });
+        releasePage(page);
+      } catch {
+        console.log(`[waf] Discarding dead page after streaming`);
+        try {
+          if (!page.isClosed()) await page.close().catch(() => {});
+        } catch {}
+      }
+    } else if (page) {
+      releasePage(page);
+    }
   }
 }
 
@@ -451,29 +716,75 @@ function startServer() {
     req.on("end", async () => {
       const body = buf.length ? Buffer.concat(buf).toString() : null;
       const isStream = req.url && req.url.includes("/chat/completions");
-      try {
-        if (isStream) {
-          // Streaming → browser-only (Aliyun WAF NC). No headers written yet — proxyStreaming handles it.
-          await proxyStreaming(req.method, req.url, req.headers, body, res);
-        } else {
+
+      // ── Fast 503 during browser restart ──
+      if (restartState.active) {
+        if (!res.headersSent) {
+          res.writeHead(503, {
+            "Content-Type": "application/json",
+            "Retry-After": "15",
+          });
+          res.end(JSON.stringify({ error: "waf_restarting" }));
+        }
+        return;
+      }
+
+      // ── Streaming → enqueue (throttled by request queue) ──
+      // Non-streaming → direct (lightweight, no browser needed)
+      if (isStream) {
+        enqueueRequest(req.method, req.url, req.headers, body, res);
+      } else {
+        try {
           const r = await proxySimple(req.method, req.url, req.headers, body);
           if (!res.headersSent) {
             res.writeHead(r.status, r.headers);
             res.end(r.body);
           } else if (!res.writableEnded) res.end();
+        } catch (e) {
+          console.error(`[waf] ${e.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: e.message }));
+          } else if (!res.writableEnded) res.end();
         }
-      } catch (e) {
-        console.error(`[waf] ${e.message}`);
-        if (!res.headersSent) {
-          res.writeHead(502, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: e.message }));
-        } else if (!res.writableEnded) res.end();
       }
     });
   });
-  srv.listen(PORT, "127.0.0.1", () =>
-    console.log(`[waf] Listening on 127.0.0.1:${PORT}`),
+  srv.listen(PORT, WAF_HOST, () =>
+    console.log(`[waf] Listening on ${WAF_HOST}:${PORT}`),
   );
+}
+
+// ─── Page health monitor ───
+
+async function checkPoolHealth() {
+  if (restartState.active || !browser?.connected) return;
+  let healthy = 0;
+  const toRemove = [];
+  for (const p of pagePool) {
+    if (p.isClosed()) {
+      toRemove.push(p);
+      continue;
+    }
+    try {
+      await p.evaluate("1", { timeout: 5000 });
+      healthy++;
+    } catch {
+      toRemove.push(p);
+      try {
+        if (!p.isClosed()) await p.close().catch(() => {});
+      } catch {}
+    }
+  }
+  // Remove dead pages from pool
+  for (const p of toRemove) {
+    const idx = pagePool.indexOf(p);
+    if (idx >= 0) pagePool.splice(idx, 1);
+  }
+  // Replenish if below minimum
+  if (healthy < POOL_SIZE && browser?.connected) {
+    await ensurePoolSize(browser, POOL_SIZE);
+  }
 }
 
 // ─── Main ───
@@ -484,7 +795,9 @@ async function main() {
   await refreshCookies();
   startServer();
   setInterval(() => refreshCookies().catch(() => {}), REFRESH_MS);
-  setInterval(() => restartBrowser().catch(() => {}), RESTART_MS);
+  setInterval(() => checkMemory().catch(() => {}), MEM_CHECK_MS);
+  setInterval(() => checkPoolHealth().catch(() => {}), 30000); // P0: pool health check every 30s
+  scheduleRestart();
   console.log("[waf-proxy] Ready (browser-only streaming, pre-flight status)");
 }
 

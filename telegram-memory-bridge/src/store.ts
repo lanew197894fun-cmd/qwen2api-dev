@@ -93,6 +93,9 @@ export class MemStore {
     startCall();
     const t0 = performance.now();
     let ok = true;
+    // 動態超時：基礎 60s，若 Governor 建議跳過背景任務（高負載）則延長至 120s
+    const gov = suggest();
+    const timeoutMs = gov.skipBg ? 120000 : 60000;
     try {
       const res = await fetch(CHAT_URL, {
         method: "POST",
@@ -109,7 +112,7 @@ export class MemStore {
           max_tokens: 1024,
           temperature: 0.3,
         }),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) {
         ok = false;

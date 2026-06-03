@@ -98,7 +98,12 @@ const getLatestModels = async (force = false) => {
       return cachedModels.filter((m) => !unhealthyModels.has(m?.id));
     })
     .catch((error) => {
-      console.error("[models] Error fetching latest models:", error.message);
+      // 啟動初期上游尚未就緒是預期行為（白名單降級已處理），不用紅色錯誤
+      if (cachedModels) {
+        console.warn("[models] Failed to refresh, using stale cache");
+      } else {
+        console.warn("[models] Wait for upstream (fallback active)");
+      }
       fetchPromise = null;
       // 如果快取過期但仍有舊資料，回傳舊資料（降級）
       if (cachedModels) {

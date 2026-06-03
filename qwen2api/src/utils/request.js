@@ -60,7 +60,7 @@ function markRequestProcessed(requestId) {
 // ─── 重試輔助：指數退避，最多 retries 次 ───
 async function withRetry(
   fn,
-  retries = 2,
+  retries = 0,
   baseDelay = 1000,
   shouldRetry = () => true,
 ) {
@@ -229,7 +229,7 @@ const sendChatRequest = async (
             timeout: parseInt(process.env.QWEN_CHAT_TIMEOUT || "900000", 10),
           },
         ),
-      3, // 增加重試次數至 3 次（原 2 次）
+      0, // P0: 重試次數降為 0 — 上游 503/504 放大風暴時重試只會讓事情更糟
       1500, // 增加基礎延遲至 1.5s（原 1s）
       shouldRetry, // 使用條件重試
     );
@@ -372,7 +372,7 @@ const generateChatID = async (currentToken, model, account) => {
           },
           requestConfig,
         ),
-      1,
+      0, // P0: 重試次數降為 0（同步修改）
       500,
     );
 

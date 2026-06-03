@@ -186,8 +186,8 @@ function setCache(key, data, ttl = CACHE_TTL.default) {
 
 const retryConfig = {
   maxRetries: 2,
-  baseDelay: 500,
-  maxDelay: 5000,
+  baseDelay: 2000,
+  maxDelay: 15000,
 };
 
 async function fetchWithRetry(
@@ -232,7 +232,9 @@ async function fetchWithRetry(
           retryConfig.baseDelay * Math.pow(2, i),
           retryConfig.maxDelay,
         );
-        await new Promise((r) => setTimeout(r, delay));
+        // Add jitter (±25%) to spread concurrent retries and avoid thundering herd
+        const jittered = Math.round(delay * (0.75 + Math.random() * 0.5));
+        await new Promise((r) => setTimeout(r, jittered));
       }
     }
   }
@@ -841,6 +843,35 @@ const Plugin = async (ctx) => {
           ]
             .filter(Boolean)
             .join("\n");
+        },
+      }),
+      qwen_routing_status: tool({
+        description:
+          "檢查 Qwen2API 模型路由狀態。顯示自動路由是否啟用、偵測到的模型分級與當前決策邏輯。",
+        args: {},
+        async execute() {
+          const h = await proxyGet("/health", 3000);
+          if (!h || h.proxy !== "running") return "❌ Proxy 未運行";
+          const r = h.routing;
+          if (!r) return "⚠️ 無路由資訊";
+          const lines = [
+            `🧠 **模型路由狀態**`,
+            `  自動路由: ${r.enabled ? "✅ 啟用" : "❌ 停用"}`,
+          ];
+          if (r.detected) {
+            lines.push(`  偵測模型:`);
+            lines.push(`    Small: ${r.detected.small} 個`);
+            lines.push(`    Medium: ${r.detected.medium} 個`);
+            lines.push(`    Large: ${r.detected.large} 個`);
+          }
+          if (r.levels) {
+            lines.push(`  當前映射:`);
+            lines.push(`    Small → ${r.levels.small}`);
+            lines.push(`    Medium → ${r.levels.medium}`);
+            lines.push(`    Large → ${r.levels.large}`);
+          }
+          lines.push(`  硬體限制: ${h.hardware?.level || "unknown"}`);
+          return lines.join("\n");
         },
       }),
       qwen_repair_manual: tool({

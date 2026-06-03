@@ -13,6 +13,34 @@ const config = require("../config/index.js");
 const axios = require("axios");
 const { logger } = require("../utils/logger");
 
+// ─── 全域併發限制：保護 waf-proxy 不被大量請求淹沒 ───
+const MAX_CONCURRENT_OUTGOING = parseInt(
+  process.env.QWEN_MAX_CONCURRENT || "2",
+  10,
+);
+let outgoingActive = 0;
+const outgoingQueue = [];
+
+function acquireOutgoing() {
+  return new Promise((resolve) => {
+    if (outgoingActive < MAX_CONCURRENT_OUTGOING) {
+      outgoingActive++;
+      resolve();
+    } else {
+      outgoingQueue.push(resolve);
+    }
+  });
+}
+
+function releaseOutgoing() {
+  if (outgoingQueue.length > 0) {
+    const next = outgoingQueue.shift();
+    next();
+  } else {
+    outgoingActive--;
+  }
+}
+
 /**
  * 設定響應頭
  * @param {object} res - Express 響應物件
@@ -408,10 +436,15 @@ const handleStreamResponse = async (
             if (isPaused && queue.length < DROP_THRESHOLD) {
               isPaused = false;
               upstreamResponse.resume();
-              logger.info(`🔄 佇列降至 ${queue.length} (<${DROP_THRESHOLD})，恢復上游 stream`, "CHAT");
+              logger.info(
+                `🔄 佇列降至 ${queue.length} (<${DROP_THRESHOLD})，恢復上游 stream`,
+                "CHAT",
+              );
               // P21: 設定冷卻時間，避免瞬間再次填滿
               if (drainTimer) clearTimeout(drainTimer);
-              drainTimer = setTimeout(() => { drainTimer = null; }, 2000);
+              drainTimer = setTimeout(() => {
+                drainTimer = null;
+              }, 2000);
             }
             if (queue.length > 0) {
               setImmediate(processQueue);
@@ -465,12 +498,20 @@ const handleStreamResponse = async (
           if (queue.length >= MAX_QUEUE_SIZE && !isPaused && !drainTimer) {
             isPaused = true;
             upstreamResponse.pause();
-            logger.warn(`⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游 (chunks=${chunkCount}, queue=${queue.length})`, "CHAT");
+            logger.warn(
+              `⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游 (chunks=${chunkCount}, queue=${queue.length})`,
+              "CHAT",
+            );
           }
 
           // P11: 偵測上游是否已自動恢復（某些情況下 pause/resume 可能不同步）
           // P21: 加入 drainTimer 檢查，避免在冷卻期間頻繁觸發 resume
-          if (isPaused && queue.length < DROP_THRESHOLD && !processing && !drainTimer) {
+          if (
+            isPaused &&
+            queue.length < DROP_THRESHOLD &&
+            !processing &&
+            !drainTimer
+          ) {
             // 若佇列已低於閾值且未在处理中，但上游仍處於暫停狀態，強制恢復
             // 這防止因 processQueue 延遲導致上游長時間暫停
             logger.debug(`🔄 佇列降至 ${queue.length}，檢查上游狀態`, "CHAT");
@@ -548,9 +589,10 @@ const handleStreamResponse = async (
         ],
       };
       logger.warning?.(
-        "tool_choice=required 首次未觸發工具呼叫，進行一次重試",
+        "tool_choice=required 首次未觸發工具呼叫，等待 2s 後重試",
         "CHAT",
       );
+      await new Promise((r) => setTimeout(r, 2000));
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
@@ -868,9 +910,10 @@ const handleNonStreamResponse = async (
         ],
       };
       logger.warning?.(
-        "tool_choice=required 首次未觸發工具呼叫，進行一次重試",
+        "tool_choice=required 首次未觸發工具呼叫，等待 2s 後重試",
         "CHAT",
       );
+      await new Promise((r) => setTimeout(r, 2000));
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
@@ -981,6 +1024,8 @@ const handleChatCompletion = async (req, res) => {
   const enable_thinking = req.enable_thinking;
   const enable_web_search = req.enable_web_search;
 
+  // P0: 等待併發許可 — 保護 waf-proxy 不被淹沒
+  await acquireOutgoing();
   try {
     const response_data = await sendChatRequest(req.body);
 
@@ -1043,6 +1088,8 @@ const handleChatCompletion = async (req, res) => {
         ? "token無效,請求傳送失敗"
         : `請求傳送失敗: ${error.message || "未知錯誤"}`,
     });
+  } finally {
+    releaseOutgoing(); // P0: 釋放併發許可
   }
 };
 

@@ -19,6 +19,7 @@ class Account {
     // 帳戶資料
     this.accountTokens = [];
     this.isInitialized = false;
+    this.initializationError = null;
 
     // 配置資訊
     this.defaultHeaders = config.defaultHeaders || {};
@@ -30,8 +31,8 @@ class Account {
     // auto-get-token.js 行程 PID（防止重複觸發）
     this._autoGetTokenPid = null;
 
-    // 初始化
-    this._initialize();
+    // 初始化 promise
+    this.initializationPromise = this._initialize();
   }
 
   /**
@@ -468,9 +469,14 @@ class Account {
    * @returns {Promise<Object|null>} 帳戶物件或 null
    */
   async getAccount() {
+    // 等待初始化完成
     if (!this.isInitialized) {
-      logger.warn("帳戶管理器尚未初始化完成", "ACCOUNT");
-      return null;
+      try {
+        await this.initializationPromise;
+      } catch (error) {
+        logger.error("帳戶管理器初始化失敗", "ACCOUNT", "", error);
+        return null;
+      }
     }
 
     if (this.accountTokens.length === 0) {

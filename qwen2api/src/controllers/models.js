@@ -43,10 +43,27 @@ const buildPublicModelData = (model, suffix = "", anthropicCompat = false) => {
   return modelData;
 };
 
+// ⚪ 模型白名單：空字串 = 允許全部
+// 若要限定，設 MODEL_ALLOWLIST=qwen3.7-max,qwen3.7-plus,opencode-zen
+const MODEL_ALLOWLIST = (process.env.MODEL_ALLOWLIST || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
 const handleGetModels = async (req, res) => {
   const models = [];
 
-  const ModelsMap = await getLatestModels();
+  let ModelsMap = await getLatestModels();
+
+  // 🐛 FIX: 上游模型快取尚未刷新（WAF/API 初始化中）時，
+  //         直接用白名單當降級，確保 /v1/models 永遠有值
+  if (ModelsMap.length === 0 && MODEL_ALLOWLIST.length > 0) {
+    ModelsMap = MODEL_ALLOWLIST.map((id) => ({
+      id,
+      name: id,
+      info: { meta: {} },
+    }));
+  }
 
   // 檢測是否為 Claude CLI 請求（透過 User-Agent 或特定 header）
   const isClaudeCli =
@@ -54,6 +71,13 @@ const handleGetModels = async (req, res) => {
     req.headers["x-claude-compat"] === "true";
 
   for (const model of ModelsMap) {
+    const modelId = (model.id || model.name || "").toLowerCase();
+
+    // 白名單篩選：有設定白名單時只保留匹配的模型
+    if (MODEL_ALLOWLIST.length > 0 && !MODEL_ALLOWLIST.includes(modelId)) {
+      continue;
+    }
+
     models.push(buildPublicModelData(model, "", isClaudeCli));
 
     if (config.simpleModelMap) {

@@ -10,6 +10,20 @@ const { initSsxmodManager } = require("./utils/ssxmod-manager");
 const { gracefulShutdown } = require("./graceful-shutdown");
 const { hasKey } = require("./utils/encryption");
 
+// ─── 全域錯誤防護：防止未捕獲異常導致進程退出 ───
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("未處理的 Promise Rejection", "PROCESS", "", {
+    reason,
+    promise,
+  });
+  // 不要 exit，讓服務繼續運行
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("未捕獲的異常", "PROCESS", "", error);
+  // 記錄錯誤後繼續運行，避免中斷正在進行的對話
+});
+
 // ─── Express 4 async 錯誤自動捕獲 ───
 const Layer = require("express/lib/router/layer");
 const origHandle = Layer.prototype.handle_request;

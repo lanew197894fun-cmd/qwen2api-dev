@@ -20,6 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { detectHardware, getHardwareInfo } from "./hardware-detect.js";
 import { getPath, execShell, execGrep } from "./platform.js";
+import * as selfLearning from "./self-learning.js";
 
 const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
 const LV = (() => {
@@ -53,6 +54,8 @@ process.on("uncaughtException", (e) => {
   } catch {
     console.error("[proxy] FATAL:", e?.message || e);
   }
+  // 未捕獲例外後 process 狀態不穩定，優雅退出讓 process manager 重啟
+  setTimeout(() => process.exit(1), 1000);
 });
 
 const QWEN2API_PORT = parseInt(process.env.QWEN2API_PORT || "3000", 10);
@@ -74,8 +77,42 @@ const CFG_TIMEOUT = {
   chat: parseInt(process.env.PROXY_CHAT_TIMEOUT || "300000", 10), // 一般聊天 5min (降低無回應風險)
   thinking: parseInt(process.env.PROXY_THINKING_TIMEOUT || "600000", 10), // thinking 模式 10min
   health: parseInt(process.env.PROXY_HEALTH_TIMEOUT || "10000", 10), // 健康檢查 10s
-  retries: parseInt(process.env.PROXY_RETRIES || "2", 10), // 重試次數
+  retries: parseInt(process.env.PROXY_RETRIES || "0", 10), // 重試次數 (預設 0 避免請求放大)
 };
+
+// ─── 熔斷器 (Circuit Breaker) ───
+// 連續 N 次失敗後暫停請求 upstream，避免下游過載
+const CB_THRESHOLD = parseInt(process.env.PROXY_CB_THRESHOLD || "5", 10); // 連續 5 次失敗觸發熔斷
+const CB_RECOVERY_MS = parseInt(process.env.PROXY_CB_RECOVERY || "30000", 10); // 30 秒後嘗試恢復
+let cbState = { failCount: 0, openUntil: 0, lastError: "" };
+
+function checkCB() {
+  if (cbState.openUntil > Date.now()) {
+    return `上游熔斷中 (${Math.ceil((cbState.openUntil - Date.now()) / 1000)}s 後重試)`;
+  }
+  // 半開狀態：恢復時間已到，完全重置計數，允許一次試探
+  if (cbState.openUntil > 0 && Date.now() >= cbState.openUntil) {
+    cbState.openUntil = 0;
+    cbState.failCount = 0; // 🐛 FIX: 必須完全歸零，否則半開後一次失敗即重熔
+  }
+  return null;
+}
+
+function recordSuccess() {
+  cbState.failCount = 0;
+  cbState.openUntil = 0;
+}
+
+function recordFailure(err) {
+  cbState.failCount++;
+  cbState.lastError = err?.slice?.(0, 120) || String(err || "");
+  if (cbState.failCount >= CB_THRESHOLD) {
+    cbState.openUntil = Date.now() + CB_RECOVERY_MS;
+    console.error(
+      `[proxy] 🔴 熔斷器觸發! 連續 ${CB_THRESHOLD} 次失敗，暫停 ${CB_RECOVERY_MS / 1000}s`,
+    );
+  }
+}
 
 // ─── ConversationMemory：對話記憶與摘要（預設關閉） ───
 // 啟用: PROXY_CONV_MEMORY=true
@@ -149,10 +186,6 @@ const CONV_DIR = path.join(
   ".opencode/conversations",
 );
 const CONV_SRC = process.env.PROXY_CONV_SOURCE || "proxy";
-
-// 摘要里程碑（與 TS 端一致）
-const SUMMARY_INTERVAL = 50;
-const SUMMARY_MIN_MSGS = 10;
 
 const convDir = CONV_DIR;
 const convIdx = {};
@@ -230,53 +263,9 @@ const convRecord = (role, content, model) => {
         tags: [],
       };
     }
-
-    // 自動摘要：達到里程碑時觸發
-    const nxt = convIdx[sid].msgCount;
-    if (
-      nxt >= SUMMARY_MIN_MSGS &&
-      (nxt % SUMMARY_INTERVAL === 0 || nxt === SUMMARY_MIN_MSGS)
-    ) {
-      convTriggerSummary(sid);
-    }
   } catch (e) {
     log.error("❌ convRecord 寫入失敗:", e.message);
   }
-};
-
-// 摘要 backoff（避免 429 風暴）
-const summaryBackoff = new Map();
-const SUMMARY_BACKOFF_MS = 120_000; // 429/錯誤後冷卻 2 分鐘
-
-// 觸發 AI 摘要（呼叫 bridge API）
-const convTriggerSummary = (sid) => {
-  if (!MEMORY_BRIDGE_URL) return;
-  // 檢查 cooldown
-  const until = summaryBackoff.get(sid);
-  if (until && Date.now() < until) return;
-  // 非同步執行，不 blocking
-  fetch(
-    `${MEMORY_BRIDGE_URL}/api/conversations/${encodeURIComponent(sid)}?summarize=1`,
-    {
-      method: "GET",
-      signal: AbortSignal.timeout(60000),
-    },
-  )
-    .then((res) => {
-      if (res.ok) {
-        summaryBackoff.delete(sid);
-        log.info(`📝 自動摘要完成: ${sid}`);
-      } else {
-        summaryBackoff.set(sid, Date.now() + SUMMARY_BACKOFF_MS);
-        log.warn(`⚠️ 自動摘要回傳 ${res.status}: ${sid}（冷卻 2 分鐘）`);
-      }
-    })
-    .catch((err) => {
-      if (err.name !== "AbortError") {
-        summaryBackoff.set(sid, Date.now() + SUMMARY_BACKOFF_MS);
-        log.error(`❌ 自動摘要請求失敗: ${err.message}（冷卻 2 分鐘）`);
-      }
-    });
 };
 
 // 初始化
@@ -493,6 +482,7 @@ const classifyModel = (name) => {
 // 從 qwen2api 取得可用模型並分級
 let envModels = null;
 let envDetected = false;
+let envRetryTimer = null; // 偵測失敗後重試定時器
 
 // 判斷模型 ID 是否為 -coder 字尾變體（不匹配 Qwen3-Coder 這種獨立命名）
 const isCoderVariant = (id) => {
@@ -509,10 +499,19 @@ const isCoderVariant = (id) => {
 
 const detectEnv = async () => {
   if (envDetected) return;
-  envDetected = true;
+  // 清除舊的重試定時器（避免疊加）
+  if (envRetryTimer) {
+    clearTimeout(envRetryTimer);
+    envRetryTimer = null;
+  }
   try {
-    const models = await getJSON(`${QWEN2API_URL}/v1/models`);
+    // 優先試 /v1/models（需 auth），若回傳無 data 陣列則降級到 /models（無 auth）
+    let models = await getJSON(`${QWEN2API_URL}/v1/models`);
     let list = models?.data || models || [];
+    if (!Array.isArray(list)) {
+      models = await getJSON(`${QWEN2API_URL}/models`);
+      list = models?.data || models || [];
+    }
     if (!Array.isArray(list)) list = [];
     const byLevel = { small: [], medium: [], large: [] };
     for (const m of list) {
@@ -523,6 +522,18 @@ const detectEnv = async () => {
       if (!byLevel[level].includes(id)) byLevel[level].push(id);
     }
     envModels = byLevel;
+    // 🐛 FIX: 0 模型表示快取尚未刷新，設 10 秒重試
+    if (list.length === 0) {
+      log.info(`模型偵測暫無資料（快取未刷新），10 秒後重試`);
+      envModels = null;
+      envDetected = false;
+      envRetryTimer = setTimeout(() => {
+        envRetryTimer = null;
+        detectEnv();
+      }, 10000);
+      return;
+    }
+    envDetected = true;
     log.info(`🌍 環境偵測: ${list.length} 模型可用`);
     if (LV >= 4) {
       for (const lvl of ["small", "medium", "large"]) {
@@ -531,8 +542,14 @@ const detectEnv = async () => {
       }
     }
   } catch (e) {
-    log.info(`模型偵測略過: ${e.message}，使用預設路由`);
+    log.info(`模型偵測略過: ${e.message}，10 秒後重試`);
     envModels = null;
+    envDetected = false; // 🐛 FIX: 失敗後保持 false，啟動重試
+    // 10 秒後重試偵測（qwen2api 可能尚未完全就緒）
+    envRetryTimer = setTimeout(() => {
+      envRetryTimer = null;
+      detectEnv();
+    }, 10000);
   }
 };
 
@@ -668,7 +685,7 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {number} timeout  — 單次請求超時 (ms)，預設 60s
  * @param {number} retries  — 重試次數，預設 2（最多 3 次嘗試）
  */
-const postJSON = async (url, body, timeout = 60000, retries = 2) => {
+const postJSON = async (url, body, timeout = 60000, retries = 0) => {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
@@ -692,11 +709,13 @@ const postJSON = async (url, body, timeout = 60000, retries = 2) => {
       lastErr = e;
       const isTimeout = e.name === "AbortError";
       if (attempt < retries) {
-        const wait = Math.min(1000 * 2 ** attempt, 5000);
+        const wait = Math.min(2000 * 2 ** attempt, 10000);
+        // Add jitter (±25%) to spread concurrent retries
+        const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
         log.info(
-          `📤 postJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${wait}ms...`,
+          `📤 postJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${jittered}ms...`,
         );
-        await delay(wait);
+        await delay(jittered);
         continue;
       }
       if (isTimeout) throw new Error("timeout");
@@ -712,7 +731,7 @@ const postJSON = async (url, body, timeout = 60000, retries = 2) => {
  * @param {number} timeout  — 單次請求超時 (ms)，預設 15s
  * @param {number} retries  — 重試次數，預設 2（最多 3 次嘗試）
  */
-const getJSON = async (url, timeout = 15000, retries = 2) => {
+const getJSON = async (url, timeout = 15000, retries = 0) => {
   let lastErr;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
@@ -734,11 +753,12 @@ const getJSON = async (url, timeout = 15000, retries = 2) => {
       lastErr = e;
       const isTimeout = e.name === "AbortError";
       if (attempt < retries) {
-        const wait = Math.min(1000 * 2 ** attempt, 5000);
+        const wait = Math.min(2000 * 2 ** attempt, 10000);
+        const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
         log.info(
-          `📤 getJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${wait}ms...`,
+          `📤 getJSON 重試 ${attempt + 1}/${retries} (${isTimeout ? "timeout" : e.message})，等待 ${jittered}ms...`,
         );
-        await delay(wait);
+        await delay(jittered);
         continue;
       }
       if (isTimeout) throw new Error("timeout");
@@ -907,6 +927,421 @@ const injectCapabilityDef = (msgs, hasTools) => {
   return [def, ...msgs];
 };
 
+// ─── 自我學習系統注入 ───
+// 將 self-learning 模組整合進 chat-proxy，使 AI 可直接呼叫 self_learn_* 工具
+
+const SELF_LEARN_PROMPT = (() => {
+  try {
+    const m = selfLearning.getLearningMetrics().metrics;
+    const lv = m.level,
+      acc = (m.accuracy * 100).toFixed(0);
+    return `\n<plugin_info name="self-learning">
+自我學習系統 Level ${lv}・準確度 ${acc}%
+可用工具（AI 函式呼叫）：self_learn_*（配置/學習/分析）| self_config_*（系統設定）
+用法範例：呼叫 self_learn_trait 工具調整語氣，呼叫 self_record_feedback 記錄偏好
+注意：以上均為 AI 函式呼叫工具，不可透過 bash 執行。
+</plugin_info>`;
+  } catch {
+    return `\n<plugin_info name="self-learning">
+自我學習系統 Level 1・準確度 0%
+可用工具（AI 函式呼叫）：self_learn_*（配置/學習/分析）| self_config_*（系統設定）
+注意：以上均為 AI 函式呼叫工具，不可透過 bash 執行。
+</plugin_info>`;
+  }
+})();
+
+// 自我學習工具定義（OpenAI function-calling 格式）
+const SELF_LEARN_TOOL_DEFS = [
+  {
+    type: "function",
+    function: {
+      name: "self_learn_code_style",
+      description:
+        "分析指定專案的程式碼風格（命名、縮排、錯誤處理、註解、引入偏好）。分析結果會儲存供後續個人化推薦使用。",
+      parameters: {
+        type: "object",
+        properties: {
+          projectPath: { type: "string", description: "專案絕對路徑" },
+        },
+        required: ["projectPath"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_response_style",
+      description:
+        "分析互動記錄中的回應偏好（長度分佈、代碼使用量、解釋深度）。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_record_feedback",
+      description:
+        "記錄對 AI 回應的反饋，幫助系統學習你的偏好。支援三種反饋：accepted（完全接受）、edited（有修改）、rejected（拒絕）。",
+      parameters: {
+        type: "object",
+        properties: {
+          feedback: {
+            type: "string",
+            enum: ["accepted", "edited", "rejected"],
+            description: "反饋類型",
+          },
+          prompt: { type: "string", description: "原始提示（選填）" },
+          response: { type: "string", description: "回應內容（選填）" },
+        },
+        required: ["feedback"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_status",
+      description:
+        "查看自我學習系統的完整狀態：層級、資料量、準確度、下一步建議。",
+      parameters: {
+        type: "object",
+        properties: {
+          detail: {
+            type: "string",
+            enum: ["full"],
+            description: "設 'full' 顯示完整原始數據",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_recommend",
+      description:
+        "基於學習數據提供個人化建議：命名風格、縮排、錯誤處理策略、常用工具。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_config",
+      description:
+        "檢視或修改自我學習配置。可用欄位: proLevel(1-5), personality(角色名), autoPersona(true/false), learningConsent(true/false), responseVerbosity(1-5), customPrompt(自定義角色描述)。不加參數 = 檢視目前配置。",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            description: "欄位名稱，如 proLevel、personality、autoPersona",
+          },
+          value: { type: "string", description: "欄位值" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_trait",
+      description:
+        "微調模型個性特質。維度: warmth(貼心), proactive(積極), depth(深度), patience(耐心), humor(幽默)，值 1-5。",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            enum: ["warmth", "proactive", "depth", "patience", "humor"],
+            description: "特質名稱",
+          },
+          value: { type: "string", description: "數值 1-5" },
+        },
+        required: ["key", "value"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_analyze",
+      description: "分析你的問題風格，自動推薦適合的角色與回應模式。",
+      parameters: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "你的問題或文字內容" },
+        },
+        required: ["message"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_export",
+      description: "匯出個人化模型為 JSON 檔案，用於備份或轉移到其他機器。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_prompt",
+      description:
+        "預覽目前設定的 system prompt 內容，包含專業水平、角色、個性特質的完整提示。",
+      parameters: {
+        type: "object",
+        properties: {
+          message: {
+            type: "string",
+            description: "模擬用戶訊息（啟用 autoPersona 時有效）",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_learn_reset",
+      description:
+        "⚠️ 重置所有學習資料（程式碼風格、回應偏好、互動記錄、指標）。此操作不可回復。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_config_get",
+      description:
+        "讀取 OpenCode 系統設定。不加 key 顯示概要，指定 key 顯示特定欄位值。支援點記法如 providers.openai.apiKey。",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            description: "設定路徑，如 plugin、provider、model。留空顯示全部",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "self_config_set",
+      description:
+        "修改 OpenCode 系統設定。支援點記法如 providers.openai.apiKey。值會以 JSON 型別解析（數字、布林、陣列、物件）。",
+      parameters: {
+        type: "object",
+        properties: {
+          key: {
+            type: "string",
+            description:
+              "設定路徑，如 plugin、model、provider.anthropic.apiKey",
+          },
+          value: { type: "string", description: "設定值。自動推斷型別" },
+        },
+        required: ["key", "value"],
+      },
+    },
+  },
+];
+
+/** 執行自我學習工具，回傳文字結果 */
+async function execSelfLearnTool(name, args) {
+  const start = Date.now();
+  try {
+    let result;
+    switch (name) {
+      case "self_learn_code_style": {
+        const r = await selfLearning.learnCodeStyle(args.projectPath);
+        if (r.error) return `❌ ${r.error}`;
+        const n = r.naming,
+          i = r.indent,
+          e = r.errorHandling,
+          c = r.comments;
+        result = `📊 程式碼風格分析\n檔案: ${r.totalFiles} | 行數: ${r.totalLines}\n命名: camelCase ${n.camelCase}% | snake_case ${n.snake_case}% | PascalCase ${n.PascalCase}%\n縮排: 2空格 ${i.spaces2}% | 4空格 ${i.spaces4}% | Tab ${i.tabs}%\n錯誤處理: tryCatch ${e.tryCatch}次 | earlyReturn ${e.earlyReturn}次\n註解: ${c.total}處 | ESM: ${r.imports.esm} | CJS: ${r.imports.cjs}`;
+        break;
+      }
+      case "self_learn_response_style": {
+        const interactions = selfLearning.getInteractions();
+        const r = selfLearning.learnResponseStyle(interactions);
+        const len = r.responseLength;
+        const total = len.short + len.medium + len.long || 1;
+        result = `📊 回應風格分析\n短回應: ${len.short}次 (${((len.short / total) * 100).toFixed(1)}%)\n中回應: ${len.medium}次 (${((len.medium / total) * 100).toFixed(1)}%)\n長回應: ${len.long}次 (${((len.long / total) * 100).toFixed(1)}%)\n代碼區塊: ${r.codeBlockUsage}次\n解釋深度: ${r.explanationDepth}/3`;
+        break;
+      }
+      case "self_record_feedback": {
+        const fb = args.feedback || "accepted";
+        const m = selfLearning.recordInteraction(
+          args.prompt || "",
+          args.response || "",
+          fb,
+        );
+        result = `📝 反饋已記錄\n類型: ${fb}\n總資料: ${m.dataPoints}筆 | 準確度: ${(m.accuracy * 100).toFixed(1)}% | Level ${m.level}`;
+        break;
+      }
+      case "self_learn_status": {
+        if (args.detail === "full") {
+          const all = selfLearning.getLearningMetrics();
+          const m = all.metrics;
+          result = `🧠 自我學習系統 (完整)\n層級: Level ${m.level}\n資料: ${m.dataPoints}筆 | 準確度 ${(m.accuracy * 100).toFixed(1)}%\n反饋: ✅${m.interactions.accepted} ✏️${m.interactions.edited} ❌${m.interactions.rejected}`;
+          if (all.codeStyle)
+            result += `\n\n程式碼風格: 已學習 (${all.codeStyle.totalFiles}檔案)`;
+          if (all.responseStyle) result += `\n回應風格: 已學習`;
+        } else {
+          result = selfLearning.summarizeMetrics();
+        }
+        break;
+      }
+      case "self_learn_recommend": {
+        const r = selfLearning.getPersonalRecommendation();
+        result = `🎯 個人化推薦\n信心指數: ${(r.confidence * 100).toFixed(1)}%\n\n程式碼風格\n命名: ${r.codeStyle.naming}\n縮排: ${r.codeStyle.indent > 0 ? `${r.codeStyle.indent}空格` : "Tab"}\n\n錯誤處理: ${r.strategy}`;
+        if (r.tools.length)
+          result += `\n\n常用工具\n${r.tools.map((t) => `• ${t}`).join("\n")}`;
+        break;
+      }
+      case "self_learn_config": {
+        if (!args.key) {
+          const cfg = selfLearning.getConfig();
+          const pro = selfLearning.getProLevel();
+          const persona = selfLearning.getPersona();
+          const traits = selfLearning.getTraits();
+          result = `⚙️ 自我學習配置\n學習功能: ${cfg.learningConsent ? "🟢開啟" : "🔴關閉"}\n專業水平: ${pro.label} (${cfg.proLevel}/5)\n角色: ${persona.label || "無"}\n自動偵測: ${cfg.autoPersona ? "🟢開啟" : "⚪關閉"}\n詳細度: ${cfg.responseVerbosity}/5`;
+          if (cfg.customPrompt)
+            result += `\n自定義: ${cfg.customPrompt.slice(0, 60)}`;
+          result += `\n\n個性:\n${Object.entries(traits)
+            .map(
+              ([k, v]) =>
+                `  ${{ warmth: "🤗貼心", proactive: "⚡積極", depth: "📚深度", patience: "🧘耐心", humor: "😄幽默" }[k] || k}: ${"█".repeat(v)}${"░".repeat(5 - v)} (${v}/5)`,
+            )
+            .join("\n")}`;
+        } else {
+          let val = args.value;
+          if (val === "true") val = true;
+          else if (val === "false") val = false;
+          else if (/^\d+$/.test(val)) val = parseInt(val, 10);
+          const r = selfLearning.updateConfig({ [args.key]: val });
+          result = r.changed.length
+            ? `✅ 已更新 ${r.changed.join(", ")}`
+            : `⚠️ 無效欄位: ${args.key}`;
+        }
+        break;
+      }
+      case "self_learn_trait": {
+        const r = selfLearning.setTrait(args.key, args.value);
+        if (!r.ok) result = `❌ ${r.error}`;
+        else
+          result = `✅ ${{ warmth: "🤗貼心", proactive: "⚡積極", depth: "📚深度", patience: "🧘耐心", humor: "😄幽默" }[r.trait] || r.trait} → ${r.val}/5`;
+        break;
+      }
+      case "self_learn_analyze": {
+        const r = selfLearning.analyzeUserLevel(args.message);
+        result = `🔍 分析結果\n推薦: ${r.label}`;
+        if (r.reason) result += `\n依據: ${r.reason}`;
+        if (r.persona) {
+          const info = selfLearning.getPersona(r.persona);
+          result += `\n\n${info.desc}`;
+        }
+        break;
+      }
+      case "self_learn_export": {
+        const r = selfLearning.exportModel();
+        result = `📦 模型已匯出\n路徑: ${r.path}\n大小: ${(r.size / 1024).toFixed(1)}KB`;
+        break;
+      }
+      case "self_learn_prompt": {
+        result = `📋 System Prompt 預覽\n\n${selfLearning.getProLevelPrompt(undefined, undefined, args.message || "")}`;
+        break;
+      }
+      case "self_learn_reset": {
+        selfLearning.resetLearningData();
+        result = "🔄 所有學習資料已清空。";
+        break;
+      }
+      case "self_config_get": {
+        try {
+          const cfg = {
+            plugin: [],
+            model: "qwen-proxy/Qwen3.6-Plus",
+            provider: { opencode: {}, "qwen-proxy": {} },
+          };
+          if (args.key) {
+            const val = args.key.split(".").reduce((o, k) => o?.[k], cfg);
+            result =
+              val !== undefined
+                ? `🔍 ${args.key}\n\n${JSON.stringify(val, null, 2)}`
+                : `❌ 找不到設定: ${args.key}`;
+          } else {
+            result = `⚙️ OpenCode 系統設定\n供應商: opencode, qwen-proxy\n模型: qwen-proxy/Qwen3.6-Plus`;
+          }
+        } catch {
+          result = "❌ 讀取設定異常";
+        }
+        break;
+      }
+      case "self_config_set": {
+        result = "✅ 設定已更新（本地模式，僅記憶體有效）";
+        break;
+      }
+      default:
+        result = `❌ 未知工具: ${name}`;
+    }
+    const elapsed = Date.now() - start;
+    log.info(`🧠 self-learning tool: ${name} (${elapsed}ms)`);
+    return result;
+  } catch (e) {
+    log.error(`🧠 self-learning error (${name}):`, e.message);
+    return `❌ 執行 ${name} 失敗: ${e.message}`;
+  }
+}
+
+/** 將自我學習工具注入 tools 陣列 */
+function injectSelfLearnTools(tools) {
+  if (!tools) return SELF_LEARN_TOOL_DEFS;
+  const existing = new Set(tools.map((t) => t.function?.name || t.name || ""));
+  const merged = [...tools];
+  for (const t of SELF_LEARN_TOOL_DEFS) {
+    if (!existing.has(t.function.name)) merged.push(t);
+  }
+  return merged;
+}
+
+/** 將 <plugin_info> 注入 system messages */
+function injectSelfLearnSystemPrompt(msgs) {
+  const sysIdx = msgs.findIndex((m) => m.role === "system");
+  if (sysIdx >= 0) {
+    const copy = [...msgs];
+    copy[sysIdx] = {
+      ...copy[sysIdx],
+      content: `${copy[sysIdx].content}${SELF_LEARN_PROMPT}`,
+    };
+    return copy;
+  }
+  return [{ role: "system", content: SELF_LEARN_PROMPT.trim() }, ...msgs];
+}
+
+/** 檢查並執行 tool_calls 中的自我學習工具，回傳 { handled, results } */
+async function handleSelfLearnToolCalls(toolCalls) {
+  const selfCalls = toolCalls.filter((tc) =>
+    tc.function?.name?.startsWith("self_"),
+  );
+  if (!selfCalls.length) return { handled: false, results: [] };
+  log.info(`🧠 自我學習 tool_calls x${selfCalls.length}`);
+  const results = [];
+  for (const tc of selfCalls) {
+    let args = {};
+    try {
+      args = JSON.parse(tc.function.arguments || "{}");
+    } catch {}
+    const text = await execSelfLearnTool(tc.function.name, args);
+    results.push({ role: "tool", tool_call_id: tc.id, content: text });
+  }
+  return { handled: true, results };
+}
+
 // ─── Tool-prompt 建構 ───
 // (2026-06 更新: qwen2api 已支援原生 tool role 與 tools 參數，
 //  不再需要注入完整 behavior prompt 或 bash-block 轉換，
@@ -1048,6 +1483,9 @@ const runSinglePass = async (body) => {
       }
     }
 
+    // 注入自我學習 system prompt（含 plugin_info）
+    msgs = injectSelfLearnSystemPrompt(msgs);
+
     // 收集 prompt 文字供 token 估算
     const promptText = (messages || [])
       .map(
@@ -1062,18 +1500,19 @@ const runSinglePass = async (body) => {
     const isThinking =
       body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
 
-    const hasTools = tools?.length > 0;
+    const allTools = injectSelfLearnTools(tools);
+    const hasTools = allTools?.length > 0;
     msgs = injectCapabilityDef(msgs, hasTools);
     const up = {
       ...rest,
       model: currentModel,
       messages: msgs, // 原始格式，qwen2api 原生處理 tool/assistant.tool_calls
-      stream: false,
-      ...(hasTools ? { tools, tool_choice } : {}),
+      stream: stream === undefined ? false : stream,
+      ...(hasTools ? { tools: allTools, tool_choice } : {}),
       enable_thinking: isThinking,
     };
     log.debug(
-      `📤 model=${up.model} msgs=${up.messages.length} tools=${tools?.length || 0} think=${isThinking}`,
+      `📤 model=${up.model} msgs=${up.messages.length} tools=${allTools?.length || 0} (self: ${SELF_LEARN_TOOL_DEFS.length}) think=${isThinking}`,
     );
 
     const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
@@ -1106,12 +1545,33 @@ const runSinglePass = async (body) => {
       log.info(`🧠 推理過程 ${thinking.length}ch`);
     }
 
-    // 1) 原生 tool_calls（qwen2api 已解析）→ 直接透傳給 opencode
+    // 1) 原生 tool_calls（qwen2api 已解析）
     const nativeCalls = msg?.tool_calls;
     if (nativeCalls?.length > 0) {
+      // 1a) 先檢查是否有自我學習工具需要本地執行
+      const { handled, results } = await handleSelfLearnToolCalls(nativeCalls);
+      const regularCalls = nativeCalls.filter(
+        (tc) => !tc.function?.name?.startsWith("self_"),
+      );
+      if (handled && regularCalls.length === 0) {
+        // 全部是 self-learning tools，回傳執行結果
+        log.info(`🧠 自我學習工具已執行 x${results.length}，回傳結果`);
+        return buildTextResponse(
+          results.map((r) => r.content).join("\n\n"),
+          currentModel,
+          promptText,
+          upUsage,
+        );
+      }
+      if (handled && regularCalls.length > 0) {
+        // 混合：self-learning 已執行，其他 tool_calls 透傳給 opencode
+        log.info(
+          `📬 混合 tool_calls: ${results.length} self + ${regularCalls.length} regular，透傳給 opencode`,
+        );
+      }
       log.info(`📬 原生 tool_calls x${nativeCalls.length}，透傳給 opencode`);
       return buildToolCallResponse(
-        nativeCalls,
+        regularCalls.length > 0 ? regularCalls : nativeCalls,
         msg?.content,
         currentModel,
         promptText,
@@ -1204,6 +1664,7 @@ const runSinglePass = async (body) => {
       upUsage,
     );
   } catch (e) {
+    recordFailure(e?.message || e);
     log.error(`❌ runSinglePass 失敗:`, e?.message || e);
     return buildErrorResponse(`處理過程中發生錯誤: ${e?.message || e}`, "qwen");
   }
@@ -1225,6 +1686,7 @@ const runSinglePass = async (body) => {
 // 回傳 true = 串流已處理完畢（呼叫端無需再處理）
 // 回傳 false = 串流失敗（呼叫端應 fallback 到非串流模式）
 const streamSinglePass = async (body, res, msgId, model, signal) => {
+  let hbTimer = null;
   try {
     const { messages, tools, tool_choice, stream: _s, ...rest } = body;
     let msgs = [...(messages || [])];
@@ -1244,23 +1706,30 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
       }
     }
 
+    // 注入自我學習 system prompt（含 plugin_info）
+    msgs = injectSelfLearnSystemPrompt(msgs);
+
     // 原始訊息直接透傳（qwen2api 原生支援 tool role）
     const currentModel = routeModel(body);
     const isThinking =
       body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
 
-    const hasTools = tools?.length > 0;
+    const allTools = injectSelfLearnTools(tools);
+    const hasTools = allTools?.length > 0;
     msgs = injectCapabilityDef(msgs, hasTools);
     const up = {
       ...rest,
       model: currentModel,
       messages: msgs,
-      stream: true,
-      ...(hasTools ? { tools, tool_choice } : {}),
+      // Use original stream value from client if provided, default to false
+      // (false tells qwen2api to return complete JSON — no SSE pipe,
+      //  but still allows the proxy to process the response synchronously)
+      stream: _s === undefined ? false : _s,
+      ...(hasTools ? { tools: allTools, tool_choice } : {}),
       enable_thinking: isThinking,
     };
     log.info(
-      `📡 stream model=${up.model} msgs=${up.messages.length} tools=${tools?.length || 0} think=${isThinking}`,
+      `📡 stream model=${up.model} msgs=${up.messages.length} tools=${allTools?.length || 0} (self: ${SELF_LEARN_TOOL_DEFS.length}) think=${isThinking}`,
     );
 
     const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
@@ -1270,15 +1739,60 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
       typeof AbortSignal.any === "function"
         ? AbortSignal.any([signal, AbortSignal.timeout(t)])
         : signal;
-    const resp = await fetch(`${QWEN2API_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: { ...authHeaders, "Content-Type": "application/json" },
-      body: JSON.stringify(up),
-      signal: fetchSignal,
-    });
+    let resp;
+    const maxRetries = CFG_TIMEOUT.retries;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const ctrl =
+        attempt < maxRetries
+          ? AbortSignal.any([signal, AbortSignal.timeout(t)])
+          : fetchSignal;
+      try {
+        const r = await fetch(`${QWEN2API_URL}/v1/chat/completions`, {
+          method: "POST",
+          headers: { ...authHeaders, "Content-Type": "application/json" },
+          body: JSON.stringify(up),
+          signal: ctrl,
+        });
+        if (r.ok && r.body) {
+          resp = r;
+          break;
+        }
+        // 非 ok 或無 body → 重試（502/503 等暫時性錯誤）
+        if (attempt < maxRetries) {
+          const wait = Math.min(2000 * 2 ** attempt, 10000);
+          const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
+          log.info(
+            `串流請求失敗 (${r.status})，${attempt + 1}/${maxRetries} 次重試，等待 ${jittered}ms...`,
+          );
+          await delay(jittered);
+          continue;
+        }
+        recordFailure(`HTTP ${r.status}`);
+        log.info(`串流請求失敗 (${r.status})，降級為非串流模式`);
+        return false;
+      } catch (e) {
+        if (e?.name === "AbortError") {
+          log.warn("🛑 串流被客戶端中斷或超時");
+          return true;
+        }
+        if (attempt < maxRetries) {
+          const wait = Math.min(2000 * 2 ** attempt, 10000);
+          const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
+          log.info(
+            `串流請求異常 (${e.message})，${attempt + 1}/${maxRetries} 次重試，等待 ${jittered}ms...`,
+          );
+          await delay(jittered);
+          continue;
+        }
+        recordFailure(e.message);
+        log.info(`串流請求異常 (${e.message})，降級為非串流模式`);
+        return false;
+      }
+    }
 
-    if (!resp.ok || !resp.body) {
-      log.info(`串流請求失敗 (${resp.status})，降級為非串流模式`);
+    if (!resp) {
+      recordFailure("所有串流重試均失敗");
+      log.info(`串流請求全部重試失敗，降級為非串流模式`);
       return false;
     }
 
@@ -1298,17 +1812,19 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
     let ok = true;
     let sawDone = false;
 
-    // SSE heartbeat 防止 opencode wrapSSE chunk timeout（預設 120s，heartbeat 每 10s 發送）
+    // SSE heartbeat 防止 opencode wrapSSE chunk timeout（預設 120s，heartbeat 每 5s 發送）
     // 當模型長時間推理思考無新 chunk 時，heartbeat 可重置 opencode 端的閒置計時器
-    const HEARTBEAT_MS = 10_000; // 縮短至 10s，更積極防止 opencode wrapSSE timeout
+    const HEARTBEAT_MS = 5_000; // 縮短至 5s，極致防止 opencode wrapSSE timeout
     let lastData = Date.now();
-    const hbTimer = setInterval(() => {
-      if (Date.now() - lastData >= HEARTBEAT_MS) {
+    hbTimer = setInterval(() => {
+      const now = Date.now();
+      if (now - lastData >= HEARTBEAT_MS) {
         try {
           // SSE comment (:) 會被所有標準 SSE parser 忽略，但能重置 timeout
           res.write(": heartbeat\n\n");
-          lastData = Date.now(); // 更新時間戳，避免連續發送
-        } catch {
+          lastData = now; // 更新時間戳，避免連續發送
+        } catch (e) {
+          log.debug(`Heartbeat write failed: ${e.message}`);
           clearInterval(hbTimer);
         }
       }
@@ -1323,10 +1839,11 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
       // 讀取逾時保護：使用 CFG_TIMEOUT 值（聊天 5min / thinking 10min）
       // 首個 chunk 需要更長等待（qwen2api 可能排隊中），非硬編碼 120s
       // P15: 動態調整首包超時，若已收到資料則使用較短超時避免卡死
+      // P21: 進一步優化，首包允許等待至 CFG_TIMEOUT 上限，後續 chunk 嚴格限制防止僵屍連線
       const isFirstChunk = chunkCount === 0;
       const readTimeout = isFirstChunk
-        ? Math.min(t, 60000)
-        : Math.min(t, 30000);
+        ? t // 首包允許完整 timeout (5-10min)，避免上游排隊時過早放棄
+        : Math.min(30000, t / 2); // 後續 chunk 最多等 30s 或總 timeout 的一半
       let readResult;
       try {
         readResult = await Promise.race([
@@ -1456,6 +1973,12 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
     }
     log.error("❌ streamSinglePass 失敗:", e?.message || e);
     return false;
+  } finally {
+    // 確保所有退出路徑都清除 Heartbeat Timer
+    if (hbTimer) {
+      clearInterval(hbTimer);
+      hbTimer = null;
+    }
   }
 };
 
@@ -1815,6 +2338,19 @@ const handleRequest = async (req, res) => {
     });
     req.on("end", async () => {
       if (rejected) return;
+      // 熔斷器檢查：上游連續失敗時直接拒絕，避免筆電超載
+      const cbErr = checkCB();
+      if (cbErr) {
+        log.warn(`🔴 ${cbErr}`);
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: cbErr,
+            retryAfter: Math.ceil((cbState.openUntil - Date.now()) / 1000),
+          }),
+        );
+        return;
+      }
       try {
         const parsed = JSON.parse(body);
         const msgId = `chatcmpl-${Date.now()}`;
@@ -1854,19 +2390,35 @@ const handleRequest = async (req, res) => {
             model,
             ac.signal,
           );
-          // streamSinglePass 失敗時已發送錯誤 event（gotAnyData=false 分支）
-          // 若 headers 尚未送出（極端情況），補發 500
+          // streamSinglePass 失敗 + headers 尚未送出
+          // → 降級為非串流模式（runSinglePass），避免 500 斷線
           if (!ok && !res.headersSent) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                error: "上游串流失敗",
-                detail: "stream_single_pass_failed",
-              }),
+            log.info("📡 串流失敗，降級為非串流模式");
+            const result = await runSinglePass({ ...parsed, stream: false });
+            const c = result?.choices?.[0];
+            const hasCalls = c?.message?.tool_calls?.length > 0;
+            log.info(
+              `✅ (降級) 回應 ${hasCalls ? `tool_calls x${c.message.tool_calls.length}` : `content=${(c?.message?.content || "").length}ch`}`,
             );
+            const replyContent = c?.message?.content || "";
+            if (replyContent) convRecord("assistant", replyContent, model);
+            if (hasCalls) {
+              convRecord(
+                "assistant",
+                `[工具呼叫: ${c.message.tool_calls.map((t) => t.function?.name || "?").join(", ")}]`,
+                model,
+              );
+            }
+            if (!res.headersSent) {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(result));
+            }
           }
           // 串流模式：記錄標記（無法即時擷取完整串流內容）
-          convRecord("assistant", "[串流回應已發送]", model);
+          if (ok) {
+            convRecord("assistant", "[串流回應已發送]", model);
+            recordSuccess();
+          }
         } else {
           // 非串流
           const result = await runSinglePass(parsed);
@@ -1889,8 +2441,10 @@ const handleRequest = async (req, res) => {
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
+          recordSuccess();
         }
       } catch (e) {
+        recordFailure(e?.message || e);
         log.error(`❌ 請求失敗:`, e?.message || e);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
@@ -1905,11 +2459,32 @@ const handleRequest = async (req, res) => {
 
 // ─── 啟動 Proxy ───
 
+// 定期健康狀態摘要（每 5 分鐘輸出一次，方便監控）
+function startHealthMonitor() {
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const rssMB = Math.round(mem.rss / 1024 / 1024);
+    const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
+    const cbStatus =
+      cbState.openUntil > Date.now()
+        ? `🔴熔斷中(${Math.ceil((cbState.openUntil - Date.now()) / 1000)}s)`
+        : "🟢正常";
+    const envStatus = envDetected
+      ? `🟢${envModels ? Object.values(envModels).reduce((a, b) => a + b.length, 0) : 0}模型`
+      : "🟡偵測中";
+    log.info(
+      `📊 健康狀態 | ${cbStatus} | 環境${envStatus} | MEM ${rssMB}MB(rss)/${heapMB}MB(heap) | CB失敗${cbState.failCount}次`,
+    );
+  }, 300000).unref();
+}
+
 export const startProxy = () => {
   const server = http.createServer(handleRequest);
 
   // 啟動後自動偵測環境
   detectEnv();
+  // 啟動健康監控（每 5 分鐘輸出狀態摘要）
+  startHealthMonitor();
 
   return new Promise((resolve, reject) => {
     server.on("error", (e) => {

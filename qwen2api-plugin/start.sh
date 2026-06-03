@@ -1,45 +1,32 @@
-#!/usr/bin/env bash
-# qwen2api-plugin: Chat Proxy + 硬體偵測 獨立啟動腳本（Linux）
-# 前台執行，terminal 會保持開啟直到 Ctrl+C
-set -e
+#!/bin/bash
+# start.sh — 獨立啟動 waf-proxy（3457）+ chat-proxy（3456）
+# 用法: bash start.sh
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(dirname "$DIR")"
-PORT=3456
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+BUN="$(which bun 2>/dev/null)"
+[ -z "$BUN" ] && { echo "❌ 找不到 bun"; exit 1; }
 
-# ─── 載入 API_KEY ───
-if [ -f "$ROOT/.env" ]; then
-  export $(grep -E '^API_KEY=' "$ROOT/.env" 2>/dev/null || true)
-fi
-
-echo ""
-echo "══════════ Chat Proxy ══════════"
-echo ""
-
-# ─── 優雅關閉舊服務 ───
-graceful_kill() {
-  local port=$1
-  local pids
-  pids=$(lsof -ti:"$port" 2>/dev/null || true)
-  [ -z "$pids" ] && return 0
-  echo "  ⏳ 關閉舊服務 (port $port)..."
-  for p in $pids; do kill -15 "$p" 2>/dev/null || true; done
-  sleep 3
-  pids=$(lsof -ti:"$port" 2>/dev/null || true)
-  if [ -n "$pids" ]; then
-    echo "  ⚠️  強制終止"
-    for p in $pids; do kill -9 "$p" 2>/dev/null || true; done
-  else
-    echo "  ✅ 已關閉"
-  fi
+cleanup() {
+  kill $WAF_PID $PROXY_PID 2>/dev/null
+  exit
 }
+trap cleanup INT TERM
 
-graceful_kill $PORT
+echo "🔵 waf-proxy (3457) + chat-proxy (3456)"
+echo "---"
 
-# ─── 啟動（前台，terminal 保持開啟） ───
-echo "🚀 啟動 Chat Proxy (port $PORT)..."
-echo ""
-echo "  關閉: 按 Ctrl+C 停止服務"
-echo ""
-cd "$DIR"
-exec bun src/start-proxy.js
+echo "[1/2] 啟動 waf-proxy..."
+$BUN src/waf-proxy.js &
+WAF_PID=$!
+sleep 10
+
+export API_KEY=sk-123456
+echo "[2/2] 啟動 chat-proxy..."
+$BUN src/start-proxy.js &
+PROXY_PID=$!
+
+echo "---"
+echo "waf-proxy:   PID $WAF_PID"
+echo "chat-proxy:  PID $PROXY_PID"
+echo "按 Ctrl+C 停止"
+wait

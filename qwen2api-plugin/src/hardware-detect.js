@@ -114,67 +114,89 @@ const getRamInfo = () => {
 // ─── GPU（跨平台） ───
 const getGpuInfo = () => {
   let gpu = null;
+  let score = 0;
+
+  // 1) nvidia-smi 最可靠（名稱 + VRAM 一次完成）
   try {
-    if (isWin) {
-      const out = execSync(
-        "wmic path win32_VideoController get name /format:csv 2>nul",
-        { timeout: 3000, encoding: "utf8" },
-      );
-      for (const line of out.split("\n")) {
-        if (
-          line.includes("NVIDIA") ||
-          line.includes("AMD") ||
-          line.includes("Intel") ||
-          line.includes("Microsoft")
-        ) {
-          gpu = line.replace(/^[^,]*,/, "").trim();
-          if (gpu && !gpu.includes("Microsoft")) break;
-        }
-      }
-    } else if (process.platform === "darwin") {
-      // macOS: system_profiler
-      const model = detectGpuMac();
-      if (model) gpu = model;
-    } else {
-      // Linux: lspci
-      const out = execSync("lspci 2>/dev/null | grep -iE 'vga|3d|display'", {
-        timeout: 3000,
-        encoding: "utf8",
-      });
-      for (const line of out.trim().split("\n").filter(Boolean)) {
-        if (
-          line.includes("NVIDIA") ||
-          line.includes("AMD") ||
-          line.includes("Intel")
-        ) {
-          gpu = line.replace(/^\S+\s+/, "").trim();
-          break;
-        }
-      }
+    const out = execSync(
+      "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>nul",
+      { timeout: 3000, encoding: "utf8" },
+    );
+    const parts = (out.trim().split("\n")[0] || "").split(",");
+    if (parts.length >= 2) {
+      gpu = parts[0].trim();
+      const mem = parseInt(parts[1].trim());
+      if (mem >= 4096) score = 3;
+      else if (mem >= 2048) score = 2;
+      else score = 1;
     }
-  } catch {}
-  let s = 0;
-  if (gpu?.includes("NVIDIA")) {
-    try {
-      const nvidia = execSync(
-        isWin
-          ? "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits"
-          : "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null",
-        { timeout: 3000, encoding: "utf8" },
-      );
-      const mem = parseInt(nvidia.trim());
-      if (mem >= 4096) s = 3;
-      else if (mem >= 2048) s = 2;
-      else s = 1;
-    } catch {
-      s = 1;
-    }
-  } else if (gpu?.includes("AMD")) {
-    s = 2;
-  } else if (gpu?.includes("Intel")) {
-    s = 1;
+  } catch {
+    /* fall through */
   }
-  return { model: gpu || "無獨立 GPU", score: s };
+
+  // 2) 若 nvidia-smi 沒抓到，用 PowerShell（比 wmic 可靠）
+  if (!gpu) {
+    try {
+      if (isWin) {
+        const out = execSync(
+          'powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name" 2>nul',
+          { timeout: 5000, encoding: "utf8" },
+        );
+        for (const line of out.trim().split("\n").filter(Boolean)) {
+          if (
+            line.includes("NVIDIA") ||
+            line.includes("AMD") ||
+            line.includes("Intel")
+          ) {
+            gpu = line.trim();
+            break;
+          }
+        }
+      } else if (process.platform === "darwin") {
+        const model = detectGpuMac();
+        if (model) gpu = model;
+      } else {
+        const out = execSync("lspci 2>/dev/null | grep -iE 'vga|3d|display'", {
+          timeout: 3000,
+          encoding: "utf8",
+        });
+        for (const line of out.trim().split("\n").filter(Boolean)) {
+          if (
+            line.includes("NVIDIA") ||
+            line.includes("AMD") ||
+            line.includes("Intel")
+          ) {
+            gpu = line.replace(/^\S+\s+/, "").trim();
+            break;
+          }
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+
+    // 3) 如果 PowerShell / lspci 抓到 NVIDIA，順便查 VRAM
+    if (gpu?.includes("NVIDIA")) {
+      try {
+        const nvidia = execSync(
+          "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>nul",
+          { timeout: 3000, encoding: "utf8" },
+        );
+        const mem = parseInt(nvidia.trim());
+        if (mem >= 4096) score = 3;
+        else if (mem >= 2048) score = 2;
+        else score = 1;
+      } catch {
+        score = 1;
+      }
+    } else if (gpu?.includes("AMD")) {
+      score = 2;
+    } else if (gpu?.includes("Intel")) {
+      score = 1;
+    }
+  }
+
+  return { model: gpu || "無獨立 GPU", score };
 };
 
 // ─── 系統負載（跨平台） ───
