@@ -171,36 +171,35 @@ export class IdleProcessor {
 
     // Governor 調度：系統忙碌時跳過背景處理
     const gov = govSuggest();
-    if (gov.skipBg) {
-      this.running = false;
-      return `⏭️ 背景跳過 (${gov.info})`;
-    }
+    if (gov.skipBg) return `⏭️ 背景跳過 (${gov.info})`;
 
     this.running = true;
     this.cycle++;
     const start = Date.now();
 
-    const mem = await processMemory(this.paths);
-    const knw = await processKnowledge(this.paths);
-    const wik = await processWiki(this.paths);
+    try {
+      const mem = await processMemory(this.paths);
+      const knw = await processKnowledge(this.paths);
+      const wik = await processWiki(this.paths);
 
-    const lines: string[] = [];
-    lines.push(`🔄 背景處理 #${this.cycle}`);
-    lines.push(`📝 ${mem.summary}`);
-    lines.push(`📚 ${knw.summary}`);
-    lines.push(`📖 ${wik.summary}`);
+      const lines: string[] = [];
+      lines.push(`🔄 背景處理 #${this.cycle}`);
+      lines.push(`📝 ${mem.summary}`);
+      lines.push(`📚 ${knw.summary}`);
+      lines.push(`📖 ${wik.summary}`);
 
-    // 每 5 輪輸出一次詳細（避免刷屏）
-    if (this.cycle % 5 === 1) {
-      for (const d of [...mem.detail, ...knw.detail, ...wik.detail])
-        lines.push(`  ${d}`);
+      // 每 5 輪輸出一次詳細（避免刷屏）
+      if (this.cycle % 5 === 1) {
+        for (const d of [...mem.detail, ...knw.detail, ...wik.detail])
+          lines.push(`  ${d}`);
+      }
+
+      const elapsed = Date.now() - start;
+      lines.push(`⚡ ${elapsed}ms`);
+      return lines.join("\n");
+    } finally {
+      this.running = false;
     }
-
-    const elapsed = Date.now() - start;
-    lines.push(`⚡ ${elapsed}ms`);
-
-    this.running = false;
-    return lines.join("\n");
   }
 
   // 最近一輪摘要（給 console 用）

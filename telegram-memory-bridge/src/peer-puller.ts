@@ -38,10 +38,13 @@ export async function pullFromPeer(
         entries: MemEntry[];
         device: string;
       };
-      const remoteIds = new Set(data.entries.map((e) => e.id));
       const local = await store.list();
-      const localIds = new Set(local.map((e) => e.id));
-      const newEntries = data.entries.filter((e) => !localIds.has(e.id));
+      // 用 summary 內容判重（而非 peer 原始 ID）
+      // push 會在 Windows 端產生不同 ID，ID 比對會漏掉已推送的資料
+      const localSummaries = new Set(local.map((e) => e.summary));
+      const newEntries = data.entries.filter(
+        (e) => !localSummaries.has(e.summary),
+      );
 
       if (newEntries.length > 0) {
         console.log(

@@ -52,6 +52,8 @@ export class TelegramBot {
   private conv: ConversationStore;
   private pollCount = 0;
   private lastGovInfo = "";
+  private pollErrCount = 0;
+  private maxPollErrBackoff = 120_000;
 
   constructor(cfg: BotConfig) {
     this.token = cfg.token;
@@ -193,8 +195,19 @@ export class TelegramBot {
         }
       }
     } catch (err) {
-      console.error("[telegram-memory] Poll error:", (err as Error).message);
+      this.pollErrCount++;
+      const backoff = Math.min(
+        this.baseInterval * Math.pow(2, Math.min(this.pollErrCount, 5)),
+        this.maxPollErrBackoff,
+      );
+      this.curInterval = Math.max(this.curInterval, backoff);
+      console.error(
+        `[telegram-memory] Poll error #${this.pollErrCount}: ${(err as Error).message} (backoff ${this.curInterval}ms)`,
+      );
+      this.scheduleNext();
+      return; // skip governor/logic below, just retry later
     }
+    this.pollErrCount = 0; // reset on success
 
     // Governor 動態調速：每輪檢査，資訊改變或每 10 輪顯示
     this.pollCount++;
@@ -715,24 +728,36 @@ export class TelegramBot {
     );
   }
 
-  // ── Organize (自動整理舊資料 → SOP) ──
+  // ── Organize (自動整理舊資料 → SOP，背景執行不卡 bot) ──
 
-  private async doCmdOrganize(msg: TgMessage): Promise<void> {
+  private doCmdOrganize(msg: TgMessage): void {
     if (!this.organizer) {
-      await this.reply(msg, "⚠️ 組織器未啟用（無路徑配置）");
+      this.reply(msg, "⚠️ 組織器未啟用（無路徑配置）").catch(() => {});
       return;
     }
     if (this.organizer.isRunning()) {
-      await this.reply(msg, "⏳ 整理工作已在進行中，用 /progress 查看進度");
+      this.reply(msg, "⏳ 整理工作已在進行中，用 /progress 查看進度").catch(
+        () => {},
+      );
       return;
     }
-    await this.reply(
+    this.reply(
       msg,
-      "🚀 開始整理舊資料（記憶+知識庫→SOP）...\n這需要一些時間，完成後會通知。\n可用 /progress 查看進度。",
-    );
-    const result = await this.organizer.start();
-    await this.sendMessage(`📋 *整理報告*\n\n${result}`);
-    this.notifyWork(); // SOP 檔案寫入 → 觸發索引更新
+      "🚀 開始整理舊資料（記憶+知識庫→SOP）...\n完成後會通知。\n可用 /progress 查看進度。",
+    ).catch(() => {});
+    // ⚡ fire-and-forget: 不 await，不阻塞 bot 輪詢
+    this.organizer
+      .start()
+      .then((result) => {
+        this.sendMessage(`📋 *整理報告*\n\n${result}`).catch(() => {});
+        this.notifyWork();
+      })
+      .catch((err) => {
+        console.error("[organizer] ❌ 整理失敗:", (err as Error).message);
+        this.sendMessage(`❌ 整理失敗: ${(err as Error).message}`).catch(
+          () => {},
+        );
+      });
   }
 
   // ── Progress ──

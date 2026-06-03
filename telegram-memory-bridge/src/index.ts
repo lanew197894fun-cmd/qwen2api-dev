@@ -295,6 +295,8 @@ function startTailscaleWatcher(
   onPull?: (s: string) => void,
 ) {
   const known = new Map<string, KP>();
+  const pullCooldown = new Map<string, number>(); // ip → last pull timestamp
+  const PULL_COOLDOWN_MS = 120_000; // 同一裝置 2 分鐘內不重複拉取
 
   const refresh = async () => {
     let devices: TSDev[] = [];
@@ -356,15 +358,21 @@ function startTailscaleWatcher(
         );
       }
       if (bridge && !prev?.bridge) {
-        const { pullFromPeer } = await import("./peer-puller");
-        pullFromPeer(
-          `http://${dev.ip}:${cfg.apiPort}`,
-          store,
-          cfg.knowledgePath,
-          cfg.wikiPath,
-          onPull,
-          dev.hostname,
-        ).catch(() => {});
+        const last = pullCooldown.get(dev.ip) || 0;
+        if (Date.now() - last < PULL_COOLDOWN_MS) {
+          console.log(`   ⏱️ ${dev.ip} (${dev.hostname}) pull 冷卻中，跳過`);
+        } else {
+          pullCooldown.set(dev.ip, Date.now());
+          const { pullFromPeer } = await import("./peer-puller");
+          pullFromPeer(
+            `http://${dev.ip}:${cfg.apiPort}`,
+            store,
+            cfg.knowledgePath,
+            cfg.wikiPath,
+            onPull,
+            dev.hostname,
+          ).catch(() => {});
+        }
       }
     }
   };
@@ -429,6 +437,11 @@ function startTailscaleWatcher(
             ? `   ${pi}✅ ${dev.ip} (${dev.hostname}) — bridge 在線`
             : `   ${pi}🔵 ${dev.ip} (${dev.hostname}) — 系統在線`,
         );
+    }
+
+    // 初始掃描的 pull 記錄冷卻時間
+    for (const [ip, _b] of bridges) {
+      if (_b) pullCooldown.set(ip, Date.now());
     }
 
     // 定時比對，120s 取代 30s，減少 75% subprocess 呼叫

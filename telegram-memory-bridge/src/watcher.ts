@@ -42,7 +42,13 @@ export class DirWatcher {
   }
 
   stop(): void {
-    for (const w of this.watchers) w.close();
+    for (const w of this.watchers) {
+      try {
+        w.close();
+      } catch {
+        /* ignore */
+      }
+    }
     this.watchers = [];
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();

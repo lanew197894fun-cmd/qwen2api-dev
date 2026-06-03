@@ -202,6 +202,7 @@ export class Indexer {
     if (this._running) return { added: 0, removed: 0, updated: 0, total: 0 };
     this._running = true;
     const start = Date.now();
+    let success = false;
 
     try {
       const [wiki, knowledge] = await Promise.all([
@@ -264,10 +265,14 @@ export class Indexer {
       }
 
       await this.writeIndex({ entries: newEntries, links: mergedLinks });
+      success = true;
       console.log(
         `[indexer] ✅ 索引同步: +${added} / -${removed} / ~${updated} (共${newEntries.length}條, ${Date.now() - start}ms)`,
       );
       return { added, removed, updated, total: newEntries.length };
+    } catch (err) {
+      console.error(`[indexer] ❌ 掃描失敗:`, (err as Error).message);
+      throw err;
     } finally {
       this._running = false;
     }

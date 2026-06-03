@@ -9,6 +9,23 @@ import { existsSync } from "fs";
 import { resolve, dirname, relative } from "path";
 import { hostname } from "os";
 
+// ── JS-length-aware truncation ──
+// JS `.length` = UTF-16 code units. Emoji (Non-BMP) = 2 units, Python `len()` = 1.
+// Ensures payloads pass API's `validStr` checks without HTTP 400.
+function truncToJSLen(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const chars = [...s];
+  let n = 0;
+  let out = "";
+  for (const c of chars) {
+    const add = c.length;
+    if (n + add > max - 3) break;
+    out += c;
+    n += add;
+  }
+  return out + "...";
+}
+
 interface PushOpts {
   peerUrl: string;
   memoryRoot: string;
@@ -30,7 +47,50 @@ let _busy = false;
 let _timer: ReturnType<typeof setTimeout> | null = null;
 let _pollTimer: ReturnType<typeof setInterval> | null = null;
 const _debounceMs = 5000;
-const _pollMs = 30_000; // polling 間隔（取代 recursive fs.watch）
+const _pollMs = 120_000;
+const BATCH_SIZE = 50;
+const BASE_DELAY_MS = 1000;
+const MAX_RETRIES = 5;
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function pushWithBackoff(
+  url: string,
+  body: any,
+  timeout: number,
+): Promise<{ ok: boolean; status: number }> {
+  let delay = BASE_DELAY_MS;
+  for (let i = 0; i < MAX_RETRIES; i++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeout),
+      });
+      if (res.status === 429) {
+        const retryAfter = parseInt(
+          res.headers.get("Retry-After") || String(Math.min(delay * 2, 60_000)),
+        );
+        console.log(
+          `${tag()} ⏳ 429 Rate limited, backoff ${retryAfter}ms (attempt ${i + 1}/${MAX_RETRIES})`,
+        );
+        await sleep(retryAfter);
+        delay = Math.min(delay * 2, 60_000);
+        continue;
+      }
+      return { ok: res.ok, status: res.status };
+    } catch (err) {
+      if (i < MAX_RETRIES - 1) {
+        await sleep(delay);
+        delay = Math.min(delay * 2, 60_000);
+      }
+    }
+  }
+  return { ok: false, status: 0 };
+}
 
 function tag(): string {
   return `[push ${new Date().toLocaleTimeString()}]`;
@@ -60,6 +120,42 @@ async function saveHistory(): Promise<void> {
   } catch {}
 }
 
+async function pushBatch(
+  items: any[],
+  pushFn: (item: any) => Promise<{ ok: boolean; status: number }>,
+  label: string,
+): Promise<{ success: number; errors: number }> {
+  let success = 0;
+  let errors = 0;
+  const batches: any[][] = [];
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    batches.push(items.slice(i, i + BATCH_SIZE));
+  }
+  if (batches.length > 1)
+    console.log(
+      `${tag()} 📦 ${label}: ${items.length} 筆 → ${batches.length} 批次`,
+    );
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    if (batches.length > 1)
+      console.log(
+        `${tag()} 🚀 批次 ${b + 1}/${batches.length} (${batch.length} 筆)`,
+      );
+    for (const item of batch) {
+      const r = await pushFn(item);
+      if (r.ok) success++;
+      else errors++;
+      await sleep(50); // 節流：避免 burst 打爆 rate limit
+    }
+    if (b < batches.length - 1) {
+      const delay = Math.min(BASE_DELAY_MS * Math.pow(2, b), 30000); // 🐛 FIX: 上限 30 秒
+      console.log(`${tag()} ⏱️ 批次間等待 ${delay}ms...`);
+      await sleep(delay);
+    }
+  }
+  return { success, errors };
+}
+
 async function doPush(): Promise<void> {
   if (_busy) return;
   _busy = true;
@@ -79,97 +175,109 @@ async function doPush(): Promise<void> {
         tags?: string[];
       }[];
       const known = new Set(_history.memory);
-      for (const e of entries) {
-        if (known.has(e.id)) continue;
-        const cp = resolve(_opts!.memoryRoot, "entries", `${e.id}.md`);
-        let content = e.summary;
-        if (existsSync(cp)) content = await readFile(cp, "utf-8");
-        try {
-          const res = await fetch(`${_peerUrl}/api/push/memory`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              summary: e.summary,
-              category: e.category || "general",
-              importance: e.importance ?? 0.7,
-              tags: e.tags || [],
-              content,
-              _peer: device,
-            }),
-            signal: AbortSignal.timeout(10_000),
-          });
-          if (res.ok) {
-            _history.memory.push(e.id);
-            pushed++;
-          } else console.log(`${tag()} ⚠️ 記憶 ${e.id} → ${res.status}`);
-        } catch (err) {
-          console.log(`${tag()} ⚠️ 記憶 ${e.id} → ${(err as Error).message}`);
-        }
+      const newEntries = entries.filter((e) => !known.has(e.id));
+      if (newEntries.length > 0) {
+        const memItems = newEntries.map((e) => ({
+          e,
+          contentPath: resolve(_opts!.memoryRoot, "entries", `${e.id}.md`),
+        }));
+        const r = await pushBatch(
+          memItems,
+          async ({ e, contentPath }) => {
+            let content = e.summary;
+            if (existsSync(contentPath))
+              content = await readFile(contentPath, "utf-8");
+            const result = await pushWithBackoff(
+              `${_peerUrl}/api/push/memory`,
+              {
+                summary: truncToJSLen(e.summary, 1000),
+                category: e.category || "general",
+                importance: e.importance ?? 0.7,
+                tags: e.tags || [],
+                content,
+                _peer: device,
+              },
+              10_000,
+            );
+            if (result.ok) _history.memory.push(e.id);
+            return result;
+          },
+          "記憶",
+        );
+        pushed += r.success;
       }
     }
+    await sleep(50); // 記憶→知識庫 節流
 
     // ── 知識庫 ──
     if (existsSync(_opts!.knowledgeRoot)) {
       const files = await walkDir(_opts!.knowledgeRoot);
       const known = new Set(_history.knowledge);
-      for (const rel of files) {
-        if (known.has(rel)) continue;
-        try {
-          const full = resolve(_opts!.knowledgeRoot, rel);
-          const content = await readFile(full, "utf-8");
-          const title = rel.replace(/\.md$/, "").replace(/[_-]/g, " ");
-          const res = await fetch(`${_peerUrl}/api/push/knowledge`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              title,
-              content,
-              category: "peer-knowledge",
-              tags: ["knowledge", "peer", device],
-              _peer: device,
-            }),
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (res.ok) {
-            _history.knowledge.push(rel);
-            pushed++;
-          } else console.log(`${tag()} ⚠️ 知識 ${rel} → ${res.status}`);
-        } catch (err) {
-          console.log(`${tag()} ⚠️ 知識 ${rel} → ${(err as Error).message}`);
-        }
+      const newFiles = files.filter((f) => !known.has(f));
+      if (newFiles.length > 0) {
+        const kItems = newFiles.map((rel) => ({
+          rel,
+          full: resolve(_opts!.knowledgeRoot, rel),
+        }));
+        const r = await pushBatch(
+          kItems,
+          async ({ rel, full }) => {
+            const content = await readFile(full, "utf-8");
+            const title = rel.replace(/\.md$/, "").replace(/[_-]/g, " ");
+            const result = await pushWithBackoff(
+              `${_peerUrl}/api/push/knowledge`,
+              {
+                title,
+                content,
+                category: "peer-knowledge",
+                tags: ["knowledge", "peer", device],
+                _peer: device,
+              },
+              15_000,
+            );
+            if (result.ok) _history.knowledge.push(rel);
+            return result;
+          },
+          "知識庫",
+        );
+        pushed += r.success;
       }
     }
+    await sleep(50); // 知識庫→維基 節流
 
     // ── 維基 ──
     if (existsSync(_opts!.wikiRoot)) {
       const files = await walkDir(_opts!.wikiRoot);
       const known = new Set(_history.wiki);
-      for (const rel of files) {
-        if (known.has(rel)) continue;
-        try {
-          const full = resolve(_opts!.wikiRoot, rel);
-          const content = await readFile(full, "utf-8");
-          const id = rel.replace(/\.md$/, "");
-          const cat = dirname(rel) === "." ? "general" : dirname(rel);
-          const res = await fetch(`${_peerUrl}/api/push/wiki`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              id,
-              content,
-              category: cat,
-              tags: ["wiki", "peer", device],
-              _peer: device,
-            }),
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (res.ok) {
-            _history.wiki.push(rel);
-            pushed++;
-          } else console.log(`${tag()} ⚠️ 維基 ${rel} → ${res.status}`);
-        } catch (err) {
-          console.log(`${tag()} ⚠️ 維基 ${rel} → ${(err as Error).message}`);
-        }
+      const newFiles = files.filter((f) => !known.has(f));
+      if (newFiles.length > 0) {
+        const wItems = newFiles.map((rel) => ({
+          rel,
+          full: resolve(_opts!.wikiRoot, rel),
+        }));
+        const r = await pushBatch(
+          wItems,
+          async ({ rel, full }) => {
+            const content = await readFile(full, "utf-8");
+            const id = rel.replace(/\.md$/, "");
+            const cat = dirname(rel) === "." ? "general" : dirname(rel);
+            const result = await pushWithBackoff(
+              `${_peerUrl}/api/push/wiki`,
+              {
+                id,
+                content,
+                category: cat,
+                tags: ["wiki", "peer", device],
+                _peer: device,
+              },
+              15_000,
+            );
+            if (result.ok) _history.wiki.push(rel);
+            return result;
+          },
+          "維基",
+        );
+        pushed += r.success;
       }
     }
 

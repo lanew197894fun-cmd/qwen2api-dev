@@ -2,7 +2,8 @@
 // Telegram Memory Bridge — api.ts
 // HTTP API（Tailscale 提供網路隔離，僅 tailnet 內可存取）
 
-import { hostname } from "os";
+import { hostname, networkInterfaces } from "os";
+import { execSync } from "child_process";
 import type { MemStore } from "./store";
 import type { ApiError, RecallResult, StoreResult } from "./types";
 import type { Role } from "./types/push";
@@ -14,6 +15,28 @@ export interface ApiConfig {
   store: MemStore;
   role: Role;
 }
+
+// ── 本地 IP 集合（用於跳過 rate limit） ──
+
+const LOCAL_IPS = new Set<string>(["127.0.0.1", "::1", "unknown"]);
+
+function initLocalIPs(): void {
+  try {
+    const nets = networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] || []) {
+        LOCAL_IPS.add(net.address);
+      }
+    }
+  } catch {}
+  try {
+    const out = execSync("tailscale ip -4", { timeout: 3000 })
+      .toString()
+      .trim();
+    if (out) LOCAL_IPS.add(out);
+  } catch {}
+}
+initLocalIPs();
 
 // ── 簡易速率限制（memory-based，依真實來源 IP） ──
 
@@ -32,8 +55,8 @@ function getClientIP(
 }
 
 function checkRate(ip: string, path: string): boolean {
-  // localhost / tailnet 內部請求不計 rate limit
-  if (ip === "127.0.0.1" || ip === "::1" || ip === "unknown") return true;
+  // 本機 IP / tailnet 內部請求不計 rate limit
+  if (LOCAL_IPS.has(ip) || ip.startsWith("100.")) return true;
   // 摘要端點不計 rate limit（本身是長時間請求）
   if (path.includes("/conversations/")) return true;
   const now = Date.now();
@@ -47,12 +70,17 @@ function checkRate(ip: string, path: string): boolean {
 }
 
 // 定時清理過期記錄（每 5 分鐘）
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [k, v] of reqCount) {
     if (now > v.reset) reqCount.delete(k);
   }
 }, 300_000);
+
+if (typeof process !== "undefined" && process.on) {
+  process.on("SIGINT", () => clearInterval(cleanupTimer));
+  process.on("SIGTERM", () => clearInterval(cleanupTimer));
+}
 
 // ── 輸入驗證 helper ──
 
