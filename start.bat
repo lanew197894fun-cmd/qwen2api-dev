@@ -19,7 +19,7 @@ if not exist "bun.exe" for /f "delims=" %%i in ('where bun.exe 2^>nul') do set "
 echo [start.bat] Starting qwen2api-dev (single terminal mode)...
 echo [start.bat] Close this window or press Ctrl+C to stop.
 echo.
-bun start.js %*
+bun start.js --quiet %*
 echo.
 echo [start.bat] Process exited. You can close this window.
 pause

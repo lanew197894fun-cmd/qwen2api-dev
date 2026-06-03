@@ -21,6 +21,9 @@ const ROOT = __dirname;
 const LOGS = join(ROOT, "logs");
 const children = [];
 
+// ─── quiet mode: suppress subprocess output prefix (logs still written) ───
+const QUIET = process.argv.includes("--quiet") || process.argv.includes("-q");
+
 // Load .env file to get API_KEY
 const fs = require("fs");
 const envFile = join(ROOT, ".env");
@@ -305,7 +308,7 @@ function launch(srv) {
           writeSync(lfd, d);
         } catch {}
       for (const l of d.toString().split("\n").filter(Boolean))
-        console.log(`  [${pfx}] ${l}`);
+        console.log(QUIET ? l : `  [${pfx}] ${l}`);
     });
     proc.stderr.on("data", (d) => {
       if (efd !== undefined)
@@ -313,7 +316,7 @@ function launch(srv) {
           writeSync(efd, d);
         } catch {}
       for (const l of d.toString().split("\n").filter(Boolean))
-        console.error(`  [${pfx}] ${l}`);
+        console.error(QUIET ? l : `  [${pfx}] ${l}`);
     });
 
     proc.on("exit", (code, sig) => {

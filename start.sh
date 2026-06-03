@@ -3,4 +3,4 @@
 # Delegates to the Bun-based start.js
 set -e
 cd "$(dirname "$0")"
-bun start.js
+bun start.js "$@"
