@@ -3,6 +3,7 @@
 
 import type { MemStore } from "./store";
 import { IdleProcessor, type ProcessorPaths } from "./processor";
+import { suggest } from "./governor";
 import { webSearch, webFetch, summarizeWithQwen } from "./websearch";
 import { OrgEngine, type OrgPaths } from "./organizer";
 import { ConversationStore, makeSessionId } from "./conversation-store";
@@ -49,6 +50,8 @@ export class TelegramBot {
   private organizer: OrgEngine | null = null;
   private peers: string[] = [];
   private conv: ConversationStore;
+  private pollCount = 0;
+  private lastGovInfo = "";
 
   constructor(cfg: BotConfig) {
     this.token = cfg.token;
@@ -57,7 +60,9 @@ export class TelegramBot {
     this.conv = new ConversationStore(undefined, (prompt) =>
       this.store.qwenAsk("", prompt),
     );
-    this.conv.init().catch(() => {}); // 非同步初始化，不阻塞啟動
+    this.conv.init().catch((err) => {
+      console.error("[bot] 對話歷史初始化失敗:", (err as Error).message);
+    });
     if (cfg.processorPaths)
       this.processor = new IdleProcessor(cfg.processorPaths);
     if (cfg.orgPaths)
@@ -190,6 +195,20 @@ export class TelegramBot {
     } catch (err) {
       console.error("[telegram-memory] Poll error:", (err as Error).message);
     }
+
+    // Governor 動態調速：每輪檢査，資訊改變或每 10 輪顯示
+    this.pollCount++;
+    const gov = suggest();
+    if (gov.pollMs !== this.baseInterval || gov.info !== this.lastGovInfo) {
+      this.baseInterval = gov.pollMs;
+      this.lastGovInfo = gov.info;
+      if (this.pollCount % 10 === 1 || this.emptyCount === 0)
+        console.log(`[governor] ${gov.info}`);
+    }
+    // 若 governor 建議降頻且目前閒置中，直接套用
+    if (this.idle && gov.pollMs > this.curInterval)
+      this.curInterval = gov.pollMs;
+
     this.scheduleNext();
   }
 

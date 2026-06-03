@@ -10,8 +10,9 @@ import type {
 } from "./types";
 import { resolve, dirname } from "path";
 import { mkdir, readdir, readFile, writeFile, stat } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, renameSync } from "fs";
 import { hostname } from "os";
+import { recordApiCall, startCall, endCall, suggest } from "./governor";
 
 const CHAT_URL =
   process.env.CHAT_URL || "http://127.0.0.1:3456/v1/chat/completions";
@@ -23,6 +24,37 @@ function getApiKey(): string {
     process.exit(1);
   }
   return key;
+}
+
+// ── Concurrency semaphore ──
+// Limits parallel Qwen API calls based on governor's maxConc
+// Dynamically adjusts as governor detects load changes
+let semActive = 0;
+const semQueue: (() => void)[] = [];
+let semLastLog = 0;
+
+async function semAcquire(): Promise<void> {
+  const { maxConc } = suggest();
+  if (semActive < maxConc) {
+    semActive++;
+    return;
+  }
+  // Log queue state every 5s when waiting
+  const now = Date.now();
+  if (now - semLastLog > 5000) {
+    semLastLog = now;
+    console.log(
+      `[semaphore] ⏳ waiting: ${semQueue.length + 1}, active: ${semActive}, maxConc: ${maxConc}`,
+    );
+  }
+  await new Promise<void>((r) => semQueue.push(r));
+  semActive++;
+}
+
+function semRelease(): void {
+  const next = semQueue.shift();
+  if (next) next();
+  else semActive--;
 }
 
 export class MemStore {
@@ -57,32 +89,43 @@ export class MemStore {
   }
 
   async qwenAsk(system: string, userMsg: string): Promise<string> {
-    const res = await fetch(CHAT_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey()}`,
-      },
-      body: JSON.stringify({
-        model: this.qwenModel,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: userMsg },
-        ],
-        max_tokens: 1024,
-        temperature: 0.3,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.error(`[qwen] ${res.status}: ${txt.slice(0, 200)}`);
-      throw new Error(`qwen error ${res.status}`);
+    await semAcquire();
+    startCall();
+    const t0 = performance.now();
+    let ok = true;
+    try {
+      const res = await fetch(CHAT_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${getApiKey()}`,
+        },
+        body: JSON.stringify({
+          model: this.qwenModel,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: userMsg },
+          ],
+          max_tokens: 1024,
+          temperature: 0.3,
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) {
+        ok = false;
+        const txt = await res.text().catch(() => "");
+        console.error(`[qwen] ${res.status}: ${txt.slice(0, 200)}`);
+        throw new Error(`qwen error ${res.status}`);
+      }
+      const data = (await res.json()) as {
+        choices: { message: { content: string } }[];
+      };
+      return data.choices[0].message.content;
+    } finally {
+      semRelease();
+      endCall();
+      recordApiCall(performance.now() - t0, ok);
     }
-    const data = (await res.json()) as {
-      choices: { message: { content: string } }[];
-    };
-    return data.choices[0].message.content;
   }
 
   // ── Model-powered search ──
@@ -143,6 +186,8 @@ export class MemStore {
       content?: string;
     },
   ): Promise<StoreResult> {
+    // 防止 summary 超過 API 允許長度（1000 UTF-16 code units）
+    summary = truncToJSLen(summary, 1000);
     const id = `mem-${Date.now()}-${slugify(summary)}`;
     const cat = opts?.category ?? inferCategory(summary);
     const imp = opts?.importance ?? 0.7;
@@ -252,11 +297,11 @@ export class MemStore {
   // ── Read entry content ──
 
   async readContent(id: string): Promise<string | null> {
-    // 只允許安全字元，拒絕路徑穿越
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) return null;
-    const path = resolve(this.entriesDir, `${id}.md`);
-    if (!existsSync(path)) return null;
-    return readFile(path, "utf-8");
+    const p = resolve(this.entriesDir, `${id}.md`);
+    if (!p.startsWith(this.entriesDir)) return null;
+    if (!existsSync(p)) return null;
+    return readFile(p, "utf-8");
   }
 
   // ── Sync state ──
@@ -278,8 +323,11 @@ export class MemStore {
 
   private async appendIndex(entry: MemEntry): Promise<void> {
     const existing = await this.list();
+    if (existing.some((e) => e.id === entry.id)) return;
     existing.push(entry);
-    await writeFile(this.indexPath, JSON.stringify(existing, null, 2), "utf-8");
+    const tmp = this.indexPath + ".tmp." + process.pid;
+    await writeFile(tmp, JSON.stringify(existing, null, 2), "utf-8");
+    renameSync(tmp, this.indexPath);
   }
 
   get entriesDirPath(): string {
@@ -354,6 +402,23 @@ export class MemStore {
     await writeFile(indexPath, JSON.stringify(index, null, 2), "utf-8");
     return { path: fp };
   }
+}
+
+// ── JS-length-aware truncation ──
+// JS `.length` = UTF-16 code units. Emoji (Non-BMP) = 2 units, but Python `len()` = 1.
+// This ensures summaries fit within API's `validStr(summary, 1000)` check.
+function truncToJSLen(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const chars = [...s];
+  let n = 0;
+  let out = "";
+  for (const c of chars) {
+    const add = c.length; // 1 for BMP, 2 for supplementary (emoji)
+    if (n + add > max - 3) break;
+    out += c;
+    n += add;
+  }
+  return out + "...";
 }
 
 function slugify(text: string): string {

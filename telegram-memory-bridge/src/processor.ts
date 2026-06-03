@@ -5,6 +5,7 @@
 import { readdir, readFile, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve } from "path";
+import { suggest as govSuggest } from "./governor";
 
 export interface ProcessorPaths {
   memoryIndex: string; // memory-index.json
@@ -167,6 +168,14 @@ export class IdleProcessor {
   // 執行一輪背景處理（被 bot idle 觸發）
   async runOnce(): Promise<string> {
     if (this.running) return "⏳ 前一轮處理未完成，跳過";
+
+    // Governor 調度：系統忙碌時跳過背景處理
+    const gov = govSuggest();
+    if (gov.skipBg) {
+      this.running = false;
+      return `⏭️ 背景跳過 (${gov.info})`;
+    }
+
     this.running = true;
     this.cycle++;
     const start = Date.now();
