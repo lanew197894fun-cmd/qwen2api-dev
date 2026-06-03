@@ -80,7 +80,7 @@ function loadConfig(): Config {
       __dirname,
       process.env.WIKI_PATH || "../../../../.opencode/wiki",
     ),
-    qwenModel: "small",
+    qwenModel: process.env.QWEN_MODEL || "Qwen3.6-Max-Preview",
   };
 }
 
