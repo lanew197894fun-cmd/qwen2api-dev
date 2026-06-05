@@ -351,6 +351,8 @@ export class Provider {
         this.healthy = true;
         return true;
       }
+      // 非 200 回應：記錄狀態碼（API 需要 auth）
+      log.debug(`${this.name} health: HTTP ${res.status}`);
       this._healthFails++;
       if (this._healthFails >= this._maxHealthFails) this.healthy = false;
       return false;

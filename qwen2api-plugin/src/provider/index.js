@@ -35,11 +35,16 @@ export function createRouter(cfg) {
 
     // 從 cfg（環境變數）讀取
     let baseUrl = cfg[`${prefix}_URL`] || cfg[`${prefix}_BASE_URL`];
-    const apiKey = cfg[`${prefix}_KEY`] || cfg[`${prefix}_API_KEY`] || "";
+    let apiKey = cfg[`${prefix}_KEY`] || cfg[`${prefix}_API_KEY`] || "";
 
     // 預設 qwen2api 端點
     if (!baseUrl && name === "qwen2api") {
       baseUrl = `http://${cfg.QWEN2API_HOST || "127.0.0.1"}:${cfg.QWEN2API_PORT || 3000}`;
+    }
+
+    // 通用 API_KEY 作為 qwen2api provider 的最終 fallback
+    if (!apiKey && name === "qwen2api") {
+      apiKey = cfg.API_KEY || "";
     }
 
     if (!baseUrl) {
