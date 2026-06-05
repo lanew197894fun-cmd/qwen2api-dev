@@ -12,6 +12,7 @@ const log = {
   info: (...a) => console.log("[provider]", ...a),
   warn: (...a) => console.warn("[provider]", ...a),
   error: (...a) => console.error("[provider]", ...a),
+  debug: (...a) => console.log("[provider]", ...a),
 };
 
 export class Provider {
