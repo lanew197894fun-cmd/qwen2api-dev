@@ -1,0 +1,20 @@
+{
+  "id": "knowledge-wiki-plugin",
+  "name": "Knowledge Wiki Plugin",
+  "version": "1.0.0",
+  "description": "整合知識庫、經驗教訓與維基的 OpenCode 插件，支援自動分類、重複檢測與批量去重",
+  "author": "OpenCode Team",
+  "license": "MIT",
+  "dependencies": ["@opencode-ai/plugin", "zod"],
+  "tools": [
+    "knowledge/save",
+    "knowledge/index",
+    "knowledge/read",
+    "knowledge/deduplicate",
+    "lesson/save",
+    "lesson/list",
+    "wiki/save",
+    "wiki/list",
+    "wiki/read"
+  ]
+}

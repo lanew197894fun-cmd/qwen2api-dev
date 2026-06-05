@@ -10,18 +10,43 @@ const { initSsxmodManager } = require("./utils/ssxmod-manager");
 const { gracefulShutdown } = require("./graceful-shutdown");
 const { hasKey } = require("./utils/encryption");
 
-// ─── 全域錯誤防護：防止未捕獲異常導致進程退出 ───
+// ─── 全域錯誤防護：區分可恢復與致命錯誤 ───
+let fatalShutdownScheduled = false;
+
 process.on("unhandledRejection", (reason, promise) => {
-  logger.error("未處理的 Promise Rejection", "PROCESS", "", {
-    reason,
-    promise,
-  });
-  // 不要 exit，讓服務繼續運行
+  const msg = String(reason?.message || reason);
+  const isFatal =
+    /heap|memory|out of memory|allocation failure|segmentation fault/i.test(
+      msg,
+    );
+
+  if (isFatal && !fatalShutdownScheduled) {
+    fatalShutdownScheduled = true;
+    logger.error("致命錯誤：記憶體或資源耗盡，準備優雅關閉", "PROCESS", "💀", {
+      reason,
+    });
+    setTimeout(() => process.exit(1), 5000); // 給予 5 秒緩衝期
+  } else {
+    logger.warn("非致命 Promise Rejection（已攔截）", "PROCESS", "⚠️", {
+      reason: msg.slice(0, 200),
+    });
+  }
 });
 
 process.on("uncaughtException", (error) => {
-  logger.error("未捕獲的異常", "PROCESS", "", error);
-  // 記錄錯誤後繼續運行，避免中斷正在進行的對話
+  const msg = String(error?.message || error);
+  const isFatal =
+    /heap|memory|out of memory|allocation failure|segmentation fault/i.test(
+      msg,
+    );
+
+  if (isFatal && !fatalShutdownScheduled) {
+    fatalShutdownScheduled = true;
+    logger.error("致命錯誤：未捕獲異常，準備優雅關閉", "PROCESS", "💀", error);
+    setTimeout(() => process.exit(1), 5000);
+  } else {
+    logger.error("非致命未捕獲異常（已攔截）", "PROCESS", "⚠️", error);
+  }
 });
 
 // ─── Express 4 async 錯誤自動捕獲 ───

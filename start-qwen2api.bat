@@ -50,6 +50,7 @@ cd /d "%ROOT%\telegram-memory-bridge"
 start "%BUN%" /B %BUN% src/index.ts
 
 echo [%DATE% %TIME%] All services started.
+echo system-watchdog 已整合至 chat-proxy 健康報告中
 echo This window will stay open to keep services alive.
 echo Close this window to stop all services.
 

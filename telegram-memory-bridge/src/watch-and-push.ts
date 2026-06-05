@@ -8,6 +8,7 @@ import { readFile, readdir, stat, mkdir, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve, dirname, relative } from "path";
 import { hostname } from "os";
+import { suggest } from "./governor";
 
 // ── JS-length-aware truncation ──
 // JS `.length` = UTF-16 code units. Emoji (Non-BMP) = 2 units, Python `len()` = 1.
@@ -47,7 +48,8 @@ let _busy = false;
 let _timer: ReturnType<typeof setTimeout> | null = null;
 let _pollTimer: ReturnType<typeof setInterval> | null = null;
 const _debounceMs = 5000;
-const _pollMs = 120_000;
+// P1.1 修復：使用 Governor 動態調整輪詢間隔，預設 120s
+let _pollMs = 120_000;
 const BATCH_SIZE = 50;
 const BASE_DELAY_MS = 1000;
 const MAX_RETRIES = 5;
@@ -156,11 +158,23 @@ async function pushBatch(
   return { success, errors };
 }
 
+const PUSH_TIMEOUT_MS = 60_000;
+
 async function doPush(): Promise<void> {
-  if (_busy) return;
+  if (_busy) {
+    console.log(`${tag()} ⏳ 前次推送尚未完成，跳過本輪`);
+    return;
+  }
   _busy = true;
   const device = hostname();
   let pushed = 0;
+
+  const timeoutId = setTimeout(() => {
+    if (_busy) {
+      console.log(`${tag()} ⚠️ 推送超時 (${PUSH_TIMEOUT_MS}ms)，強制重置`);
+      _busy = false;
+    }
+  }, PUSH_TIMEOUT_MS);
 
   try {
     // ── 記憶 ──
@@ -284,9 +298,10 @@ async function doPush(): Promise<void> {
     await saveHistory();
   } catch (err) {
     console.log(`${tag()} ❌ 推送異常: ${(err as Error).message}`);
+  } finally {
+    clearTimeout(timeoutId);
+    _busy = false;
   }
-
-  _busy = false;
   if (pushed === 0) idle();
   else console.log(`${tag()} ✅ 推送 ${pushed} 筆完成`);
 }
@@ -380,13 +395,28 @@ export async function startWatchAndPush(opts: PushOpts): Promise<void> {
   }
 
   // ── 知識庫 + 維基：polling 取代 recursive fs.watch（避免 inotify 爆炸） ──
-  _pollTimer = setInterval(async () => {
+  // P1.1 修復：每輪檢查前根據 Governor 建議動態調整間隔
+  const runPoll = async () => {
+    const gov = suggest();
+    // Governor pollMs 是針對 bot idle 的建議，這裡我們映射到 watch-push 的輪詢
+    // 負載高時延長輪詢（減少 I/O），負載低時縮短輪詢（提高即時性）
+    const suggestedPollMs = gov.pollMs * 10; // bot poll 是秒級，watch-push 是分鐘級
+    if (suggestedPollMs !== _pollMs) {
+      console.log(
+        `[watch-push] 🔄 輪詢間隔調整: ${_pollMs / 1000}s → ${suggestedPollMs / 1000}s (${gov.info})`,
+      );
+      _pollMs = suggestedPollMs;
+      if (_pollTimer) clearInterval(_pollTimer);
+      _pollTimer = setInterval(runPoll, _pollMs);
+    }
+
     const n = await dryRun();
     if (n > 0) {
       console.log(`[watch-push] 🔍 polling 發現 ${n} 筆新資料`);
       doPush().catch(() => {});
     }
-  }, _pollMs);
+  };
+  _pollTimer = setInterval(runPoll, _pollMs);
 
   console.log(
     `[watch-push] ✅ 就緒（fs.watch 索引 + polling ${_pollMs / 1000}s 知識/維基）`,

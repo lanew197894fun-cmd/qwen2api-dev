@@ -1,0 +1,62 @@
+{
+  "services": [
+    {
+      "name": "embed-server",
+      "port": 11436,
+      "cwd": "../scripts",
+      "cmd": ["bun", "embed-server.ts"],
+      "env": {},
+      "waitUrl": null,
+      "platforms": ["linux", "darwin"]
+    },
+    {
+      "name": "waf-proxy",
+      "port": 3457,
+      "cwd": "qwen2api-plugin",
+      "cmd": ["bun", "src/waf-proxy.js"],
+      "env": {},
+      "waitUrl": "http://127.0.0.1:3457/",
+      "waitTimeout": 30,
+      "platforms": ["win32", "linux", "darwin"]
+    },
+    {
+      "name": "qwen2api",
+      "port": 3000,
+      "cwd": "qwen2api",
+      "cmd": ["bun", "src/start.js", "--force"],
+      "env": {
+        "API_KEY": "sk-123456"
+      },
+      "waitUrl": "http://127.0.0.1:3000/health",
+      "waitTimeout": 30,
+      "platforms": ["win32", "linux", "darwin"]
+    },
+    {
+      "name": "chat-proxy",
+      "port": 3456,
+      "cwd": "qwen2api-plugin",
+      "cmd": ["bun", "src/start-proxy.js"],
+      "env": {
+        "API_KEY": "sk-123456",
+        "PROXY_LOG_LEVEL": "info",
+        "PROXY_ROUTE": "auto",
+        "PROXY_LARGE_MODEL": "Qwen3.6-Max-Preview",
+        "PROXY_HW_FORCE_LEVEL": "large"
+      },
+      "waitUrl": "http://127.0.0.1:3456/health",
+      "waitTimeout": 15,
+      "platforms": ["win32", "linux", "darwin"]
+    },
+    {
+      "name": "telegram-bridge",
+      "port": 4377,
+      "cwd": "telegram-memory-bridge",
+      "cmd": ["bun", "src/index.ts"],
+      "env": {},
+      "waitUrl": "http://127.0.0.1:4377/api/health",
+      "waitTimeout": 20,
+      "platforms": ["win32", "linux", "darwin"]
+    }
+  ],
+  "ports": [3000, 3456, 3457, 4377, 11436]
+}

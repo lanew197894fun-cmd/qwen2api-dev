@@ -100,14 +100,22 @@ const getRamInfo = () => {
   const totalGB = total / 1024 / 1024 / 1024;
   const freeGB = free / 1024 / 1024 / 1024;
   let s = 0;
-  if (totalGB >= 16) s = 3;
-  else if (totalGB >= 8) s = 2;
-  else if (totalGB >= 4) s = 1;
-  if (freeGB >= 4) s += 1;
+  // 針對入門級筆電優化：8GB 以下嚴格限制
+  if (totalGB >= 32) s = 4;
+  else if (totalGB >= 16) s = 3;
+  else if (totalGB >= 8)
+    s = 1; // 8GB 僅給 1 分，避免誤判為 medium
+  else s = 0; // <8GB 直接 0 分
+
+  // 可用記憶體權重加大
+  if (freeGB >= 8) s += 2;
+  else if (freeGB >= 4) s += 1;
+  else if (freeGB < 1.5) s -= 2; // 可用 <1.5GB 嚴重扣分
+
   return {
     totalGB: +totalGB.toFixed(1),
     freeGB: +freeGB.toFixed(1),
-    score: Math.max(0, Math.min(4, s)),
+    score: Math.max(0, Math.min(5, s)),
   };
 };
 

@@ -4,6 +4,14 @@
 
 import { hostname, networkInterfaces } from "os";
 import { execSync } from "child_process";
+import {
+  readdirSync,
+  statSync,
+  readFileSync,
+  existsSync,
+  unlinkSync,
+} from "fs";
+import { resolve } from "path";
 import type { MemStore } from "./store";
 import type { ApiError, RecallResult, StoreResult } from "./types";
 import type { Role } from "./types/push";
@@ -14,6 +22,11 @@ export interface ApiConfig {
   port: number;
   store: MemStore;
   role: Role;
+  knowledgePath?: string;
+  wikiPath?: string;
+  lessonPath?: string;
+  opencodeRoot?: string;
+  onPullRequest?: (peerUrl: string) => Promise<void>;
 }
 
 // ── 本地 IP 集合（用於跳過 rate limit） ──
@@ -165,25 +178,50 @@ export function startApi(cfg: ApiConfig) {
           return json(result);
         }
 
-        // ── Qwen ask ──
+        // ── Qwen ask（強化：自動搜尋記憶+知識庫+維基+經驗教訓） ──
         if (method === "POST" && path === "/api/ask") {
           const body = (await req.json()) as Record<string, unknown>;
           if (!validStr(body.question, 2000))
             return json({ error: "question required (max 2000 chars)" }, 400);
-          const entries = await store.searchByModel(body.question as string, 5);
-          const memoryText = entries.entries
+          const q = body.question as string;
+
+          // 1. 記憶搜尋
+          const entries = await store.searchByModel(q, 5);
+          const mem = entries.entries
             .map(
               (e, i) => `[${i + 1}] ${e.summary} (${e.category}, ${e.score}%)`,
             )
             .join("\n");
+
+          // 2. 知識庫 + 維基 + 教訓 全文搜尋
+          const know = await searchDir(cfg.knowledgePath || "", q, 3);
+          const wiki = await searchDir(cfg.wikiPath || "", q, 3);
+          const less = await searchDir(cfg.lessonPath || "", q, 3);
+
+          // 3. 組裝完整上下文
+          const ctx: string[] = [];
+          if (mem) ctx.push(`📝 相關記憶：\n${mem}`);
+          if (know) ctx.push(`\n📚 相關知識：\n${know}`);
+          if (wiki) ctx.push(`\n📖 相關維基：\n${wiki}`);
+          if (less) ctx.push(`\n⚠️ 相關教訓：\n${less}`);
+          const allCtx = ctx.join("\n") || "（無相關資料）";
+
           const system =
-            "你是一個記憶助手。根據提供的記憶回答問題。保持簡潔，繁體中文。";
-          const prompt = `相關記憶：\n${memoryText || "無相關記憶"}\n\n問題：${body.question}`;
+            "你是一個全知的開發助手。以下是與問題相關的記憶、知識庫、維基和經驗教訓。\n" +
+            "請根據這些資訊回答，並在適當時引用來源。保持繁體中文。\n\n" +
+            "小提醒：\n" +
+            "• 遇到問題解決後，可用 lesson/save 記錄經驗教訓\n" +
+            "• 學到新技術或架構，可用 knowledge/save 存入知識庫\n" +
+            "• 重要的長期文件，可用 wiki/save 建立維基條目";
+          const prompt = `## 相關上下文\n\n${allCtx}\n\n## 問題\n${q}`;
           const answer = await store.qwenAsk(system, prompt);
           return json({
-            question: body.question,
+            question: q,
             answer,
-            matchedCount: entries.entries.length,
+            matchedMemory: entries.entries.length,
+            matchedKnowledge: know ? know.split("\n").length : 0,
+            matchedWiki: wiki ? wiki.split("\n").length : 0,
+            matchedLessons: less ? less.split("\n").length : 0,
           });
         }
 
@@ -220,6 +258,115 @@ export function startApi(cfg: ApiConfig) {
           const content = await store.readContent(id);
           if (!content) return json({ error: "not found" }, 404);
           return json({ id, content });
+        }
+
+        // ── Knowledge listing ──
+        if (method === "GET" && path === "/api/knowledge") {
+          const files = listMarkdownFiles(cfg.knowledgePath || "");
+          return json({ files, device: hostname() });
+        }
+
+        // ── Wiki listing ──
+        if (method === "GET" && path === "/api/wiki") {
+          const files = listMarkdownFiles(cfg.wikiPath || "");
+          return json({ files, device: hostname() });
+        }
+
+        // ── Lesson listing ──
+        if (method === "GET" && path === "/api/lesson") {
+          const files = listMarkdownFiles(cfg.lessonPath || "");
+          return json({ files, device: hostname() });
+        }
+
+        // ── Read knowledge/wiki/lesson file by relative path ──
+        if (method === "GET" && path === "/api/read") {
+          const type = url.searchParams.get("type") || "";
+          const relPath = url.searchParams.get("path") || "";
+          const baseDir =
+            type === "wiki"
+              ? cfg.wikiPath
+              : type === "lesson"
+                ? cfg.lessonPath
+                : cfg.knowledgePath;
+          if (!baseDir || !relPath)
+            return json({ error: "type and path required" }, 400);
+          const full = resolve(baseDir, relPath);
+          if (!full.startsWith(resolve(baseDir)))
+            return json({ error: "path traversal" }, 403);
+          if (!existsSync(full)) return json({ error: "not found" }, 404);
+          const content = readFileSync(full, "utf-8");
+          return json({ content });
+        }
+
+        // ── Cleanup synced files on source (pull 完成後刪除原始檔) ──
+        if (method === "POST" && path === "/api/cleanup") {
+          const body = (await req.json()) as Record<string, unknown>;
+          const files = body.files as
+            | { type: string; path: string }[]
+            | undefined;
+          if (!Array.isArray(files))
+            return json({ error: "files array required" }, 400);
+          let deleted = 0;
+          const errors: string[] = [];
+          for (const f of files) {
+            const baseDir =
+              f.type === "wiki"
+                ? cfg.wikiPath
+                : f.type === "knowledge"
+                  ? cfg.knowledgePath
+                  : f.type === "lesson"
+                    ? cfg.lessonPath
+                    : "";
+            if (!baseDir) {
+              errors.push(`${f.type}:${f.path} → 未知類型`);
+              continue;
+            }
+            const full = resolve(baseDir, f.path);
+            if (!full.startsWith(resolve(baseDir))) {
+              errors.push(`${f.path} → 路徑越界`);
+              continue;
+            }
+            try {
+              unlinkSync(full);
+              deleted++;
+              console.log(`[cleanup] 🗑️ 刪除 ${f.type}: ${f.path}`);
+              // 清理空目錄（遞迴向上）
+              let dir = resolve(full, "..");
+              while (dir.startsWith(resolve(baseDir))) {
+                const entries = readdirSync(dir);
+                if (entries.length > 0) break;
+                try {
+                  const { rmdirSync } = await import("fs");
+                  rmdirSync(dir);
+                } catch {
+                  /* */
+                }
+                dir = resolve(dir, "..");
+              }
+            } catch (err) {
+              errors.push(`${f.path} → ${(err as Error).message}`);
+            }
+          }
+          return json({
+            deleted,
+            errors: errors.length > 0 ? errors : undefined,
+          });
+        }
+
+        // ── Trigger pull from peer (master only) ──
+        if (method === "POST" && path === "/api/pull/now") {
+          if (!cfg.onPullRequest)
+            return json({ error: "pull not available (not master)" }, 503);
+          const body = (await req.json()) as Record<string, string>;
+          const peerUrl = body.url || "";
+          if (!peerUrl) return json({ error: "url required" }, 400);
+          // Fire-and-forget: don't block the response
+          cfg
+            .onPullRequest(peerUrl)
+            .catch((err) =>
+              console.error(`[api] pull error: ${(err as Error).message}`),
+            );
+          return json({ ok: true, message: "pull triggered", peer: peerUrl });
         }
 
         // ── Health ──
@@ -447,4 +594,65 @@ function json(data: any, status = 200): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function listMarkdownFiles(baseDir: string): string[] {
+  if (!baseDir || !existsSync(baseDir)) return [];
+  const files: string[] = [];
+  const walk = (dir: string, prefix: string) => {
+    for (const e of readdirSync(dir)) {
+      const full = resolve(dir, e);
+      const s = statSync(full);
+      if (s.isDirectory()) walk(full, prefix ? `${prefix}/${e}` : e);
+      else if (e.endsWith(".md")) files.push(prefix ? `${prefix}/${e}` : e);
+    }
+  };
+  walk(baseDir, "");
+  return files;
+}
+
+/**
+ * 在指定目錄中搜尋關鍵字，回傳最近修改且相關的 .md 文件摘要。
+ * 用於 knowledge/wiki/lesson 等 markdown 知識來源的全文比對。
+ */
+export function searchDir(dir: string, query: string, max: number): string {
+  if (!dir || !existsSync(dir)) return "";
+  const q = query.toLowerCase();
+  const hits: { file: string; mtime: Date; snippet: string }[] = [];
+  const walk = (base: string, prefix: string) => {
+    for (const e of readdirSync(base)) {
+      const full = resolve(base, e);
+      const s = statSync(full);
+      if (s.isDirectory()) walk(full, prefix ? `${prefix}/${e}` : e);
+      else if (e.endsWith(".md")) {
+        try {
+          const content = readFileSync(full, "utf-8");
+          // 全文關鍵詞比對（簡單但足夠）
+          if (content.toLowerCase().includes(q)) {
+            const title =
+              content.match(/^# (.+)$/m)?.[1] || e.replace(/\.md$/, "");
+            // 取關鍵字前後文字作為摘要
+            const idx = content.toLowerCase().indexOf(q);
+            const start = Math.max(0, idx - 60);
+            const end = Math.min(content.length, idx + q.length + 120);
+            const snippet =
+              (start > 0 ? "…" : "") +
+              content.slice(start, end).replace(/\n/g, " ").trim() +
+              (end < content.length ? "…" : "");
+            hits.push({ file: title, mtime: s.mtime, snippet });
+          }
+        } catch {
+          /* 跳過無法讀取的檔案 */
+        }
+      }
+    }
+  };
+  walk(dir, "");
+
+  // 依修改時間排序（最新的在前面），取前 max 筆
+  hits.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+  return hits
+    .slice(0, max)
+    .map((h) => `📄 ${h.file}\n   ${h.snippet}`)
+    .join("\n");
 }

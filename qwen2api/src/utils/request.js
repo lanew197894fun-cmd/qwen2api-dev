@@ -13,6 +13,51 @@ const {
   refreshModels,
 } = require("../models/models-map.js");
 
+// ─── 延遲監控與健康廣播 (輕量級) ───
+// 用於追蹤上游 API 的響應延遲，當延遲超過閾值時標記為「擁塞」
+// chat-proxy 可讀取此狀態以觸發模型降級
+// ─── 延遲監控與健康廣播 (輕量級) ───
+// 用於追蹤上游 API 的響應延遲，當延遲超過閾值時標記為「擁塞」
+// chat-proxy 可讀取此狀態以觸發模型降級
+// 筆電開發測試優化：降低閾值至 3s，更快偵測卡死
+const LATENCY_THRESHOLD_MS = parseInt(
+  process.env.QWEN_LATENCY_THRESHOLD || "3000",
+  10,
+);
+let upstreamCongested = false;
+let lastLatencyCheck = 0;
+
+function checkUpstreamHealth() {
+  return !upstreamCongested;
+}
+
+function recordLatency(ms) {
+  lastLatencyCheck = Date.now();
+  if (ms > LATENCY_THRESHOLD_MS) {
+    if (!upstreamCongested) {
+      logger.warn(
+        `⚠️ 上游延遲臨界: ${ms}ms > ${LATENCY_THRESHOLD_MS}ms，標記為擁塞`,
+        "HEALTH",
+      );
+      upstreamCongested = true;
+    }
+  } else {
+    // 恢復健康需連續幾次正常或經過一段時間，這裡簡化為立即恢復但設冷卻
+    if (upstreamCongested && Date.now() - lastLatencyCheck > 10000) {
+      // 簡單冷卻邏輯，實際可更複雜
+    }
+    if (upstreamCongested && ms < LATENCY_THRESHOLD_MS / 2) {
+      logger.info(`✅ 上游延遲恢復: ${ms}ms，解除擁塞標記`, "HEALTH");
+      upstreamCongested = false;
+    }
+  }
+}
+
+module.exports.getUpstreamHealth = () => ({
+  congested: upstreamCongested,
+  lastCheck: lastLatencyCheck,
+});
+
 // ─── 冪等性保護：快取已處理的 Request ID（限制容量防止記憶體洩漏） ───
 const processedRequests = new Map();
 const REQUEST_CACHE_TTL = 60000; // 60秒過期
@@ -210,6 +255,8 @@ const sendChatRequest = async (
 
   try {
     logger.network(`傳送聊天請求`, "REQUEST");
+    // 🐛 FIX: 記錄請求開始時間用於計算 TTFB
+    body._requestStartTime = Date.now();
     const response = await withRetry(
       () =>
         axios.post(
@@ -244,6 +291,9 @@ const sendChatRequest = async (
           error: "invalid_stream_response",
         };
       }
+      // 🐛 FIX: 記錄首包延遲 (TTFB) 用於健康監控
+      const ttfb = Date.now() - (body._requestStartTime || Date.now());
+      recordLatency(ttfb);
       return {
         currentToken: currentToken,
         status: true,
@@ -403,4 +453,8 @@ const generateChatID = async (currentToken, model, account) => {
 module.exports = {
   sendChatRequest,
   generateChatID,
+  getUpstreamHealth: () => ({
+    congested: upstreamCongested,
+    lastCheck: lastLatencyCheck,
+  }),
 };

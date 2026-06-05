@@ -245,14 +245,29 @@ async function main() {
       }
 
       // 監聽工作程式退出
+      const workerRestartCooldown = new Map(); // workerId → lastRestartTime
+      const RESTART_COOLDOWN_MS = 30_000; // 30 秒冷卻
+
       cluster.on("exit", (worker, code, signal) => {
         logger.error(
           `工作程式 ${worker.process.pid} 已退出 - 退出碼: ${code}, 訊號: ${signal}`,
           "CLUSTER",
         );
 
-        // 自動重啟工作程式
+        // 自動重啟工作程式（加入冷卻機制防止風暴）
         if (!worker.exitedAfterDisconnect) {
+          const now = Date.now();
+          const lastRestart = workerRestartCooldown.get(worker.id) || 0;
+
+          if (now - lastRestart < RESTART_COOLDOWN_MS) {
+            logger.warn(
+              `工作程式重啟冷卻中，跳過 (${RESTART_COOLDOWN_MS - (now - lastRestart)}ms 剩餘)`,
+              "CLUSTER",
+            );
+            return;
+          }
+
+          workerRestartCooldown.set(worker.id, now);
           logger.info("正在重啟工作程式...", "CLUSTER");
           const newWorker = cluster.fork();
           logger.info(

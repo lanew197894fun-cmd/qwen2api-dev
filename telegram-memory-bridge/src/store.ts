@@ -9,10 +9,24 @@ import type {
   SyncState,
 } from "./types";
 import { resolve, dirname } from "path";
-import { mkdir, readdir, readFile, writeFile, stat } from "fs/promises";
-import { existsSync, renameSync } from "fs";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  writeFile,
+  stat,
+  rename,
+  unlink,
+} from "fs/promises";
+import { existsSync } from "fs";
 import { hostname } from "os";
-import { recordApiCall, startCall, endCall, suggest } from "./governor";
+import {
+  recordApiCall,
+  startCall,
+  endCall,
+  setQueueDepth,
+  suggest,
+} from "./governor";
 
 const CHAT_URL =
   process.env.CHAT_URL || "http://127.0.0.1:3456/v1/chat/completions";
@@ -33,8 +47,9 @@ let semActive = 0;
 const semQueue: (() => void)[] = [];
 let semLastLog = 0;
 
-async function semAcquire(): Promise<void> {
+async function semAcquire(timeoutMs?: number): Promise<void> {
   const { maxConc } = suggest();
+  setQueueDepth(semQueue.length);
   if (semActive < maxConc) {
     semActive++;
     return;
@@ -47,14 +62,42 @@ async function semAcquire(): Promise<void> {
       `[semaphore] ⏳ waiting: ${semQueue.length + 1}, active: ${semActive}, maxConc: ${maxConc}`,
     );
   }
-  await new Promise<void>((r) => semQueue.push(r));
-  semActive++;
+
+  if (timeoutMs) {
+    const acquired = await Promise.race([
+      new Promise<boolean>((resolve) => {
+        semQueue.push(() => resolve(true));
+      }),
+      new Promise<boolean>((resolve) =>
+        setTimeout(() => resolve(false), timeoutMs),
+      ),
+    ]);
+    if (!acquired) {
+      // 超時時不增加 semActive，避免計數器洩漏
+      throw new Error(`Semaphore acquire timeout after ${timeoutMs}ms`);
+    }
+    // 成功取得 slot 後才遞增
+    semActive++;
+  } else {
+    await new Promise<void>((r) => semQueue.push(r));
+    semActive++;
+  }
 }
 
 function semRelease(): void {
   const next = semQueue.shift();
   if (next) next();
   else semActive--;
+  setQueueDepth(semQueue.length);
+}
+
+/** 硬性超時保護，確保不會無限等待 */
+const HARD_TIMEOUT_MS = Number(process.env.QWEN_HARD_TIMEOUT_MS) || 30000;
+
+function requestTimeout(ms: number): Promise<never> {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Request timeout after ${ms}ms`)), ms),
+  );
 }
 
 export class MemStore {
@@ -63,6 +106,8 @@ export class MemStore {
   private entriesDir: string;
   private syncStatePath: string;
   private qwenModel: string;
+  /** 序列化 appendIndex 寫入，避免併發 race condition */
+  private appendLock = Promise.resolve();
 
   constructor(root: string, qwenModel?: string) {
     this.root = resolve(root);
@@ -88,47 +133,193 @@ export class MemStore {
     this.qwenModel = m;
   }
 
+  /** 判斷訊息是否極簡（供 overload 時跳過 AI） */
+  private isTrivial(msg: string): boolean {
+    const t = msg.trim();
+    if (t.length > 60) return false;
+    const trivia = [
+      "好",
+      "ok",
+      "okay",
+      "是的",
+      "沒錯",
+      "謝謝",
+      "感恩",
+      "了解",
+      "知道了",
+      "明白",
+      "收到",
+    ];
+    if (trivia.includes(t.toLowerCase())) return true;
+    if (/^[👍👌✅🙏😊❤️]+$/.test(t)) return true;
+    return false;
+  }
+
+  /** 模型等級 → 具體模型名稱（proxy 會再依複雜度路由） */
+  private modelForTier(tier: "small" | "medium" | "large"): string {
+    // 讓 chat-proxy 做最終路由，我們只給 hint
+    const map: Record<string, string> = {
+      small: "qwen3.6-27b",
+      medium: "qwen3.7-plus",
+      large: this.qwenModel, // 使用者設定的主模型
+    };
+    return map[tier] || this.qwenModel;
+  }
+
   async qwenAsk(system: string, userMsg: string): Promise<string> {
-    await semAcquire();
+    // 先查 governor 狀態決定策略
+    const gov = suggest();
+
+    // 極高負載 + 極簡訊息 → 跳過 AI，直接回確認
+    if (gov.skipAIfIfTrivial && this.isTrivial(userMsg)) {
+      const replies = ["✅ 收到", "👌 好的", "📝 已記錄", "✔️ 了解"];
+      console.log(`[qwen:skip] ${gov.info}`);
+      return replies[Math.floor(Math.random() * replies.length)];
+    }
+
+    // 根據 governor 決定 timeout 與模型
+    const isSmall = gov.modelTier === "small";
+    // small tier 且非複雜問題 → 走快速通道（跳 semaphore）
+    const useFastPath =
+      isSmall &&
+      !userMsg.includes("```") &&
+      !userMsg.includes("~~~") &&
+      userMsg.length <= 200;
+
+    if (useFastPath) {
+      const t0 = performance.now();
+      const model = this.modelForTier("small");
+      try {
+        const res = await fetch(CHAT_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${getApiKey()}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content: userMsg },
+            ],
+            max_tokens: 256,
+            temperature: 0.3,
+          }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as {
+            choices: { message: { content: string } }[];
+          };
+          const elapsed = performance.now() - t0;
+          console.log(
+            `[qwen:fast] ${model} ${Math.round(elapsed)}ms (${gov.info})`,
+          );
+          return data.choices[0].message.content;
+        }
+        console.warn(`[qwen:fast] ${res.status} → 降級`);
+      } catch (e) {
+        console.warn(`[qwen:fast] ${(e as Error).message} → 降級`);
+      }
+    }
+
+    // 正常通道（受 governor 動態控制）
+    // semAcquire 有內建 timeout，API call 有 Promise.race，
+    // 不需要額外硬超時——避免跟 semAcquire timeout 競爭造成計數偏移
+    await semAcquire(HARD_TIMEOUT_MS);
     startCall();
     const t0 = performance.now();
     let ok = true;
-    // 動態超時：基礎 60s，若 Governor 建議跳過背景任務（高負載）則延長至 120s
-    const gov = suggest();
-    const timeoutMs = gov.skipBg ? 120000 : 60000;
+
+    // 動態超時：模型越小超時越短
+    const timeoutMs =
+      gov.modelTier === "small"
+        ? 15000
+        : gov.modelTier === "medium"
+          ? 30000
+          : gov.skipBg
+            ? 60000
+            : 45000;
+    const maxRetries = gov.modelTier === "small" ? 0 : 1; // 減少重試次數以快速失敗
+    const model = this.modelForTier(gov.modelTier);
+
     try {
-      const res = await fetch(CHAT_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${getApiKey()}`,
-        },
-        body: JSON.stringify({
-          model: this.qwenModel,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: userMsg },
-          ],
-          max_tokens: 1024,
-          temperature: 0.3,
-        }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (!res.ok) {
-        ok = false;
-        const txt = await res.text().catch(() => "");
-        console.error(`[qwen] ${res.status}: ${txt.slice(0, 200)}`);
-        throw new Error(`qwen error ${res.status}`);
-      }
-      const data = (await res.json()) as {
-        choices: { message: { content: string } }[];
-      };
-      return data.choices[0].message.content;
+      // ⚡ 使用 Promise.race 確保不會超過硬性超時
+      const result = await Promise.race([
+        this.fetchWithRetry(model, system, userMsg, timeoutMs, maxRetries, gov),
+        requestTimeout(timeoutMs + 5000), // 給予 fetchWithRetry 額外緩衝時間
+      ]);
+      const elapsed = performance.now() - t0;
+      console.log(`[qwen] ${model} ${Math.round(elapsed)}ms (${gov.info})`);
+      return result as string;
+    } catch (e) {
+      ok = false;
+      console.error(`[qwen] Failed: ${(e as Error).message}`);
+      throw e;
     } finally {
       semRelease();
       endCall();
       recordApiCall(performance.now() - t0, ok);
     }
+  }
+
+  private async fetchWithRetry(
+    model: string,
+    system: string,
+    userMsg: string,
+    timeoutMs: number,
+    maxRetries: number,
+    gov: ReturnType<typeof suggest>,
+  ): Promise<string> {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const res = await fetch(CHAT_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${getApiKey()}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: system },
+              { role: "user", content: userMsg },
+            ],
+            max_tokens: gov.modelTier === "small" ? 256 : 1024,
+            temperature: 0.3,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "");
+          if (res.status >= 500 && attempt < maxRetries) {
+            const wait = Math.min(1000 * 2 ** attempt, 5000);
+            console.warn(
+              `[qwen] ${res.status} 重試 ${attempt + 1}/${maxRetries}，等待 ${wait}ms`,
+            );
+            await new Promise((r) => setTimeout(r, wait));
+            continue;
+          }
+          console.error(`[qwen] ${res.status}: ${txt.slice(0, 200)}`);
+          throw new Error(`qwen error ${res.status}`);
+        }
+        const data = (await res.json()) as {
+          choices: { message: { content: string } }[];
+        };
+        return data.choices[0].message.content;
+      } catch (e) {
+        if (attempt < maxRetries) {
+          const wait = Math.min(1000 * 2 ** attempt, 5000);
+          console.warn(
+            `[qwen] ${(e as Error).message} 重試 ${attempt + 1}/${maxRetries}，等待 ${wait}ms`,
+          );
+          await new Promise((r) => setTimeout(r, wait));
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw new Error("qwenAsk: all retries exhausted");
   }
 
   // ── Model-powered search ──
@@ -325,12 +516,61 @@ export class MemStore {
   // ── Helpers ──
 
   private async appendIndex(entry: MemEntry): Promise<void> {
+    // 序列化寫入：避免兩次併發 store() 同時讀取舊索引後互相覆蓋
+    return new Promise<void>((resolve, reject) => {
+      this.appendLock = this.appendLock.then(async () => {
+        try {
+          await this._appendIndex(entry);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+  }
+
+  private async _appendIndex(entry: MemEntry): Promise<void> {
+    // 跨裝置同步衝突解決：讀取最新內容後合併，避免覆蓋
     const existing = await this.list();
     if (existing.some((e) => e.id === entry.id)) return;
-    existing.push(entry);
+
     const tmp = this.indexPath + ".tmp." + process.pid;
-    await writeFile(tmp, JSON.stringify(existing, null, 2), "utf-8");
-    renameSync(tmp, this.indexPath);
+    try {
+      // 寫入新資料到暫存檔
+      const newData = [...existing, entry];
+      await writeFile(tmp, JSON.stringify(newData, null, 2), "utf-8");
+
+      // 原子性替換
+      await rename(tmp, this.indexPath);
+    } catch (err) {
+      // 若 rename 失敗（極少見），嘗試重新讀取並合併
+      console.warn(
+        `[store] appendIndex rename failed, retrying merge: ${(err as Error).message}`,
+      );
+      try {
+        const latestRaw = await readFile(this.indexPath, "utf-8").catch(
+          () => "[]",
+        );
+        const latest = JSON.parse(latestRaw) as MemEntry[];
+        if (!latest.some((e) => e.id === entry.id)) {
+          latest.push(entry);
+          await writeFile(
+            this.indexPath,
+            JSON.stringify(latest, null, 2),
+            "utf-8",
+          );
+        }
+      } catch (retryErr) {
+        console.error(
+          `[store] appendIndex retry failed: ${(retryErr as Error).message}`,
+        );
+      } finally {
+        // 清理暫存檔
+        try {
+          await unlink(tmp);
+        } catch {}
+      }
+    }
   }
 
   get entriesDirPath(): string {

@@ -1,0 +1,7 @@
+{
+  "ts": 1780602116492,
+  "maxConcurrency": 2,
+  "circuitBreaker": true,
+  "throttleRequested": false,
+  "healthCheckTimeoutMs": 2000
+}

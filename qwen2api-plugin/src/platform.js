@@ -14,41 +14,19 @@
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { CFG } from "./config/index.js";
 
 export const PLATFORM = process.platform;
 export const IS_WIN = PLATFORM === "win32";
 export const IS_MAC = PLATFORM === "darwin";
 export const IS_LINUX = PLATFORM === "linux";
 
-// ─── 預設路徑（可透過環境變數覆蓋） ───
-
-const PATH_TABLE = {
-  qwen2api: {
-    linux:
-      "/home/reamaster/opencode-manager/projects/independent/qwen2api-dev/qwen2api",
-    darwin:
-      "/Users/reamaster/opencode-manager/projects/independent/qwen2api-dev/qwen2api",
-    win32:
-      "D:\\Tools\\opencode\\opencode-manager\\projects\\independent\\qwen2api-dev\\qwen2api",
-  },
-  projectDir: {
-    linux: "/home/reamaster/opencode-manager/projects/system/packages/opencode",
-    darwin:
-      "/Users/reamaster/opencode-manager/projects/system/packages/opencode",
-    win32:
-      "D:\\Tools\\opencode\\opencode-manager\\projects\\system\\packages\\opencode",
-  },
-};
-
-const ENV_MAP = {
-  qwen2api: "QWEN2API_DIR",
-  projectDir: "PROJECT_DIR",
-};
+// ─── 跨平台路徑（定義集中於 config/index.js） ───
 
 export const getPath = (name) => {
-  const envKey = ENV_MAP[name];
+  const envKey = CFG.PATH_ENV_MAP[name];
   if (envKey && process.env[envKey]) return process.env[envKey];
-  const tbl = PATH_TABLE[name];
+  const tbl = CFG.PATHS[name];
   return tbl?.[PLATFORM] || tbl?.linux || "";
 };
 

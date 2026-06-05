@@ -182,6 +182,35 @@ function setCache(key, data, ttl = CACHE_TTL.default) {
   cache.set(key, { data, ts: Date.now(), ttl });
 }
 
+// ─── Model Probe（模型穩定性探針） ───
+
+async function probeModelStability() {
+  const start = Date.now();
+  try {
+    // 發送輕量級推理請求：1+1=?
+    const res = await post("/v1/chat/completions", {
+      model: "qwen-plus", // 預設使用基礎模型
+      messages: [{ role: "user", content: "1+1=" }],
+      max_tokens: 10,
+      temperature: 0,
+    });
+
+    const latency = Date.now() - start;
+    const ok = res && res.choices && res.choices.length > 0;
+    const errorType = ok ? null : "no_response";
+
+    recordModelProbe(ok, latency, errorType);
+    return { ok, latency, errorType };
+  } catch (e) {
+    const latency = Date.now() - start;
+    const errorType = e.message.includes("timeout")
+      ? "timeout"
+      : "network_error";
+    recordModelProbe(false, latency, errorType);
+    return { ok: false, latency, errorType };
+  }
+}
+
 // ─── HTTP helpers（帶重試 + 斷路器 + 降級） ───
 
 const retryConfig = {
@@ -405,6 +434,126 @@ const autoStartProxy = async () => {
   return "failed";
 };
 
+// ─── 臨界點監控配置 ───
+const THRESHOLDS = {
+  latency_warn: 1000, // 延遲警告閾值 (ms)
+  latency_crit: 3000, // 延遲臨界閾值 (ms)
+  fail_rate_warn: 0.2, // 失敗率警告 (20%)
+  fail_rate_crit: 0.5, // 失敗率臨界 (50%)
+  model_latency_warn: 2000, // 模型推理延遲警告 (ms)
+  model_latency_crit: 5000, // 模型推理延遲臨界 (ms)
+  check_interval: 30000, // 檢查間隔 (30s)
+};
+
+// 健康歷史記錄（用於計算失敗率）
+const healthHistory = [];
+const MAX_HISTORY = 20; // 保留最近 20 次檢查
+
+// 模型穩定性歷史記錄
+const modelStabilityHistory = [];
+const MAX_MODEL_HISTORY = 10; // 保留最近 10 次模型探針結果
+
+function recordHealthCheck(ok, latency) {
+  healthHistory.push({ ok, latency, ts: Date.now() });
+  if (healthHistory.length > MAX_HISTORY) healthHistory.shift();
+}
+
+function recordModelProbe(ok, latency, errorType = null) {
+  modelStabilityHistory.push({ ok, latency, errorType, ts: Date.now() });
+  if (modelStabilityHistory.length > MAX_MODEL_HISTORY)
+    modelStabilityHistory.shift();
+}
+
+function getFailureRate() {
+  if (healthHistory.length === 0) return 0;
+  const fails = healthHistory.filter((h) => !h.ok).length;
+  return fails / healthHistory.length;
+}
+
+function getAvgLatency() {
+  if (healthHistory.length === 0) return 0;
+  const sum = healthHistory.reduce((acc, h) => acc + h.latency, 0);
+  return sum / healthHistory.length;
+}
+
+function getModelStability() {
+  if (modelStabilityHistory.length === 0)
+    return { score: 100, avgLatency: 0, successRate: 1 };
+  const total = modelStabilityHistory.length;
+  const success = modelStabilityHistory.filter((h) => h.ok).length;
+  const avgLatency =
+    modelStabilityHistory.reduce((acc, h) => acc + h.latency, 0) / total;
+  const successRate = success / total;
+  // 簡單評分：成功率 70% + 延遲 30%
+  const latencyScore = Math.max(
+    0,
+    1 - avgLatency / THRESHOLDS.model_latency_crit,
+  );
+  const score = Math.round((successRate * 0.7 + latencyScore * 0.3) * 100);
+  return { score, avgLatency: Math.round(avgLatency), successRate };
+}
+
+function getFailureRate() {
+  if (healthHistory.length === 0) return 0;
+  const fails = healthHistory.filter((h) => !h.ok).length;
+  return fails / healthHistory.length;
+}
+
+function getAvgLatency() {
+  if (healthHistory.length === 0) return 0;
+  const sum = healthHistory.reduce((acc, h) => acc + h.latency, 0);
+  return sum / healthHistory.length;
+}
+
+function checkThresholds() {
+  const failRate = getFailureRate();
+  const avgLatency = getAvgLatency();
+  const alerts = [];
+
+  if (avgLatency >= THRESHOLDS.latency_crit) {
+    alerts.push(
+      `🔴 延遲臨界: ${Math.round(avgLatency)}ms >= ${THRESHOLDS.latency_crit}ms`,
+    );
+  } else if (avgLatency >= THRESHOLDS.latency_warn) {
+    alerts.push(
+      `🟡 延遲警告: ${Math.round(avgLatency)}ms >= ${THRESHOLDS.latency_warn}ms`,
+    );
+  }
+
+  if (failRate >= THRESHOLDS.fail_rate_crit) {
+    alerts.push(
+      `🔴 失敗率臨界: ${(failRate * 100).toFixed(1)}% >= ${THRESHOLDS.fail_rate_crit * 100}%`,
+    );
+  } else if (failRate >= THRESHOLDS.fail_rate_warn) {
+    alerts.push(
+      `🟡 失敗率警告: ${(failRate * 100).toFixed(1)}% >= ${THRESHOLDS.fail_rate_warn * 100}%`,
+    );
+  }
+
+  // 檢查模型穩定性
+  const modelStab = getModelStability();
+  if (modelStab.avgLatency >= THRESHOLDS.model_latency_crit) {
+    alerts.push(
+      `🔴 模型延遲臨界: ${modelStab.avgLatency}ms >= ${THRESHOLDS.model_latency_crit}ms`,
+    );
+  } else if (modelStab.avgLatency >= THRESHOLDS.model_latency_warn) {
+    alerts.push(
+      `🟡 模型延遲警告: ${modelStab.avgLatency}ms >= ${THRESHOLDS.model_latency_warn}ms`,
+    );
+  }
+  if (modelStab.successRate < 0.8 && modelStab.score < 80) {
+    alerts.push(
+      `🔴 模型穩定性低: 分數 ${modelStab.score}/100 (成功率 ${(modelStab.successRate * 100).toFixed(0)}%)`,
+    );
+  }
+
+  if (alerts.length > 0) {
+    const msg = `\n⚠️ **健康臨界點警報**\n${alerts.join("\n")}\n💡 建議執行 \`qwen_diagnose\` 進行完整診斷`;
+    console.log(msg);
+    log.warn(msg.replace(/\n/g, " | "));
+  }
+}
+
 // ─── 事件驅動狀態機（非常駐，有事才動） ───
 // 狀態: idle → checking → repairing → degraded → idle (冷卻後自動回歸)
 // idle: 零資源，不做任何事
@@ -425,7 +574,13 @@ const SVC_FAIL_LIMIT = 3; // 連續失敗上限
 const svcEnter = async () => {
   if (svcState !== SVC.CHECKING) return; // 避免重入
   log.info("🔍 觸發健康檢查（事件驅動）");
+
+  // 檢查 qwen2api
+  const qStart = Date.now();
   const qUp = await isUp();
+  const qLatency = Date.now() - qStart;
+  recordHealthCheck(qUp, qLatency);
+
   if (!qUp) {
     svcState = SVC.REPAIRING;
     log.warn("⚠️ qwen2api 無回應，嘗試重啟...");
@@ -445,7 +600,24 @@ const svcEnter = async () => {
       return;
     }
   }
+  // 檢查 chat-proxy
+  const pStart = Date.now();
   const pUp = await isProxyUp();
+  const pLatency = Date.now() - pStart;
+  recordHealthCheck(pUp, pLatency);
+
+  // 執行模型穩定性探針（僅在服務正常時）
+  if (qUp && pUp) {
+    try {
+      await probeModelStability();
+    } catch (e) {
+      log.debug(`模型探針異常: ${e.message}`);
+    }
+  }
+
+  // 檢查臨界點並廣播
+  checkThresholds();
+
   if (!pUp) {
     svcState = SVC.REPAIRING;
     log.warn("⚠️ Chat Proxy 無回應，嘗試重啟...");

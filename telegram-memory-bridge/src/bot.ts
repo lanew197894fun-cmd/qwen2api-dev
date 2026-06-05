@@ -6,7 +6,18 @@ import { IdleProcessor, type ProcessorPaths } from "./processor";
 import { suggest } from "./governor";
 import { webSearch, webFetch, summarizeWithQwen } from "./websearch";
 import { OrgEngine, type OrgPaths } from "./organizer";
-import { ConversationStore, makeSessionId } from "./conversation-store";
+import {
+  ConversationStore,
+  makeSessionId,
+  type ConvSessionSummary,
+} from "./conversation-store";
+import {
+  runTool,
+  parseToolCommand,
+  getRecentConversationContext,
+} from "./tools";
+import { initKnowledgeTools } from "./knowledge-tools";
+import { searchDir } from "./api";
 
 const TG_API = "https://api.telegram.org";
 
@@ -16,6 +27,9 @@ export interface BotConfig {
   processorPaths?: ProcessorPaths;
   orgPaths?: OrgPaths;
   peers?: string[]; // Tailscale IPs of peer memory API servers
+  knowledgePath?: string; // 知識庫目錄（自動帶入上下文）
+  wikiPath?: string; // 維基目錄
+  lessonPath?: string; // 經驗教訓目錄
 }
 
 interface TgUpdate {
@@ -54,11 +68,17 @@ export class TelegramBot {
   private lastGovInfo = "";
   private pollErrCount = 0;
   private maxPollErrBackoff = 120_000;
+  private knowledgePath = "";
+  private wikiPath = "";
+  private lessonPath = "";
 
   constructor(cfg: BotConfig) {
     this.token = cfg.token;
     this.store = cfg.store;
     this.peers = cfg.peers ?? [];
+    this.knowledgePath = cfg.knowledgePath || "";
+    this.wikiPath = cfg.wikiPath || "";
+    this.lessonPath = cfg.lessonPath || "";
     this.conv = new ConversationStore(undefined, (prompt) =>
       this.store.qwenAsk("", prompt),
     );
@@ -162,7 +182,10 @@ export class TelegramBot {
       if (hasUpdates) {
         for (const u of updates.result as TgUpdate[]) {
           this.offset = u.update_id + 1;
-          await this.handleUpdate(u);
+          // ⚡ 非同步處理，避免阻塞輪詢迴圈
+          this.handleUpdate(u).catch((err) => {
+            console.error("[bot] handleUpdate error:", (err as Error).message);
+          });
         }
         // 有訊息 → 恢復活躍
         this.emptyCount = 0;
@@ -242,11 +265,20 @@ export class TelegramBot {
     const text = msg.text.trim();
     const isCmd = msg.entities?.some((e) => e.type === "bot_command");
 
+    // P24: Fire-and-Forget 模式 — 將重任務移至下一個 Event Loop tick，避免阻塞輪詢
     if (isCmd) {
-      await this.handleCommand(text, msg);
+      Promise.resolve()
+        .then(() => this.handleCommand(text, msg))
+        .catch((err) => {
+          console.error("[bot] handleCommand error:", (err as Error).message);
+        });
     } else {
       // non-command: treat as memory store attempt
-      await this.handleMessage(text, msg);
+      Promise.resolve()
+        .then(() => this.handleMessage(text, msg))
+        .catch((err) => {
+          console.error("[bot] handleMessage error:", (err as Error).message);
+        });
     }
   }
 
@@ -293,6 +325,17 @@ export class TelegramBot {
 
       case "/model":
         await this.doCmdModel(argStr, msg);
+        break;
+
+      case "/run":
+        if (!argStr) {
+          await this.reply(
+            msg,
+            "用法: /run <工具> <參數>\n\n可用工具:\n`bash <指令>` — 執行 shell\n`read <路徑>` — 讀取檔案\n`write <路徑> | <內容>` — 寫入檔案\n`edit <路徑> | <舊字串> | <新字串>` — 編輯檔案\n`glob <模式> [目錄]` — 搜尋檔案\n`grep <模式> [目錄]` — 搜尋內容\n`history` — 查看當前對話歷史\n`skill <名稱> [參數]` — 調用技能（weather, summarize）\n\n範例: `/run bash ls -la`\n範例: `/run skill weather loc=Taipei`\n範例: `/run skill summarize url=https://example.com`",
+          );
+          return;
+        }
+        await this.doCmdRun(argStr, msg);
         break;
 
       case "/websearch":
@@ -357,16 +400,19 @@ export class TelegramBot {
             "`/history summary <id>` — 顯示對話詳細摘要",
             "`/history from=2026-06-01` — 依日期過濾",
             "`/model` — 查看當前模型，`/model <名稱>` 切換",
-            "`/websearch <查詢>` — 搜尋網路（DuckDuckGo，免 API Key）",
+            "`/run <工具>` — 執行 opencode 工具（bash/read/write/edit/glob/grep/history/skill）",
+            "`/websearch <查詢>` — 搜尋網路（Brave Search，免 API Key）",
             "`/webfetch <網址>` — 擷取網頁內容並摘要",
             "`/organize` — 自動整理舊資料（記憶+知識庫）→ SOP",
             "`/progress` — 查看整理進度",
             "`/sync` — 觸發同步",
             "`/help` — 顯示此說明",
             "",
-            "💡 直接傳送文字也會自動儲存為記憶",
-            "💡 `/websearch` 支援 Qwen AI 摘要搜尋結果",
-            "💡 `/webfetch` 自動摘要網頁，無需手動閱讀",
+            "💡 直接傳送文字也會自動儲存為記憶（閒聊除外）",
+            "💡 `/websearch` 支援 AI 摘要搜尋結果",
+            "💡 `/run history` 查看當前對話歷史上下文",
+            "💡 `/run skill weather loc=台北` 查詢天氣",
+            "💡 `/run skill summarize url=...` 摘要網頁",
           ].join("\n"),
         );
         break;
@@ -392,28 +438,30 @@ export class TelegramBot {
   }
 
   private async doCmdAsk(question: string, msg: TgMessage): Promise<void> {
-    await this.reply(msg, "🤔 正在搜尋記憶並分析...");
+    await this.reply(msg, "🤔 正在搜尋記憶、知識庫、維基與教訓...");
     try {
       const [localResult, peerResults] = await Promise.all([
         this.store.searchByModel(question, 5),
         this.queryPeerRecall(question, 5),
       ]);
 
+      // 平行搜尋知識庫、維基、經驗教訓（關鍵詞全文比對）
+      const [kHits, wHits, lHits] = await Promise.all([
+        searchDir(this.knowledgePath, question, 3),
+        searchDir(this.wikiPath, question, 3),
+        searchDir(this.lessonPath, question, 3),
+      ]);
+
       const hasLocal = localResult.entries.length > 0;
       const hasPeer = peerResults.length > 0;
-
-      if (!hasLocal && !hasPeer) {
-        await this.reply(
-          msg,
-          "🔍 找不到相關記憶來回答這個問題。\n試試用 /remember 先儲存一些資訊。",
-        );
-        return;
-      }
+      const hasKnow = kHits.length > 0;
+      const hasWiki = wHits.length > 0;
+      const hasLess = lHits.length > 0;
 
       const parts: string[] = [];
       if (hasLocal) {
         parts.push(
-          "【本機記憶】\n" +
+          "📝 *本機記憶*\n" +
             localResult.entries
               .map(
                 (e, i) =>
@@ -436,22 +484,27 @@ export class TelegramBot {
               .join("\n\n"),
         );
       }
+      if (hasKnow) parts.push("📚 *相關知識庫*\n" + kHits.join("\n"));
+      if (hasWiki) parts.push("📖 *相關維基*\n" + wHits.join("\n"));
+      if (hasLess) parts.push("⚠️ *相關教訓*\n" + lHits.join("\n"));
 
       const total =
         localResult.total +
         peerResults.reduce((s, p) => s + p.entries.length, 0);
-      const memoryText = parts.join("\n\n---\n\n");
+      const allText = parts.join("\n\n---\n\n");
 
       const system =
-        "你是一個記憶助手，負責根據使用者儲存的記憶來回答問題。" +
-        "記憶可能來自多台裝置（本機/筆電等）。" +
-        "請根據提供的記憶內容回答。如果記憶不足，誠實告知不確定。" +
-        "保持簡潔，用繁體中文，必要時可條列說明。";
+        "你是一個全知的開發助手。以下是與問題相關的記憶、知識庫、維基和經驗教訓。\n" +
+        "請根據這些資訊回答，並在適當時引用來源。保持簡潔，用繁體中文，必要時可條列說明。\n\n" +
+        "小提醒：\n" +
+        "• 遇到問題解決後，可用 /run lesson_save 記錄經驗教訓\n" +
+        "• 學到新技術或架構，可用 /run knowledge_save 存入知識庫\n" +
+        "• 重要的長期文件，可用 /run wiki_save 建立維基條目";
 
       const userPrompt = [
-        `以下是我儲存的相關記憶（共 ${total} 筆）：`,
+        `以下是與問題相關的所有資料（共 ${total} 筆記憶 + 知識庫 ${kHits.length} 筆 + 維基 ${wHits.length} 筆 + 教訓 ${lHits.length} 筆）：`,
         "",
-        memoryText,
+        allText,
         "",
         "---",
         `問題：${question}`,
@@ -580,9 +633,23 @@ export class TelegramBot {
           await this.reply(msg, `📭 找不到對話: \`${sid}\``);
           return;
         }
-        // 嘗試讀取 AI 摘要
-        let detail = await conv.getSessionSummary(sid);
-        // 若無摘要且未達最小訊息數，提示使用者
+        // 嘗試讀取 AI 摘要（優先使用結構化 detail）
+        const idx = await conv.loadIdx();
+        let detail = idx[sid]?.detail;
+
+        // 若無結構化摘要，嘗試讀取舊版純文字摘要並轉換
+        if (!detail && idx[sid]?.summary) {
+          detail = {
+            purpose: idx[sid].summary,
+            keyPoints: [],
+            decisions: [],
+            files: [],
+            commands: [],
+            tags: [],
+          };
+        }
+
+        // 若完全無摘要且未達最小訊息數，提示使用者
         if (!detail && session.length < 10) {
           await this.reply(
             msg,
@@ -593,35 +660,35 @@ export class TelegramBot {
         // 若無摘要，即時生成
         if (!detail) {
           await this.reply(msg, `⏳ 正在生成摘要: \`${sid}\`...`);
-          detail = await conv.summarizeSession(sid);
-          if (!detail) {
+          const generated = await conv.summarizeSession(sid);
+          if (!generated) {
             await this.reply(msg, `❌ 摘要生成失敗`);
             return;
           }
+          detail = generated;
         }
-        const lines = [
-          `📄 *${sid}*`,
-          ``,
-          `🎯 目的: ${detail.purpose || "未歸納"}`,
-        ];
-        if (detail.keyPoints?.length > 0) {
+
+        // 確保 detail 不為 null (TypeScript narrowing)
+        const d = detail as ConvSessionSummary;
+        const lines = [`📄 *${sid}*`, ``, `🎯 目的: ${d.purpose || "未歸納"}`];
+        if (d.keyPoints && d.keyPoints.length > 0) {
           lines.push(``, `🔑 *關鍵重點*`);
-          for (const kp of detail.keyPoints.slice(0, 5)) lines.push(`• ${kp}`);
+          for (const kp of d.keyPoints.slice(0, 5)) lines.push(`• ${kp}`);
         }
-        if (detail.decisions?.length > 0) {
+        if (d.decisions && d.decisions.length > 0) {
           lines.push(``, `💡 *決定*`);
-          for (const d of detail.decisions.slice(0, 5)) lines.push(`• ${d}`);
+          for (const dec of d.decisions.slice(0, 5)) lines.push(`• ${dec}`);
         }
-        if (detail.files?.length > 0) {
+        if (d.files && d.files.length > 0) {
           lines.push(``, `📁 *涉及檔案*`);
-          for (const f of detail.files.slice(0, 8)) lines.push(`• \`${f}\``);
+          for (const f of d.files.slice(0, 8)) lines.push(`• \`${f}\``);
         }
-        if (detail.commands?.length > 0) {
+        if (d.commands && d.commands.length > 0) {
           lines.push(``, `⚡ *執行命令*`);
-          for (const c of detail.commands.slice(0, 5)) lines.push(`• \`${c}\``);
+          for (const c of d.commands.slice(0, 5)) lines.push(`• \`${c}\``);
         }
-        if (detail.tags?.length > 0) {
-          lines.push(``, `🏷️ ${detail.tags.join("、")}`);
+        if (d.tags && d.tags.length > 0) {
+          lines.push(``, `🏷️ ${d.tags.join("、")}`);
         }
         await this.reply(msg, lines.join("\n"));
         return;
@@ -688,6 +755,59 @@ export class TelegramBot {
       }
     } catch (err) {
       await this.reply(msg, `❌ 查詢失敗: ${(err as Error).message}`);
+    }
+  }
+
+  // ── /run opencode tool ──
+
+  private async doCmdRun(text: string, msg: TgMessage): Promise<void> {
+    const call = parseToolCommand(`/run ${text}`);
+    if (!call) {
+      await this.reply(
+        msg,
+        "❌ 無法解析指令。用法:\n`/run bash <指令>`\n`/run read <路徑>`\n`/run write <路徑> | <內容>`\n`/run edit <路徑> | <舊字串> | <新字串>`\n`/run glob <模式> [目錄]`\n`/run grep <模式> [目錄]`\n`/run history`\n`/run knowledge_save title=標題 content=內容 [category=分類] [tags=a,b,c]`\n`/run knowledge_read title=標題`\n`/run knowledge_index [category=分類] [limit=20]`\n`/run knowledge_deduplicate [threshold=0.9] [dryRun=true]`\n`/run lesson_save title=標題 scenario=情境 mistake=錯誤 [solution=解法]`\n`/run lesson_list [severity=P0-P4]`\n`/run wiki_save title=標題 content=內容 [category=分類]`\n`/run wiki_list [category=分類] [limit=20]`\n`/run wiki_read title=標題`",
+      );
+      return;
+    }
+
+    // 安全限制：僅允許特定目錄操作
+    if (call.name === "bash" || call.name === "write" || call.name === "edit") {
+      const restrictedDirs = ["/etc", "/sys", "/proc", "/boot", "/dev"];
+      const argStr = JSON.stringify(call.args);
+      for (const dir of restrictedDirs) {
+        if (argStr.includes(dir)) {
+          await this.reply(msg, `❌ 安全限制：不允許操作 ${dir} 目錄`);
+          return;
+        }
+      }
+    }
+
+    await this.reply(msg, `⏳ 執行 \`${call.name}\`...`);
+
+    try {
+      const sid = makeSessionId("telegram", msg.chat.id);
+      const result = await runTool(call, this.conv, sid);
+
+      if (!result.ok && result.error) {
+        await this.reply(
+          msg,
+          `❌ \`${call.name}\` 失敗\n\n${(result.output || result.error).slice(0, 1500)}`,
+        );
+        return;
+      }
+
+      const output = result.output.slice(0, 3500);
+      if (!output) {
+        await this.reply(msg, `✅ \`${call.name}\` 完成（無輸出）`);
+        return;
+      }
+
+      await this.reply(
+        msg,
+        `✅ \`${call.name}\` 結果\n\n\`\`\`\n${output}\n\`\`\``,
+      );
+    } catch (e) {
+      await this.reply(msg, `❌ 工具執行異常: ${(e as Error).message}`);
     }
   }
 
@@ -888,12 +1008,19 @@ export class TelegramBot {
     }
   }
 
-  // ── 呼叫 AI 回應 ──
+  // ── 呼叫 AI 回應（含對話歷史上下文） ──
 
   private async askAI(text: string): Promise<string | null> {
     try {
       // 先找相關記憶
-      const related = await this.store.searchByModel(text, 5);
+      const [related, convCtx] = await Promise.all([
+        this.store.searchByModel(text, 5),
+        getRecentConversationContext(
+          this.conv,
+          makeSessionId("telegram", this.chatId),
+          20,
+        ),
+      ]);
       const memoryText = related.entries
         .map((e, i) => `[${i + 1}] ${e.summary} (${e.category})`)
         .join("\n");
@@ -901,7 +1028,10 @@ export class TelegramBot {
       const system =
         "你是一個智能助手，名為 OpenCode。根據使用者訊息與相關記憶回答。" +
         "若需要可參考記憶內容，但不要說你是根據記憶回答。保持簡潔、繁體中文。" +
-        "如果使用者問的是即時資訊（時間、天氣等），誠實告知不確定。";
+        "如果使用者問的是即時資訊（時間、天氣等），誠實告知不確定。" +
+        (convCtx
+          ? "\n\n以下為當前對話的近期歷史（供上下文參考）：\n" + convCtx
+          : "");
 
       const prompt = memoryText
         ? `相關記憶：\n${memoryText}\n\n---\n\n${text}`
@@ -1038,9 +1168,74 @@ export class TelegramBot {
     }
   }
 
+  // ── 快速閒聊過濾（在 AI 分類前先擋掉明顯閒聊）──
+
+  private isTrivialChat(text: string): boolean {
+    const t = text.trim();
+    // 極短訊息
+    if (t.length < 5) return true;
+    // 常見閒聊關鍵字
+    const trivia = [
+      "hi",
+      "hello",
+      "hey",
+      "嗨",
+      "哈囉",
+      "你好",
+      "好",
+      "ok",
+      "okay",
+      "是的",
+      "沒錯",
+      "對",
+      "謝謝",
+      "感恩",
+      "感謝",
+      "thx",
+      "thanks",
+      "了解",
+      "知道了",
+      "明白",
+      "收到",
+      "get",
+      "早安",
+      "午安",
+      "晚安",
+      "bye",
+      "再見",
+      "😊",
+      "👍",
+      "👌",
+      "✅",
+      "🙏",
+      "❤️",
+      "😂",
+    ];
+    if (trivia.includes(t.toLowerCase())) return true;
+    // 純表情符號
+    if (/^[\p{Emoji}\s]+$/u.test(t)) return true;
+    // 單字回覆
+    if (t.split(/\s+/).length === 1 && t.length < 10) return true;
+    return false;
+  }
+
   // ── Non-command message ──
 
   private async handleMessage(text: string, msg: TgMessage): Promise<void> {
+    // 快速過濾明顯閒聊（不進 AI 分類，不儲存，不回覆）
+    if (this.isTrivialChat(text)) {
+      // 僅記錄到對話歷史（供上下文），不儲存為記憶
+      const sid = makeSessionId("telegram", msg.chat.id);
+      this.conv
+        .recordMsg(sid, "user", text, "telegram", undefined, false)
+        .catch(() => {});
+      // 閒聊也記錄 bot 的簡短回應到對話歷史
+      const replies = ["👌", "✅", "😊", "收到"];
+      const reply = replies[Math.floor(Math.random() * replies.length)];
+      this.conv.recordMsg(sid, "assistant", reply, "telegram").catch(() => {});
+      return;
+    }
+
     // 先 AI 分類：詐騙偵測 + 意圖判斷
     const cls = await this.classifyMessage(text);
 
@@ -1152,33 +1347,12 @@ export class TelegramBot {
         await this.reply(msg, `❌ 儲存失敗: ${(err as Error).message}`);
         return;
       }
-    } else if (cls === null) {
-      // 分類失敗（AI 異常）→ 安全預設：照樣儲存，避免遺失資料
-      try {
-        const result = await this.store.store(text);
-        id = result.id;
-        this.notifyWork(); // 有工作 → 觸發背景處理
-      } catch (err) {
-        await this.reply(msg, `❌ 儲存失敗: ${(err as Error).message}`);
-        return;
-      }
     }
+    // cls === null 且非詐騙 → 視為閒聊，不儲存（改變原行為）
     // cls?.store === false → 不儲存（閒聊）
 
     // 使用者是來問問題/查資料 → 查記憶 + AI 回答
-    if (cls?.needsAnswer || cls === null) {
-      // 分類失敗時用關鍵字 heuristic 判斷是否要搜尋網路
-      if (cls === null) {
-        const kw = ["搜", "查", "最新", "新聞", "今天", "目前", "2025", "2026"];
-        const hasKw = kw.some((k) => text.includes(k));
-        if (
-          hasKw &&
-          (text.includes("嗎") || text.includes("？") || text.includes("?"))
-        ) {
-          await this.doCmdWebSearch(text, msg);
-          return;
-        }
-      }
+    if (cls?.needsAnswer) {
       await this.reply(msg, "⏳ 處理中...");
       const answer = await this.askAI(text);
       if (answer) {
@@ -1192,10 +1366,51 @@ export class TelegramBot {
     // 無詢問 → 根據是否儲存給不同回覆
     if (cls?.store) {
       await this.reply(msg, `✅ 已記錄 💾 (\`${id}\`)\n可用 /recall 搜尋`);
-    } else if (cls === null) {
-      await this.reply(msg, `✅ 已記錄 💾 (\`${id}\`)`);
+    } else if (!cls?.needsAnswer && !cls?.store) {
+      // 非閒聊、非詐騙、非詢問、非儲存 → 視為一般對話，給予簡短回應並記錄重點
+      const sid = makeSessionId("telegram", msg.chat.id);
+      this.conv.recordMsg(sid, "user", text, "telegram").catch(() => {});
+
+      // AI 生成簡短回應與重點摘要
+      try {
+        const sys =
+          "你是一個簡潔的助手。對使用者的訊息給予簡短回應（1-2句），並提取一個重點標籤（如：確認、進度、想法）。回傳 JSON: {reply: string, tag: string}";
+        const raw = await this.store.qwenAsk(sys, text);
+        let parsed: { reply?: string; tag?: string } = {};
+        try {
+          const start = raw.indexOf("{");
+          const end = raw.lastIndexOf("}");
+          if (start !== -1 && end !== -1) {
+            parsed = JSON.parse(raw.slice(start, end + 1));
+          }
+        } catch {}
+
+        const replyText = parsed.reply || "收到";
+        const tag = parsed.tag || "general";
+
+        await this.reply(msg, replyText);
+        this.conv
+          .recordMsg(sid, "assistant", replyText, "telegram")
+          .catch(() => {});
+
+        // 將重點摘要儲存為低優先級記憶（可選）
+        if (tag && tag !== "general") {
+          this.store
+            .store(`[${tag}] ${text.slice(0, 100)}`, {
+              category: "chat-summary",
+              importance: 0.3,
+              tags: ["dialogue", tag],
+            })
+            .catch(() => {});
+        }
+      } catch {
+        // AI 失敗時給予預設回應
+        await this.reply(msg, "收到");
+        this.conv
+          .recordMsg(sid, "assistant", "收到", "telegram")
+          .catch(() => {});
+      }
     }
-    // cls?.store === false && !needsAnswer → 閒聊不儲存不回覆
   }
 
   // ── Telegram API ──

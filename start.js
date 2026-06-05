@@ -233,6 +233,69 @@ async function isAlive(url, ms = 2000) {
   }
 }
 
+// ─── 模型穩定性探針（輕量級推理測試） ───
+
+async function probeModelStability() {
+  const start = Date.now();
+  try {
+    const res = await fetch("http://127.0.0.1:3000/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.API_KEY || "CHANGE_ME"}`,
+      },
+      body: JSON.stringify({
+        model: "qwen-plus",
+        messages: [{ role: "user", content: "1+1=" }],
+        max_tokens: 10,
+        temperature: 0,
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const latency = Date.now() - start;
+    const data = await res.json();
+    const ok = data?.choices?.length > 0;
+    return { ok, latency, score: ok ? 100 : 0 };
+  } catch (e) {
+    const latency = Date.now() - start;
+    return { ok: false, latency, score: 0, error: e.message };
+  }
+}
+
+// ─── 健康報告生成器 ───
+
+async function generateHealthReport() {
+  const services = [
+    { name: "qwen2api", url: "http://127.0.0.1:3000/health" },
+    { name: "chat-proxy", url: "http://127.0.0.1:3456/health" },
+    { name: "telegram-bridge", url: "http://127.0.0.1:4377/api/health" },
+    { name: "waf-proxy", url: "http://127.0.0.1:3457/" },
+  ];
+
+  let total = 0;
+  let healthy = 0;
+  const details = [];
+
+  for (const svc of services) {
+    total++;
+    const start = Date.now();
+    const ok = await isAlive(svc.url, 3000);
+    const latency = Date.now() - start;
+    if (ok) healthy++;
+    details.push(`${svc.name}:${ok ? "✅" : "❌"}(${latency}ms)`);
+  }
+
+  const pct = Math.round((healthy / total) * 100);
+  const icon = pct >= 90 ? "🟢" : pct >= 70 ? "🟡" : "🔴";
+
+  // 執行模型穩定性探針
+  const modelProbe = await probeModelStability();
+  const modelIcon = modelProbe.ok ? "🧠" : "💀";
+  const modelDetail = `${modelIcon}模型:${modelProbe.ok ? "✅" : "❌"}(${modelProbe.latency}ms)`;
+
+  return `\n${icon} **健康報告**: ${pct}% | ${details.join(" ")} | ${modelDetail}`;
+}
+
 async function waitFor(url, label, timeout = 30) {
   for (let i = 0; i < timeout; i++) {
     if (await isAlive(url)) {
@@ -412,7 +475,7 @@ async function main() {
       waitTimeout: 15,
     },
     // telegram-bridge: 統一入口，自動偵測角色
-    // 有 TELEGRAM_BOT_TOKEN → master（bot + API + push receiver）
+    // 有 TELEGRAM_BOT_TOKEN → master（bot + API + push receiver + knowledge tools）
     // 無 token + Tailscale + peers → peer（fs.watch + push sender）
     {
       name: "telegram-bridge",
@@ -423,6 +486,7 @@ async function main() {
       waitUrl: "http://127.0.0.1:4377/api/health",
       waitTimeout: 20,
     },
+    // system-watchdog 已整合至 chat-proxy 健康報告中，不再需要獨立進程
   ];
 
   try {
@@ -459,6 +523,30 @@ async function main() {
 
     if (IS_WIN) log("embed-server: skipped (stub on Windows)");
 
+    // Auto-setup + build knowledge-wiki-plugin (telegram-bridge 依賴此插件)
+    log("Setting up knowledge-wiki-plugin...");
+    try {
+      execSync(`${BUN} src/auto-setup/index.js`, {
+        cwd: join(ROOT, "knowledge-wiki-plugin"),
+        timeout: 15000,
+        stdio: "pipe",
+      });
+      log("knowledge-wiki-plugin auto-setup done");
+    } catch (e) {
+      log(`WARNING: auto-setup failed: ${e.message}`);
+    }
+    log("Building knowledge-wiki-plugin...");
+    try {
+      execSync(`${BUN} run build`, {
+        cwd: join(ROOT, "knowledge-wiki-plugin"),
+        timeout: 30000,
+        stdio: "pipe",
+      });
+      log("knowledge-wiki-plugin built");
+    } catch (e) {
+      log(`WARNING: build failed: ${e.message}`);
+    }
+
     // Launch services sequentially with health checks (with retry for qwen2api)
     for (const s of SRV) {
       log(`Starting ${s.name}...`);
@@ -479,12 +567,19 @@ async function main() {
     }
 
     log("All services launched.");
+
+    // ─── 啟動後健康報告 ───
+    await sleep(2000); // 等待服務穩定
+    const healthReport = await generateHealthReport();
+    console.log("\n" + healthReport);
+
     log(`──────────────────────────────────────`);
     log(`  waf-proxy:    http://127.0.0.1:3457`);
     log(`  qwen2api:     http://127.0.0.1:3000`);
     log(`  chat-proxy:   http://127.0.0.1:3456`);
     if (!IS_WIN) log(`  embed-server: http://127.0.0.1:11436`);
     log(`  telegram:     port 4377`);
+    log(`  knowledge-wiki: ${join(ROOT, "knowledge-wiki-plugin")}`);
     log(`──────────────────────────────────────`);
     log(`Press Ctrl+C to stop services.`);
   } catch (err) {

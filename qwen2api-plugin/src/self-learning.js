@@ -534,7 +534,12 @@ export const learnProblemSolving = (tools = []) => {
  * @param {'accepted'|'edited'|'rejected'} feedback - 反饋
  * @returns {object} 更新後的指標
  */
-export const recordInteraction = (prompt, response, feedback = "accepted") => {
+export const recordInteraction = (
+  prompt,
+  response,
+  feedback = "accepted",
+  meta = {},
+) => {
   initDirs();
   const m = new Metrics();
 
@@ -543,6 +548,9 @@ export const recordInteraction = (prompt, response, feedback = "accepted") => {
     prompt: (prompt || "").slice(0, 200),
     responseLen: (response || "").length,
     feedback,
+    modelUsed: meta.modelUsed || "unknown",
+    routingScore: meta.routingScore || null,
+    taskType: meta.taskType || "general",
   };
 
   const logFile = path.join(DIRS.behavior, "interactions.jsonl");

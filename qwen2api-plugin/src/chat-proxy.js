@@ -21,15 +21,17 @@ import path from "node:path";
 import { detectHardware, getHardwareInfo } from "./hardware-detect.js";
 import { getPath, execShell, execGrep } from "./platform.js";
 import * as selfLearning from "./self-learning.js";
+import { createRouter } from "./provider/index.js";
+import {
+  CFG,
+  qwen2apiUrl,
+  classifyModel,
+  isCoderVariant,
+  LEVEL_ORDER,
+  LEVEL_LABELS,
+} from "./config/index.js";
 
-const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
-const LV = (() => {
-  const raw = process.env.PROXY_LOG_LEVEL;
-  if (raw && LOG_LEVELS[raw] !== undefined) return LOG_LEVELS[raw];
-  if (process.env.PROXY_QUIET === "true" || process.env.PROXY_QUIET === "1")
-    return 0;
-  return 3; // 預設 info — 顯示啟動資訊與一般狀態
-})();
+const LV = CFG.LOG_LEVEL;
 const log = {
   debug: (...a) => {
     if (LV >= 4) console.log("[proxy]", ...a);
@@ -58,83 +60,177 @@ process.on("uncaughtException", (e) => {
   setTimeout(() => process.exit(1), 1000);
 });
 
-const QWEN2API_PORT = parseInt(process.env.QWEN2API_PORT || "3000", 10);
-const QWEN2API_HOST = process.env.QWEN2API_HOST || "127.0.0.1";
-const _QWEN2API_HOST = QWEN2API_HOST.includes(":")
-  ? `[${QWEN2API_HOST}]`
-  : QWEN2API_HOST;
-const QWEN2API_URL = `http://${_QWEN2API_HOST}:${QWEN2API_PORT}`;
-const MEMORY_BRIDGE_URL =
-  process.env.MEMORY_BRIDGE_URL || "http://localhost:4377";
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || "3456");
-const API_KEY = process.env.API_KEY || "CHANGE_ME";
+const QWEN2API_URL = qwen2apiUrl();
+const MEMORY_BRIDGE_URL = CFG.MEMORY_BRIDGE_URL;
+const PROXY_PORT = CFG.PROXY_PORT;
+const API_KEY = CFG.API_KEY;
 const MAX_LOOPS = 5;
-const MAX_BODY = parseInt(process.env.PROXY_MAX_BODY || "1048576", 10); // 請求 body 上限預設 1MB (可透過 PROXY_MAX_BODY 調整)
+const MAX_BODY = CFG.MAX_BODY;
 const PROJ_DIR = getPath("projectDir");
+const MAX_INFLIGHT = CFG.MAX_INFLIGHT;
 
-// ─── 可配置 timeout 常數（可透過環境變數覆蓋） ───
+// ─── 可配置 timeout 常數（集中定義於 config/index.js） ───
 const CFG_TIMEOUT = {
-  chat: parseInt(process.env.PROXY_CHAT_TIMEOUT || "300000", 10), // 一般聊天 5min (降低無回應風險)
-  thinking: parseInt(process.env.PROXY_THINKING_TIMEOUT || "600000", 10), // thinking 模式 10min
-  health: parseInt(process.env.PROXY_HEALTH_TIMEOUT || "10000", 10), // 健康檢查 10s
-  retries: parseInt(process.env.PROXY_RETRIES || "0", 10), // 重試次數 (預設 0 避免請求放大)
+  chat: CFG.CHAT_TIMEOUT,
+  thinking: CFG.THINKING_TIMEOUT,
+  health: CFG.HEALTH_TIMEOUT,
+  retries: CFG.RETRIES,
 };
 
-// ─── 熔斷器 (Circuit Breaker) ───
-// 連續 N 次失敗後暫停請求 upstream，避免下游過載
-const CB_THRESHOLD = parseInt(process.env.PROXY_CB_THRESHOLD || "5", 10); // 連續 5 次失敗觸發熔斷
-const CB_RECOVERY_MS = parseInt(process.env.PROXY_CB_RECOVERY || "30000", 10); // 30 秒後嘗試恢復
-let cbState = { failCount: 0, openUntil: 0, lastError: "" };
+// ─── 請求追蹤 ID ───
+let _nextTrace = 0;
+const _genTrace = () => {
+  const id = (++_nextTrace).toString(36).padStart(4, "0");
+  return `${Date.now().toString(36).slice(-4)}-${id}`;
+};
 
-function checkCB() {
-  if (cbState.openUntil > Date.now()) {
-    return `上游熔斷中 (${Math.ceil((cbState.openUntil - Date.now()) / 1000)}s 後重試)`;
-  }
-  // 半開狀態：恢復時間已到，完全重置計數，允許一次試探
-  if (cbState.openUntil > 0 && Date.now() >= cbState.openUntil) {
-    cbState.openUntil = 0;
-    cbState.failCount = 0; // 🐛 FIX: 必須完全歸零，否則半開後一次失敗即重熔
-  }
-  return null;
+// ─── Router 實例（startProxy 中初始化） ───
+let _router = null;
+
+// ─── 記憶體壓力監控 ───
+let _memWarned = false;
+const _checkMem = () => {
+  try {
+    const { heapUsed, heapTotal, rss } = process.memoryUsage();
+    const usedMB = Math.round(heapUsed / 1024 / 1024);
+    const totalMB = Math.round(heapTotal / 1024 / 1024);
+    // 跳過初始 V8 heap 還很小的場景（< 50MB），避免 false positive
+    if (heapTotal < 50 * 1024 * 1024) {
+      if (LV >= 4)
+        log.debug(
+          `mem: ${usedMB}/${Math.round(rss / 1024 / 1024)}MB (warming up)`,
+        );
+      return;
+    }
+    const ratio = heapUsed / heapTotal;
+    if (ratio > CFG.MEM_WARN_THRESHOLD && !_memWarned) {
+      log.warn(
+        `⚠️ 記憶體壓力: ${usedMB}MB/${totalMB}MB (${(ratio * 100).toFixed(0)}%)`,
+      );
+      _memWarned = true;
+    } else if (ratio < CFG.MEM_WARN_THRESHOLD * 0.7) {
+      _memWarned = false;
+    }
+    if (LV >= 4) log.debug(`mem: ${usedMB}/${Math.round(rss / 1024 / 1024)}MB`);
+  } catch {}
+};
+setInterval(_checkMem, 60000);
+
+// ─── 推理模式：auto / on / off ───
+// auto  = 自動偵測模型是否支援推理（根據模型名特徵）
+// on    = 強制開啟所有 Qwen 模型推理
+// off   = 不啟用推理（除非客戶端明確要求）
+const PROXY_THINKING_MODE = CFG.THINKING_MODE;
+
+// 判斷模型是否支援推理（供 PROXY_THINKING_MODE=auto 使用）
+function modelSupportsReasoning(model) {
+  const m = model.toLowerCase();
+  // qwq 系列（純推理模型）
+  if (m.includes("qwq")) return true;
+  // 明確標記 reasoning/thinking 的模型
+  if (m.includes("reasoning") || m.includes("thinking")) return true;
+  // Qwen 高階模型：plus/max 通常支援推理
+  if (
+    m.includes("qwen") &&
+    (m.includes("plus") || m.includes("max") || m.includes("coder"))
+  )
+    return true;
+  return false;
 }
 
-function recordSuccess() {
-  cbState.failCount = 0;
-  cbState.openUntil = 0;
+// 統一解析是否啟用推理
+function resolveThinking(body) {
+  // 客戶端明確指定 → 尊重客戶端
+  if (body.enable_thinking !== undefined) return body.enable_thinking;
+  // 客戶端透過模型名指定 -thinking 後綴
+  if (body.model?.toLowerCase().includes("thinking")) return true;
+  // 根據 PROXY_THINKING_MODE 決定
+  if (PROXY_THINKING_MODE === "on") return true;
+  if (PROXY_THINKING_MODE === "auto")
+    return modelSupportsReasoning(body.model || "");
+  // off
+  return false;
 }
 
-function recordFailure(err) {
-  cbState.failCount++;
-  cbState.lastError = err?.slice?.(0, 120) || String(err || "");
-  if (cbState.failCount >= CB_THRESHOLD) {
-    cbState.openUntil = Date.now() + CB_RECOVERY_MS;
-    console.error(
-      `[proxy] 🔴 熔斷器觸發! 連續 ${CB_THRESHOLD} 次失敗，暫停 ${CB_RECOVERY_MS / 1000}s`,
+// ─── 負載感知：追蹤 proxy 層級併發數，用於動態降級模型 ───
+let proxyInflight = 0;
+let proxyInflightPeak = 0;
+function proxyRequestStart() {
+  proxyInflight++;
+  if (proxyInflight > proxyInflightPeak) proxyInflightPeak = proxyInflight;
+}
+function proxyRequestEnd() {
+  if (proxyInflight > 0) proxyInflight--;
+}
+
+// 🐛 FIX: 模型切換太快（Bug #5）
+// 加入滯後機制（hysteresis），防止 inflight 在門檻值附近波動時頻繁切換模型
+// 降級立即生效（安全優先），升級需等待冷卻時間（定義於 config/index.js）
+const MODEL_DOWNGRADE_COOLDOWN = CFG.MODEL_COOLDOWN;
+let _lastDowngradeAt = 0; // 上次降級時間戳
+let _currentDowngradeLv = 0; // 當前生效的降級程度 (0=無降級, 1=降一級, 2=強制 small)
+
+/**
+ * 負載感知路由降級：
+ * 當 proxy 同時處理大量請求時，自動調整模型等級避免 qwen2api 排隊爆炸
+ * 支援滯後（hysteresis）避免 inflight 門檻震盪導致模型頻繁切換
+ * @param {"small"|"medium"|"large"} level — analyzeComplexity 原始推薦
+ * @returns {"small"|"medium"|"large"} — 可能降級後的等級
+ */
+function loadAwareRoute(level) {
+  let idx = LEVEL_ORDER[level] ?? 1;
+
+  // P3: 計算當前需要的降級程度（基於 inflight，門檻提前，定義於 config/index.js）
+  // 0 = 不降級, 1 = 降一級, 2 = 強制 small
+  let needDowngrade = 0;
+  if (proxyInflight >= CFG.DOWNGRADE_THRESHOLDS.small) needDowngrade = 2;
+  else if (proxyInflight >= CFG.DOWNGRADE_THRESHOLDS.medium) needDowngrade = 1;
+
+  // 降級總是立即生效（安全優先）
+  if (needDowngrade > _currentDowngradeLv) {
+    _currentDowngradeLv = needDowngrade;
+    _lastDowngradeAt = Date.now();
+  }
+  // 升級需要冷卻時間：避免 inflight 波動時頻繁切換
+  else if (needDowngrade < _currentDowngradeLv) {
+    const elapsed = Date.now() - _lastDowngradeAt;
+    if (elapsed < MODEL_DOWNGRADE_COOLDOWN) {
+      if (needDowngrade === 1 || proxyInflight >= 2) {
+        _lastDowngradeAt = Date.now();
+      }
+    } else {
+      _currentDowngradeLv = needDowngrade;
+    }
+  }
+
+  // 套用降級
+  if (_currentDowngradeLv >= 2) idx = Math.min(idx, 0);
+  else if (_currentDowngradeLv >= 1) idx = Math.min(idx, 1);
+  if (idx < 0) idx = 0;
+
+  const result = LEVEL_LABELS[idx];
+  if (result !== level) {
+    log.warn(
+      `📡 負載降級: ${level}→${result} (inflight=${proxyInflight}, dLv=${_currentDowngradeLv}, cool=${Math.max(0, MODEL_DOWNGRADE_COOLDOWN - (Date.now() - _lastDowngradeAt)) / 1000}s)`,
     );
   }
+  return result;
 }
 
-// ─── ConversationMemory：對話記憶與摘要（預設關閉） ───
+// ─── ConversationMemory：對話記憶與摘要（定義於 config/index.js） ───
 // 啟用: PROXY_CONV_MEMORY=true
 // 功能：滑動窗口壓縮、閒聊過濾、跨 session 摘要持久化
-const CONV_MEMORY_ENABLED = process.env.PROXY_CONV_MEMORY !== "false"; // 預設開啟，設 false 關閉
-const CONV_SUMMARY_INTERVAL = parseInt(
-  process.env.PROXY_SUMMARY_INTERVAL || "5",
-  10,
-);
-const CONV_RECENT_MSGS = parseInt(process.env.PROXY_RECENT_MSGS || "15", 10);
-const CONV_MAX_HISTORY_TOKENS = parseInt(
-  process.env.PROXY_MAX_HISTORY_TOKENS || "8000",
-  10,
-);
-// 跨平台家目錄：Windows 用 USERPROFILE，其餘用 HOME
+const CONV_MEMORY_ENABLED = CFG.CONV_MEMORY_ENABLED;
+const CONV_SUMMARY_INTERVAL = CFG.CONV_SUMMARY_INTERVAL;
+const CONV_RECENT_MSGS = CFG.CONV_RECENT_MSGS;
+const CONV_MAX_HISTORY_TOKENS = CFG.CONV_MAX_HISTORY_TOKENS;
 const HOME_DIR = process.env.USERPROFILE || process.env.HOME || "~";
 const CONV_MEMORY_FILE = path.join(
   HOME_DIR,
   ".opencode",
   "conversation-memory.json",
 );
-const CONV_SESSION_ID = process.env.PROXY_SESSION_ID || "default";
+const CONV_SESSION_ID = CFG.CONV_SESSION_ID;
 
 // 對話記憶儲存體（in-memory + 持久化）
 let convSummary = "";
@@ -180,12 +276,9 @@ const persistMemory = () => {
 // 啟用: PROXY_CONV_HISTORY=true
 // 儲存位置: ~/.opencode/conversations/raw/YYYY-MM/<sessionId>.jsonl
 // 索引: ~/.opencode/conversations/index.json
-const CONV_HISTORY = process.env.PROXY_CONV_HISTORY !== "false";
-const CONV_DIR = path.join(
-  process.env.USERPROFILE || process.env.HOME || "~",
-  ".opencode/conversations",
-);
-const CONV_SRC = process.env.PROXY_CONV_SOURCE || "proxy";
+const CONV_HISTORY = CFG.CONV_HISTORY;
+const CONV_DIR = path.join(HOME_DIR, ".opencode/conversations");
+const CONV_SRC = CFG.CONV_SRC;
 
 const convDir = CONV_DIR;
 const convIdx = {};
@@ -220,7 +313,7 @@ const convMergeIdx = (sid, entry) => {
 const convSessionId = () => {
   const d = new Date();
   const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  const suffix = process.env.PROXY_CONV_SESSION || "opencode";
+  const suffix = CFG.CONV_SESSION_SUFFIX;
   return `${day}-${CONV_SRC}-${suffix}`;
 };
 
@@ -373,11 +466,11 @@ const processWithMemory = (messages) => {
   );
   const totalTokens = Math.ceil(totalChars / 4);
 
-  // 若超過 threshold，觸發壓縮
-  if (
-    totalTokens > CONV_MAX_HISTORY_TOKENS &&
-    convExchangeCount % CONV_SUMMARY_INTERVAL === 0
-  ) {
+  // 🐛 FIX: 對齊系統預設「快滿才壓縮」邏輯，大幅提高閾值避免過早丟失歷史
+  // 預設 8000 → 30000，接近一般模型上下文極限前才觸發
+  // 電報機器人整理重點對話摘要時可節省 Token 消耗
+  const COMPACTION_THRESHOLD = CFG.CONV_MAX_HISTORY_TOKENS || 30000;
+  if (totalTokens > COMPACTION_THRESHOLD) {
     // 保留最近 N 條，前面的用摘要取代
     const recent = filtered.slice(-CONV_RECENT_MSGS);
     const older = filtered.slice(0, -CONV_RECENT_MSGS);
@@ -405,9 +498,9 @@ const processWithMemory = (messages) => {
   return filtered;
 };
 
-// ─── Rate Limiter（滑動窗口，無依賴） ───
-const RL_MAX = parseInt(process.env.PROXY_RATE_LIMIT || "600"); // 本機環境放寬至 600 req/min
-const RL_WIN = parseInt(process.env.PROXY_RATE_WINDOW || "60000");
+// ─── Rate Limiter（滑動窗口，配置於 config/index.js） ───
+const RL_MAX = CFG.RL_MAX;
+const RL_WIN = CFG.RL_WIN;
 const rlBuckets = new Map();
 
 function checkRL(ip) {
@@ -441,76 +534,73 @@ function checkRL(ip) {
 //   PROXY_LARGE_MODEL=xxx    — 強制指定大模型
 //   PROXY_ROUTE=off          — 停用自動路由
 
-const COMPLEX_KEYWORDS = [
-  "fix",
-  "repair",
-  "debug",
-  "implement",
-  "create",
-  "build",
-  "deploy",
-  "refactor",
-  "optimize",
-  "analyze",
-  "investigate",
-  "troubleshoot",
-  "修復",
-  "除錯",
-  "實作",
-  "建立",
-  "部署",
-  "重構",
-  "優化",
-  "分析",
-];
+const COMPLEX_KEYWORDS = CFG.COMPLEX_KEYWORDS;
 
-// 從模型名稱推斷能力等級
-const classifyModel = (name) => {
-  const n = (name || "").toLowerCase();
-  // 大型模型：235B, Max, Preview
-  if (n.includes("235b") || n.includes("max") || n.includes("preview"))
-    return "large";
-  // 中型模型：Plus, 72B 以上但非 Max
-  if (n.includes("plus") || n.includes("coder")) return "medium";
-  // 小型模型：27B, Flash, 輕量
-  if (n.includes("27b") || n.includes("flash") || n.includes("35b"))
-    return "small";
-  // 預設為 medium
-  return "medium";
-};
+// 模型等級分類已移至 config/index.js → classifyModel()
 
 // 從 qwen2api 取得可用模型並分級
 let envModels = null;
 let envDetected = false;
 let envRetryTimer = null; // 偵測失敗後重試定時器
-
-// 判斷模型 ID 是否為 -coder 字尾變體（不匹配 Qwen3-Coder 這種獨立命名）
-const isCoderVariant = (id) => {
-  const n = String(id || "");
-  // 獨立 Qwen3-Coder 模型正常運作，不應被過濾或重新導向
-  if (n.toLowerCase() === "qwen3-coder") return false;
-  return (
-    n.endsWith("-coder") ||
-    n.endsWith("-thinking-coder") ||
-    n.endsWith("-search-coder") ||
-    n.endsWith("-thinking-search-coder")
-  );
-};
+let envRetryCount = 0; // 重試計數
+const MAX_ENV_RETRIES = 10; // 最多重試 10 次（100 秒）
 
 const detectEnv = async () => {
   if (envDetected) return;
+  if (envRetryCount >= MAX_ENV_RETRIES) {
+    log.error(`模型偵測已達最大重試次數 (${MAX_ENV_RETRIES})，放棄`);
+    envDetected = true; // 標記為已嘗試，避免無限重試
+    envModels = { small: [], medium: [CFG.MODEL_DEFAULTS.medium], large: [] };
+    return;
+  }
   // 清除舊的重試定時器（避免疊加）
   if (envRetryTimer) {
     clearTimeout(envRetryTimer);
     envRetryTimer = null;
   }
   try {
-    // 優先試 /v1/models（需 auth），若回傳無 data 陣列則降級到 /models（無 auth）
-    let models = await getJSON(`${QWEN2API_URL}/v1/models`);
-    let list = models?.data || models || [];
-    if (!Array.isArray(list)) {
-      models = await getJSON(`${QWEN2API_URL}/models`);
+    const trace = `env-${_genTrace()}`;
+    let list = [];
+    // 路由模式：嘗試透過 Router 查詢可用模型
+    if (_router) {
+      try {
+        const result = await _router.exec("GET", "/v1/models", null, {
+          trace,
+          timeout: 10000,
+          retries: 0,
+        });
+        const raw = result?.data;
+        log.debug(
+          `[${trace}] /v1/models type=${typeof raw} keys=${raw ? Object.keys(raw).slice(0, 6).join(",") : "null"}`,
+        );
+        list = raw?.data || raw || [];
+        if (!Array.isArray(list)) {
+          const r2 = await _router.exec("GET", "/models", null, {
+            trace,
+            timeout: 10000,
+            retries: 0,
+          });
+          const raw2 = r2?.data;
+          list = raw2?.data || raw2 || [];
+          log.debug(
+            `[${trace}] /models type=${typeof raw2} keys=${raw2 ? Object.keys(raw2).slice(0, 6).join(",") : "null"}`,
+          );
+        }
+      } catch (e) {
+        log.debug(
+          `[${trace}] Router 模型查詢失敗: ${e.message}，降級至直接請求`,
+        );
+        list = [];
+      }
+    }
+    // 降級：直接請求 Qwen2API
+    if (!Array.isArray(list) || list.length === 0) {
+      let models = await getJSON(`${QWEN2API_URL}/v1/models`);
       list = models?.data || models || [];
+      if (!Array.isArray(list)) {
+        models = await getJSON(`${QWEN2API_URL}/models`);
+        list = models?.data || models || [];
+      }
     }
     if (!Array.isArray(list)) list = [];
     const byLevel = { small: [], medium: [], large: [] };
@@ -522,9 +612,23 @@ const detectEnv = async () => {
       if (!byLevel[level].includes(id)) byLevel[level].push(id);
     }
     envModels = byLevel;
-    // 🐛 FIX: 0 模型表示快取尚未刷新，設 10 秒重試
+    // 🐛 FIX: 0 模型表示快取尚未刷新
     if (list.length === 0) {
-      log.info(`模型偵測暫無資料（快取未刷新），10 秒後重試`);
+      if (_router) {
+        // Router 模式：Router 已就緒，直接使用預設值（不再重試）
+        log.info(`模型暫無資料，Router 可用→使用預設模型`);
+        envModels = {
+          small: [],
+          medium: [CFG.MODEL_DEFAULTS.medium],
+          large: [],
+        };
+        envDetected = true;
+        return;
+      }
+      envRetryCount++;
+      log.info(
+        `模型偵測暫無資料（快取未刷新），10 秒後重試 (${envRetryCount}/${MAX_ENV_RETRIES})`,
+      );
       envModels = null;
       envDetected = false;
       envRetryTimer = setTimeout(() => {
@@ -533,6 +637,7 @@ const detectEnv = async () => {
       }, 10000);
       return;
     }
+    envRetryCount = 0; // 成功則重置計數
     envDetected = true;
     log.info(`🌍 環境偵測: ${list.length} 模型可用`);
     if (LV >= 4) {
@@ -542,7 +647,10 @@ const detectEnv = async () => {
       }
     }
   } catch (e) {
-    log.info(`模型偵測略過: ${e.message}，10 秒後重試`);
+    envRetryCount++;
+    log.info(
+      `模型偵測略過: ${e.message}，10 秒後重試 (${envRetryCount}/${MAX_ENV_RETRIES})`,
+    );
     envModels = null;
     envDetected = false; // 🐛 FIX: 失敗後保持 false，啟動重試
     // 10 秒後重試偵測（qwen2api 可能尚未完全就緒）
@@ -554,23 +662,29 @@ const detectEnv = async () => {
 };
 
 const getModelForLevel = (level) => {
-  // 環境變數強制指定優先
-  const envKey = `PROXY_${level.toUpperCase()}_MODEL`;
-  if (process.env[envKey]) return process.env[envKey];
+  // 環境變數強制指定優先（定義於 config/index.js）
+  const forced = {
+    small: CFG.MODEL_SMALL,
+    medium: CFG.MODEL_MEDIUM,
+    large: CFG.MODEL_LARGE,
+  };
+  if (forced[level]) return forced[level];
 
   // 從偵測到的模型列表選擇
   if (envModels?.[level]?.length > 0) return envModels[level][0];
 
-  // 硬編碼預設值
-  const defaults = {
-    small: "qwen3.6-27b",
-    medium: "qwen3.6-plus",
-    large: "qwen3-235b-a22b",
-  };
-  return defaults[level] || defaults.medium;
+  // 預設值
+  return CFG.MODEL_DEFAULTS[level] || CFG.MODEL_DEFAULTS.medium;
 };
 
 // ─── 任務複雜度分析 ───
+
+// ─── 歷史反饋權重查詢 (簡化版，實際應查詢 self-learning 數據) ───
+const getHistoricalPenalty = (taskType) => {
+  // TODO: 整合 self-learning.js 的 Metrics 數據
+  // 目前預設無懲罰，待後續整合真實數據源
+  return 0;
+};
 
 const analyzeComplexity = (body) => {
   const { messages, tools, tool_choice } = body;
@@ -601,6 +715,19 @@ const analyzeComplexity = (body) => {
     }
   }
 
+  // 動態特徵：思維鏈需求
+  if (
+    lower.includes("step-by-step") ||
+    lower.includes("reasoning") ||
+    lower.includes("think carefully")
+  ) {
+    score += 2;
+  }
+
+  // 歷史反饋修正 (預留接口)
+  const taskType = nTools > 0 ? "coding" : "chat";
+  score += getHistoricalPenalty(taskType);
+
   if (score >= 5) return "large";
   if (score >= 2) return "medium";
   return "small";
@@ -618,8 +745,7 @@ const waitForBackend = async (portBusy) => {
 };
 
 const routeModel = (body) => {
-  if (process.env.PROXY_ROUTE === "off")
-    return body.model || getModelForLevel("medium");
+  if (!CFG.ROUTE_ENABLED) return body.model || getModelForLevel("medium");
 
   // ─── 使用者明確指定 -coder 變體 → 導向獨立 Qwen3-Coder ───
   // -coder 字尾變體（Qwen3.6-Plus-coder 等）上游回傳空內容，
@@ -639,22 +765,28 @@ const routeModel = (body) => {
         return match;
       }
     }
-    // 環境偵測未完成或找不到時，用 env var 或硬編碼預設
-    const coderDefault = process.env.PROXY_CODER_MODEL || "qwen3-coder-plus";
+    // 環境偵測未完成或找不到時，用 CFG 預設
+    const coderDefault = CFG.MODEL_CODER;
     log.info(`📡 coder (${orig} → ${coderDefault})`);
     return coderDefault;
   }
 
   let level = analyzeComplexity(body);
   // 硬體感知：若硬體不足，降級模型等級
+  // 可透過 PROXY_HW_FORCE_LEVEL=large 繞過硬體限制
+  const hwForced = CFG.HW_FORCE_LEVEL;
   const hw = detectHardware();
   const hwOrder = { small: 0, medium: 1, large: 2 };
   const taskOrder = hwOrder[level] ?? 1;
-  const hwLimit = hwOrder[hw.level] ?? 1;
+  const hwLevel =
+    hwForced && hwOrder[hwForced] !== undefined ? hwForced : hw.level;
+  const hwLimit = hwOrder[hwLevel] ?? 1;
   if (taskOrder > hwLimit) {
     const downgraded =
       Object.entries(hwOrder).find(([, v]) => v <= hwLimit)?.[0] || "medium";
-    log.info(`📡 ${level}→${downgraded} (硬體受限: ${hw.reason})`);
+    log.info(
+      `📡 ${level}→${downgraded} (${hwForced ? `強制=${hwForced}` : `硬體=${hw.level}`}: ${hw.reason})`,
+    );
     level = downgraded;
   }
   let model = getModelForLevel(level);
@@ -1179,8 +1311,13 @@ async function execSelfLearnTool(name, args) {
           args.prompt || "",
           args.response || "",
           fb,
+          {
+            modelUsed: args.modelUsed || "unknown",
+            routingScore: args.routingScore || null,
+            taskType: args.taskType || "general",
+          },
         );
-        result = `📝 反饋已記錄\n類型: ${fb}\n總資料: ${m.dataPoints}筆 | 準確度: ${(m.accuracy * 100).toFixed(1)}% | Level ${m.level}`;
+        result = `📝 反饋已記錄\n類型: ${fb}\n模型: ${args.modelUsed || "N/A"}\n總資料: ${m.dataPoints}筆 | 準確度: ${(m.accuracy * 100).toFixed(1)}% | Level ${m.level}`;
         break;
       }
       case "self_learn_status": {
@@ -1331,13 +1468,32 @@ async function handleSelfLearnToolCalls(toolCalls) {
   if (!selfCalls.length) return { handled: false, results: [] };
   log.info(`🧠 自我學習 tool_calls x${selfCalls.length}`);
   const results = [];
+  // P5: 設定工具執行超時（5s），避免慢工具阻塞主流程
+  const TOOL_TIMEOUT_MS = 5000;
   for (const tc of selfCalls) {
     let args = {};
     try {
       args = JSON.parse(tc.function.arguments || "{}");
     } catch {}
-    const text = await execSelfLearnTool(tc.function.name, args);
-    results.push({ role: "tool", tool_call_id: tc.id, content: text });
+    try {
+      const text = await Promise.race([
+        execSelfLearnTool(tc.function.name, args),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`Tool timeout after ${TOOL_TIMEOUT_MS}ms`)),
+            TOOL_TIMEOUT_MS,
+          ),
+        ),
+      ]);
+      results.push({ role: "tool", tool_call_id: tc.id, content: text });
+    } catch (e) {
+      log.warn(`⚠️ 自我學習工具超時或失敗: ${tc.function.name} - ${e.message}`);
+      results.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: `⚠️ 工具執行超時或失敗: ${e.message}`,
+      });
+    }
   }
   return { handled: true, results };
 }
@@ -1497,8 +1653,7 @@ const runSinglePass = async (body) => {
     // qwen2api 已支援原生 tool role 與 tools 參數（2026-06 驗證通過）
     // 保持 messages 原始格式，不進行 role 轉換，直接透傳讓 qwen2api 原生處理
     const currentModel = routeModel(body);
-    const isThinking =
-      body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
+    const isThinking = resolveThinking(body);
 
     const allTools = injectSelfLearnTools(tools);
     const hasTools = allTools?.length > 0;
@@ -1515,13 +1670,35 @@ const runSinglePass = async (body) => {
       `📤 model=${up.model} msgs=${up.messages.length} tools=${allTools?.length || 0} (self: ${SELF_LEARN_TOOL_DEFS.length}) think=${isThinking}`,
     );
 
+    const trace = _genTrace();
     const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
-    const result = await postJSON(
-      `${QWEN2API_URL}/v1/chat/completions`,
-      up,
-      t,
-      CFG_TIMEOUT.retries,
-    );
+    let result;
+    if (_router) {
+      try {
+        const r = await _router.exec("POST", "/v1/chat/completions", up, {
+          trace,
+          timeout: t,
+          retries: CFG_TIMEOUT.retries,
+        });
+        result = r.data;
+        log.info(`[${trace}] ✅ ${r.provider} (${r.latency}ms)`);
+      } catch (e) {
+        log.warn(`[${trace}] Router 失敗: ${e.message}，降級至直接請求`);
+        result = await postJSON(
+          `${QWEN2API_URL}/v1/chat/completions`,
+          up,
+          t,
+          CFG_TIMEOUT.retries,
+        );
+      }
+    } else {
+      result = await postJSON(
+        `${QWEN2API_URL}/v1/chat/completions`,
+        up,
+        t,
+        CFG_TIMEOUT.retries,
+      );
+    }
     const choice = result?.choices?.[0];
     if (!choice) {
       return buildErrorResponse("上游無回應", currentModel);
@@ -1556,6 +1733,19 @@ const runSinglePass = async (body) => {
       if (handled && regularCalls.length === 0) {
         // 全部是 self-learning tools，回傳執行結果
         log.info(`🧠 自我學習工具已執行 x${results.length}，回傳結果`);
+        // 🧠 記錄自我學習工具互動
+        try {
+          selfLearning.recordInteraction(
+            promptText.slice(0, 500),
+            `[self-learn-tools] ${results.length} executed`,
+            "accepted",
+            {
+              modelUsed: currentModel,
+              routingScore: analyzeComplexity(body),
+              taskType: "self-learning",
+            },
+          );
+        } catch {}
         return buildTextResponse(
           results.map((r) => r.content).join("\n\n"),
           currentModel,
@@ -1570,6 +1760,19 @@ const runSinglePass = async (body) => {
         );
       }
       log.info(`📬 原生 tool_calls x${nativeCalls.length}，透傳給 opencode`);
+      // 🧠 記錄工具呼叫互動
+      try {
+        selfLearning.recordInteraction(
+          promptText.slice(0, 500),
+          `[tool-calls] ${nativeCalls.length} calls`,
+          "accepted",
+          {
+            modelUsed: currentModel,
+            routingScore: analyzeComplexity(body),
+            taskType: "coding",
+          },
+        );
+      } catch {}
       return buildToolCallResponse(
         regularCalls.length > 0 ? regularCalls : nativeCalls,
         msg?.content,
@@ -1657,6 +1860,25 @@ const runSinglePass = async (body) => {
 
     // 3) 純文字回應 → 直接回傳（opencode 視為完成）
     log.debug(`✅ 純文字回應 ${raw.length}ch`);
+
+    // 🧠 自動記錄路由與模型使用數據（供智能微調分析）
+    // 無論是否有 tool_calls，只要回應成功即記錄，確保所有模型互動都被學習系統捕捉
+    try {
+      const complexityScore = analyzeComplexity(body);
+      selfLearning.recordInteraction(
+        promptText.slice(0, 500),
+        raw.slice(0, 500),
+        "accepted",
+        {
+          modelUsed: currentModel,
+          routingScore: complexityScore,
+          taskType: hasTools ? "coding" : "chat",
+        },
+      );
+    } catch (err) {
+      log.debug(`⚠️ 反饋記錄失敗: ${err.message}`);
+    }
+
     return buildTextResponse(
       raw || "(空回應)",
       currentModel,
@@ -1664,7 +1886,6 @@ const runSinglePass = async (body) => {
       upUsage,
     );
   } catch (e) {
-    recordFailure(e?.message || e);
     log.error(`❌ runSinglePass 失敗:`, e?.message || e);
     return buildErrorResponse(`處理過程中發生錯誤: ${e?.message || e}`, "qwen");
   }
@@ -1685,7 +1906,14 @@ const runSinglePass = async (body) => {
 //
 // 回傳 true = 串流已處理完畢（呼叫端無需再處理）
 // 回傳 false = 串流失敗（呼叫端應 fallback 到非串流模式）
-const streamSinglePass = async (body, res, msgId, model, signal) => {
+const streamSinglePass = async (
+  body,
+  res,
+  msgId,
+  model,
+  signal,
+  checkTimedOut = () => false,
+) => {
   let hbTimer = null;
   try {
     const { messages, tools, tool_choice, stream: _s, ...rest } = body;
@@ -1711,8 +1939,7 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
 
     // 原始訊息直接透傳（qwen2api 原生支援 tool role）
     const currentModel = routeModel(body);
-    const isThinking =
-      body.enable_thinking ?? body.model?.toLowerCase().includes("thinking");
+    const isThinking = resolveThinking(body);
 
     const allTools = injectSelfLearnTools(tools);
     const hasTools = allTools?.length > 0;
@@ -1732,6 +1959,7 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
       `📡 stream model=${up.model} msgs=${up.messages.length} tools=${allTools?.length || 0} (self: ${SELF_LEARN_TOOL_DEFS.length}) think=${isThinking}`,
     );
 
+    const trace = _genTrace();
     const t = isThinking ? CFG_TIMEOUT.thinking : CFG_TIMEOUT.chat;
     // 合併客戶端中斷 signal + timeout signal
     const fetchSignal =
@@ -1740,60 +1968,75 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
         ? AbortSignal.any([signal, AbortSignal.timeout(t)])
         : signal;
     let resp;
-    const maxRetries = CFG_TIMEOUT.retries;
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const ctrl =
-        attempt < maxRetries
-          ? AbortSignal.any([signal, AbortSignal.timeout(t)])
-          : fetchSignal;
+
+    // 路由模式：嘗試透過 Router 取得串流回應
+    if (_router) {
       try {
-        const r = await fetch(`${QWEN2API_URL}/v1/chat/completions`, {
-          method: "POST",
-          headers: { ...authHeaders, "Content-Type": "application/json" },
-          body: JSON.stringify(up),
-          signal: ctrl,
-        });
-        if (r.ok && r.body) {
-          resp = r;
-          break;
-        }
-        // 非 ok 或無 body → 重試（502/503 等暫時性錯誤）
-        if (attempt < maxRetries) {
-          const wait = Math.min(2000 * 2 ** attempt, 10000);
-          const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
-          log.info(
-            `串流請求失敗 (${r.status})，${attempt + 1}/${maxRetries} 次重試，等待 ${jittered}ms...`,
-          );
-          await delay(jittered);
-          continue;
-        }
-        recordFailure(`HTTP ${r.status}`);
-        log.info(`串流請求失敗 (${r.status})，降級為非串流模式`);
-        return false;
+        const streamResult = await _router.execStream(
+          "/v1/chat/completions",
+          up,
+          { trace, timeout: t, signal, retries: CFG_TIMEOUT.retries },
+        );
+        resp = streamResult.response;
+        log.info(`[${trace}] ✅ STREAM ${streamResult.provider}`);
       } catch (e) {
-        if (e?.name === "AbortError") {
-          log.warn("🛑 串流被客戶端中斷或超時");
-          return true;
-        }
-        if (attempt < maxRetries) {
-          const wait = Math.min(2000 * 2 ** attempt, 10000);
-          const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
-          log.info(
-            `串流請求異常 (${e.message})，${attempt + 1}/${maxRetries} 次重試，等待 ${jittered}ms...`,
-          );
-          await delay(jittered);
-          continue;
-        }
-        recordFailure(e.message);
-        log.info(`串流請求異常 (${e.message})，降級為非串流模式`);
-        return false;
+        log.warn(`[${trace}] Router stream 失敗: ${e.message}，降級至直接請求`);
+        resp = null;
       }
     }
 
+    // 降級：直接請求 Qwen2API
     if (!resp) {
-      recordFailure("所有串流重試均失敗");
-      log.info(`串流請求全部重試失敗，降級為非串流模式`);
-      return false;
+      const maxRetries = CFG_TIMEOUT.retries;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const ctrl =
+          attempt < maxRetries
+            ? AbortSignal.any([signal, AbortSignal.timeout(t)])
+            : fetchSignal;
+        try {
+          const r = await fetch(`${QWEN2API_URL}/v1/chat/completions`, {
+            method: "POST",
+            headers: { ...authHeaders, "Content-Type": "application/json" },
+            body: JSON.stringify(up),
+            signal: ctrl,
+          });
+          if (r.ok && r.body) {
+            resp = r;
+            break;
+          }
+          if (attempt < maxRetries) {
+            const wait = Math.min(2000 * 2 ** attempt, 10000);
+            const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
+            log.info(
+              `[${trace}] ⚠️ 串流 ${r.status}，重試 ${attempt + 1}/${maxRetries} (${jittered}ms)`,
+            );
+            await delay(jittered);
+            continue;
+          }
+          log.info(`[${trace}] 串流失敗 (${r.status})，降級非串流`);
+          return false;
+        } catch (e) {
+          if (e?.name === "AbortError") {
+            log.warn(`[${trace}] 🛑 串流被中斷或超時`);
+            return true;
+          }
+          if (attempt < maxRetries) {
+            const wait = Math.min(2000 * 2 ** attempt, 10000);
+            const jittered = Math.round(wait * (0.75 + Math.random() * 0.5));
+            log.info(
+              `[${trace}] ⚠️ 串流異常 ${e.message}，重試 ${attempt + 1}/${maxRetries} (${jittered}ms)`,
+            );
+            await delay(jittered);
+            continue;
+          }
+          log.info(`[${trace}] 串流異常，降級非串流`);
+          return false;
+        }
+      }
+      if (!resp) {
+        log.info(`[${trace}] 串流全部重試失敗，降級非串流`);
+        return false;
+      }
     }
 
     // 設置 SSE headers（若尚未設定）
@@ -1811,18 +2054,43 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
     const decoder = new TextDecoder();
     let ok = true;
     let sawDone = false;
+    // P4: 使用傳入的 checkTimedOut 回調檢查請求是否超時
 
-    // SSE heartbeat 防止 opencode wrapSSE chunk timeout（預設 120s，heartbeat 每 5s 發送）
+    // SSE heartbeat 防止 opencode wrapSSE chunk timeout（預設 120s，heartbeat 每 3s 發送）
     // 當模型長時間推理思考無新 chunk 時，heartbeat 可重置 opencode 端的閒置計時器
-    const HEARTBEAT_MS = 5_000; // 縮短至 5s，極致防止 opencode wrapSSE timeout
+    // 🐛 FIX: heartbeat 也必須重置 readLoop 的 lastData，否則 readTimeout 不受 heartbeat 影響
+    // P22: 增加「實質資料」追蹤，若連續 N 次 heartbeat 無實質內容，強制斷線避免僵屍連線
+    // P25: 縮短 heartbeat 間隔與空計數閾值，提升對卡死的敏感度
+    const HEARTBEAT_MS = 3_000; // 縮短至 3s，更快偵測僵屍連線
+    const MAX_EMPTY_HEARTBEATS = 4; // 連續 4 次 heartbeat (12s) 無實質資料則斷線
     let lastData = Date.now();
+    let emptyHeartbeatCount = 0;
+    // 使用物件包裝以便在 readLoop 中共享引用
+    const streamState = { lastData, emptyHeartbeatCount };
     hbTimer = setInterval(() => {
       const now = Date.now();
-      if (now - lastData >= HEARTBEAT_MS) {
+      if (now - streamState.lastData >= HEARTBEAT_MS) {
         try {
+          // 檢查是否超過最大空 heartbeat 次數
+          if (streamState.emptyHeartbeatCount >= MAX_EMPTY_HEARTBEATS) {
+            log.warn(
+              `⚠️ 連續 ${MAX_EMPTY_HEARTBEATS} 次 heartbeat 無實質資料，強制斷線`,
+            );
+            clearInterval(hbTimer);
+            if (!res.writableEnded) {
+              res.write(
+                `data: {"error":"上游無回應超時","error_code":"upstream_idle_timeout","detail":"連續 ${MAX_EMPTY_HEARTBEATS * 5}s 無實質內容"}\n\n`,
+              );
+              res.write("data: [DONE]\n\n");
+              res.end();
+            }
+            return;
+          }
+
           // SSE comment (:) 會被所有標準 SSE parser 忽略，但能重置 timeout
           res.write(": heartbeat\n\n");
-          lastData = now; // 更新時間戳，避免連續發送
+          streamState.lastData = now; // 更新時間戳，避免連續發送
+          streamState.emptyHeartbeatCount++; // 遞增空 heartbeat 計數
         } catch (e) {
           log.debug(`Heartbeat write failed: ${e.message}`);
           clearInterval(hbTimer);
@@ -1836,14 +2104,26 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
     const streamStartTime = Date.now(); // P13: 記錄串流開始時間
 
     while (true) {
+      // P4: 若請求已被中止、超時或回應已結束，立即退出避免 write race
+      if (
+        signal?.aborted ||
+        checkTimedOut() ||
+        res.writableEnded ||
+        res.destroyed
+      ) {
+        if (checkTimedOut()) log.warn("🛑 串流因整體超時中止");
+        else if (!res.writableEnded) log.info("🛑 串流已中止，結束讀取迴圈");
+        break;
+      }
       // 讀取逾時保護：使用 CFG_TIMEOUT 值（聊天 5min / thinking 10min）
       // 首個 chunk 需要更長等待（qwen2api 可能排隊中），非硬編碼 120s
       // P15: 動態調整首包超時，若已收到資料則使用較短超時避免卡死
       // P21: 進一步優化，首包允許等待至 CFG_TIMEOUT 上限，後續 chunk 嚴格限制防止僵屍連線
+      // P26: 縮短首包超時至 90s，避免使用者長時間等待無回應
       const isFirstChunk = chunkCount === 0;
       const readTimeout = isFirstChunk
-        ? t // 首包允許完整 timeout (5-10min)，避免上游排隊時過早放棄
-        : Math.min(30000, t / 2); // 後續 chunk 最多等 30s 或總 timeout 的一半
+        ? Math.min(90000, t) // 首包最多 90s，避免無限等待
+        : Math.max(30000, Math.min(60000, t / 3)); // 後續 chunk 30-60s，更快偵測斷流
       let readResult;
       try {
         readResult = await Promise.race([
@@ -1874,6 +2154,8 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
       if (done) break;
       const now = Date.now();
       lastData = now; // 收到資料即重設計時器
+      streamState.lastData = now; // P22: 同步更新 streamState，重置 heartbeat 空計數
+      streamState.emptyHeartbeatCount = 0; // P22: 收到實質資料，重置空 heartbeat 計數
 
       const chunk = decoder.decode(value, { stream: true });
       if (!chunk) continue;
@@ -1896,6 +2178,7 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
         break;
       }
 
+      if (res.writableEnded || res.destroyed) break; // P4: 回應已結束，跳過寫入
       try {
         const wrote = res.write(chunk);
         gotAnyData = true;
@@ -1907,7 +2190,15 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
             new Promise((resolve) => setTimeout(() => resolve(false), 5000)),
           ]);
           if (!drained) {
-            log.warn("⚠️ 客戶端緩衝區 drain 超時，強制繼續");
+            log.warn("⚠️ 客戶端緩衝區 drain 超時，銷毀回應以釋放資源");
+            // P23: drain 超時代表客戶端讀取嚴重滯後或已斷線，直接銷毀避免記憶體洩漏
+            try {
+              res.destroy();
+            } catch {
+              /* ignore */
+            }
+            ok = false;
+            break;
           }
         }
       } catch (e) {
@@ -1942,6 +2233,24 @@ const streamSinglePass = async (body, res, msgId, model, signal) => {
           res.write("data: [DONE]\n\n");
         }
         res.end();
+
+        // 自動記錄串流模式的路由與模型使用數據
+        try {
+          const complexityScore = analyzeComplexity(body);
+          selfLearning.recordInteraction(
+            "[stream] " +
+              (messages?.[messages.length - 1]?.content || "").slice(0, 200),
+            `[stream completed] chunks=${chunkCount}`,
+            "accepted",
+            {
+              modelUsed: currentModel,
+              routingScore: complexityScore,
+              taskType: hasTools ? "coding" : "chat",
+            },
+          );
+        } catch (err) {
+          log.debug(`⚠️ 串流反饋記錄失敗: ${err.message}`);
+        }
       } else {
         // 從未收到任何資料 → 發送錯誤 event 而非空 [DONE]
         // 避免客戶端收到「200 OK + 0 內容串流」誤以為無回應
@@ -2148,22 +2457,38 @@ const streamResponse = (res, msgId, model, result) => {
 // ─── 通用轉發（非聊天端點） ───
 
 const proxyRequest = (req, res) => {
-  const url = `${QWEN2API_URL}${req.url}`;
   const method = req.method;
+  const path = req.url;
 
+  // GET 轉發
   if (method === "GET") {
-    getJSON(url)
-      .then((data) => {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(data));
-      })
-      .catch((err) => {
-        res.writeHead(502);
-        res.end(JSON.stringify({ error: err.message }));
-      });
+    const doGet = async () => {
+      if (_router) {
+        try {
+          const result = await _router.exec("GET", path, null, {
+            trace: _genTrace(),
+            timeout: 15000,
+            retries: 0,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result.data));
+          return;
+        } catch (e) {
+          log.debug(`Router GET 降級: ${e.message}`);
+        }
+      }
+      const data = await getJSON(`${QWEN2API_URL}${path}`);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(data));
+    };
+    doGet().catch((err) => {
+      res.writeHead(502);
+      res.end(JSON.stringify({ error: err.message }));
+    });
     return;
   }
 
+  // POST 轉發
   if (method === "POST") {
     let body = "";
     let rejected = false;
@@ -2182,22 +2507,32 @@ const proxyRequest = (req, res) => {
     req.on("error", () => {
       rejected = true;
     });
-    req.on("end", () => {
+    req.on("end", async () => {
       if (rejected) return;
       try {
         const parsed = JSON.parse(body);
-        postJSON(url, parsed)
-          .then((data) => {
+        if (_router) {
+          try {
+            const result = await _router.exec("POST", path, parsed, {
+              trace: _genTrace(),
+              timeout: 60000,
+              retries: 0,
+            });
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(data));
-          })
-          .catch((err) => {
-            res.writeHead(502);
-            res.end(JSON.stringify({ error: err.message }));
-          });
+            res.end(JSON.stringify(result.data));
+            return;
+          } catch (e) {
+            log.debug(`Router POST 降級: ${e.message}`);
+          }
+        }
+        const data = await postJSON(`${QWEN2API_URL}${path}`, parsed);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(data));
       } catch (e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: "Invalid JSON" }));
+        if (!rejected) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+        }
       }
     });
     return;
@@ -2253,13 +2588,25 @@ const handleRequest = async (req, res) => {
   // 健康檢查
   if (url === "/health") {
     let upstreamStatus = "unknown";
-    try {
-      // 健康檢查使用短超時（3秒），避免上游阻塞影響 proxy 響應
-      const h = await getJSON(`${QWEN2API_URL}/health`, 3000, 0);
-      upstreamStatus = h?.status || h?.upstream || "ok";
-    } catch (e) {
-      log.warn(`⚠️ 上游健康檢查失敗: ${e.message}`);
-      upstreamStatus = "unreachable";
+    let routerStatus = null;
+    if (_router) {
+      const stats = _router.status();
+      const healthyCount = stats.filter((s) => s.healthy).length;
+      routerStatus = {
+        providers: stats,
+        healthyCount,
+        totalCount: stats.length,
+        strategy: _router.strategy,
+      };
+      upstreamStatus = healthyCount > 0 ? "ok" : "unreachable";
+    } else {
+      try {
+        const h = await getJSON(`${QWEN2API_URL}/health`, 3000, 0);
+        upstreamStatus = h?.status || h?.upstream || "ok";
+      } catch (e) {
+        log.warn(`⚠️ 上游健康檢查失敗: ${e.message}`);
+        upstreamStatus = "unreachable";
+      }
     }
     const hw = detectHardware();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2267,6 +2614,7 @@ const handleRequest = async (req, res) => {
       JSON.stringify({
         proxy: "running",
         upstream: upstreamStatus,
+        router: routerStatus,
         port: PROXY_PORT,
         routing: getRouteInfo(),
         hardware: {
@@ -2311,8 +2659,35 @@ const handleRequest = async (req, res) => {
 
     // 客戶端斷線偵測（在 data/end 之前註冊，避免 stream 結束後 close 立即觸發）
     const ac = new AbortController();
+    // 🐛 FIX: 請求級別超時保護，防止 runSinglePass/stream 永久卡住
+    const REQ_TIMEOUT_MS = CFG.REQUEST_TIMEOUT; // P2: 預設 60s（原 180s），配置於 config/index.js
+    let reqTimedOut = false;
+    const reqTimer = setTimeout(() => {
+      if (res.writableEnded || res.destroyed) return; // P4: 回應已結束則跳過
+      reqTimedOut = true;
+      log.warn(`🛑 請求整體超時 (${REQ_TIMEOUT_MS}ms)，強制中止`);
+      ac.abort();
+      try {
+        if (!res.headersSent) {
+          res.writeHead(504, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Request timeout",
+              timeout_ms: REQ_TIMEOUT_MS,
+            }),
+          );
+        } else {
+          // P4: headers 已送出（串流進行中），只能關閉連線不額外寫入
+          res.end();
+        }
+      } catch {
+        /* ignore */
+      }
+    }, REQ_TIMEOUT_MS);
+
     res.on("close", () => {
-      if (!res.writableEnded) {
+      clearTimeout(reqTimer); // 客戶端斷線時清除計時器
+      if (!res.writableEnded && !reqTimedOut) {
         log.info("🛑 客戶端斷線，中止上游請求");
         ac.abort();
       }
@@ -2338,25 +2713,29 @@ const handleRequest = async (req, res) => {
     });
     req.on("end", async () => {
       if (rejected) return;
-      // 熔斷器檢查：上游連續失敗時直接拒絕，避免筆電超載
-      const cbErr = checkCB();
-      if (cbErr) {
-        log.warn(`🔴 ${cbErr}`);
-        res.writeHead(503, { "Content-Type": "application/json" });
+      // P0: 入口併發限流 — 超過 MAX_INFLIGHT 直接 429，不轉發 upstream
+      if (proxyInflight >= MAX_INFLIGHT) {
+        log.warn(
+          `⚠️ Inflight 限流: ${proxyInflight} >= ${MAX_INFLIGHT}，回傳 429`,
+        );
+        res.writeHead(429, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
-            error: cbErr,
-            retryAfter: Math.ceil((cbState.openUntil - Date.now()) / 1000),
+            error: "Too Many Concurrent Requests",
+            inflight: proxyInflight,
+            maxInflight: MAX_INFLIGHT,
+            retryAfter: 5,
           }),
         );
         return;
       }
+      proxyRequestStart();
       try {
         const parsed = JSON.parse(body);
         const msgId = `chatcmpl-${Date.now()}`;
         const model = parsed.model || "qwen";
         log.info(
-          `📨 請求 model=${parsed.model} tools=${parsed.tools?.length || 0} stream=${parsed.stream}`,
+          `📨 請求 model=${parsed.model} tools=${parsed.tools?.length || 0} stream=${parsed.stream} (inflight=${proxyInflight})`,
         );
 
         // 記錄使用者訊息到對話歷史
@@ -2389,6 +2768,7 @@ const handleRequest = async (req, res) => {
             msgId,
             model,
             ac.signal,
+            () => reqTimedOut,
           );
           // streamSinglePass 失敗 + headers 尚未送出
           // → 降級為非串流模式（runSinglePass），避免 500 斷線
@@ -2417,17 +2797,22 @@ const handleRequest = async (req, res) => {
           // 串流模式：記錄標記（無法即時擷取完整串流內容）
           if (ok) {
             convRecord("assistant", "[串流回應已發送]", model);
-            recordSuccess();
           }
         } else {
           // 非串流
+          const nskStart = Date.now();
+          const nskTimer = setInterval(() => {
+            log.debug(
+              `⏳ 等待上游回應 (${Math.round((Date.now() - nskStart) / 1000)}s)`,
+            );
+          }, CFG.NONSTREAM_KEEPALIVE_INTERVAL);
           const result = await runSinglePass(parsed);
+          clearInterval(nskTimer);
           const c = result?.choices?.[0];
           const hasCalls = c?.message?.tool_calls?.length > 0;
           log.info(
-            `✅ 回應 ${hasCalls ? `tool_calls x${c.message.tool_calls.length}` : `content=${(c?.message?.content || "").length}ch`}`,
+            `✅ ${Math.round((Date.now() - nskStart) / 1000)}s ${hasCalls ? `tool_calls x${c.message.tool_calls.length}` : `content=${(c?.message?.content || "").length}ch`}`,
           );
-          // 記錄助手回覆到對話歷史
           const replyContent = c?.message?.content || "";
           if (replyContent) {
             convRecord("assistant", replyContent, model);
@@ -2435,19 +2820,21 @@ const handleRequest = async (req, res) => {
           if (hasCalls) {
             convRecord(
               "assistant",
-              `[工具呼叫: ${c.message.tool_calls.map((t) => t.function?.name || "?").join(", ")}]`,
+              `[${c.message.tool_calls.map((t) => t.function?.name || "?").join(", ")}]`,
               model,
             );
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
-          recordSuccess();
         }
       } catch (e) {
-        recordFailure(e?.message || e);
         log.error(`❌ 請求失敗:`, e?.message || e);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+        }
+      } finally {
+        proxyRequestEnd(); // 🐛 FIX: inflight 必須歸零，否則永不恢復
       }
     });
     return;
@@ -2459,32 +2846,48 @@ const handleRequest = async (req, res) => {
 
 // ─── 啟動 Proxy ───
 
-// 定期健康狀態摘要（每 5 分鐘輸出一次，方便監控）
-function startHealthMonitor() {
-  setInterval(() => {
-    const mem = process.memoryUsage();
-    const rssMB = Math.round(mem.rss / 1024 / 1024);
-    const heapMB = Math.round(mem.heapUsed / 1024 / 1024);
-    const cbStatus =
-      cbState.openUntil > Date.now()
-        ? `🔴熔斷中(${Math.ceil((cbState.openUntil - Date.now()) / 1000)}s)`
-        : "🟢正常";
-    const envStatus = envDetected
-      ? `🟢${envModels ? Object.values(envModels).reduce((a, b) => a + b.length, 0) : 0}模型`
-      : "🟡偵測中";
-    log.info(
-      `📊 健康狀態 | ${cbStatus} | 環境${envStatus} | MEM ${rssMB}MB(rss)/${heapMB}MB(heap) | CB失敗${cbState.failCount}次`,
-    );
-  }, 300000).unref();
+// ─── 簡化健康檢查（僅供 /health 端點使用，移除常駐看門狗） ───
+
+/** 所有本地服務的健康檢查 */
+async function checkAllSvcs() {
+  const svcs = [
+    { name: "qwen2api", url: "http://127.0.0.1:3000" },
+    { name: "chat-proxy", url: "http://127.0.0.1:3456/health" },
+    { name: "telegram-bridge", url: "http://127.0.0.1:4377/api/health" },
+    { name: "waf-proxy", url: "http://127.0.0.1:3457" },
+  ];
+  const results = [];
+  let okCount = 0;
+  for (const svc of svcs) {
+    const start = Date.now();
+    let ok = false;
+    try {
+      const res = await fetch(svc.url, { signal: AbortSignal.timeout(5_000) });
+      ok = res.ok;
+    } catch {}
+    const lat = Date.now() - start;
+    if (ok) okCount++;
+    results.push(`${svc.name}:${ok ? "✅" : "❌"}(${lat}ms)`);
+  }
+  const pct = Math.round((okCount / svcs.length) * 100);
+  return { pct, results, okCount, total: svcs.length };
 }
 
 export const startProxy = () => {
   const server = http.createServer(handleRequest);
 
+  // 初始化 Router（多 Provider 路由）
+  try {
+    _router = createRouter(CFG);
+    log.info(
+      `🤖 Router: ${_router.providers.length} providers, strategy=${_router.strategy}`,
+    );
+  } catch (e) {
+    log.warn(`🤖 Router 初始化失敗，使用直接模式: ${e.message}`);
+  }
+
   // 啟動後自動偵測環境
   detectEnv();
-  // 啟動健康監控（每 5 分鐘輸出狀態摘要）
-  startHealthMonitor();
 
   return new Promise((resolve, reject) => {
     server.on("error", (e) => {
@@ -2497,9 +2900,12 @@ export const startProxy = () => {
     });
     server.listen(PROXY_PORT, "0.0.0.0", () => {
       log.info(`🤖 Chat Proxy running on http://0.0.0.0:${PROXY_PORT}`);
-      if (process.env.PROXY_ROUTE !== "off") {
+      if (CFG.ROUTE_ENABLED) {
         log.info("🧠 模型路由: 啟用（自動依任務複雜度切換）");
       }
+      log.info(
+        `🧠 推理模式: ${PROXY_THINKING_MODE}${PROXY_THINKING_MODE === "auto" ? "（自動偵測 QwQ/Plus/Max/Coder）" : ""}`,
+      );
       resolve(server);
     });
   });
@@ -2507,7 +2913,7 @@ export const startProxy = () => {
 
 // 暴露環境資訊供健康檢查
 const getRouteInfo = () => ({
-  enabled: process.env.PROXY_ROUTE !== "off",
+  enabled: CFG.ROUTE_ENABLED,
   levels: {
     small: getModelForLevel("small"),
     medium: getModelForLevel("medium"),
@@ -2518,6 +2924,12 @@ const getRouteInfo = () => ({
         small: envModels.small.length,
         medium: envModels.medium.length,
         large: envModels.large.length,
+      }
+    : null,
+  router: _router
+    ? {
+        providers: _router.providers.length,
+        strategy: _router.strategy,
       }
     : null,
 });

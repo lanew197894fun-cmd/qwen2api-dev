@@ -3,7 +3,7 @@ const {
   countTokens,
   createUsageObject,
 } = require("../utils/precise-tokenizer.js");
-const { sendChatRequest } = require("../utils/request.js");
+const { sendChatRequest, getUpstreamHealth } = require("../utils/request.js");
 const {
   createToolCallStreamParser,
   parseToolCallsFromText,
@@ -474,11 +474,15 @@ const handleStreamResponse = async (
               .toString("utf-8")
               .trim();
             if (dataChunk) {
-              // P2: 激進背壓 - 丟棄舊數據
-              if (queue.length >= DROP_THRESHOLD) {
-                const dropCount = queue.length - DROP_THRESHOLD;
-                queue.splice(0, dropCount);
-                logger.warn(`佇列過載，丟棄 ${dropCount} 條舊數據`, "CHAT");
+              // P2: 背壓控制 - 佇列滿時暫停上游而非丟棄數據
+              // 丟棄數據會導致客戶端收到不完整回應，改為暫停上游等待消費
+              if (queue.length >= MAX_QUEUE_SIZE && !isPaused) {
+                isPaused = true;
+                upstreamResponse.pause();
+                logger.warn(
+                  `⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游等待消費`,
+                  "CHAT",
+                );
               }
               queue.push(dataChunk);
             }
@@ -494,28 +498,8 @@ const handleStreamResponse = async (
             buffer = Buffer.from(buffer);
           }
 
-          // P0-1: 背壓控制 - 佇列過大時暫停上游
-          if (queue.length >= MAX_QUEUE_SIZE && !isPaused && !drainTimer) {
-            isPaused = true;
-            upstreamResponse.pause();
-            logger.warn(
-              `⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游 (chunks=${chunkCount}, queue=${queue.length})`,
-              "CHAT",
-            );
-          }
-
-          // P11: 偵測上游是否已自動恢復（某些情況下 pause/resume 可能不同步）
-          // P21: 加入 drainTimer 檢查，避免在冷卻期間頻繁觸發 resume
-          if (
-            isPaused &&
-            queue.length < DROP_THRESHOLD &&
-            !processing &&
-            !drainTimer
-          ) {
-            // 若佇列已低於閾值且未在处理中，但上游仍處於暫停狀態，強制恢復
-            // 這防止因 processQueue 延遲導致上游長時間暫停
-            logger.debug(`🔄 佇列降至 ${queue.length}，檢查上游狀態`, "CHAT");
-          }
+          // P0-1: 背壓控制 - 已在上方 dataChunk 處理時暫停，此處僅記錄狀態
+          // 移除重複的 pause 邏輯，避免競態條件
 
           if (!processing) {
             setImmediate(processQueue);
@@ -570,6 +554,21 @@ const handleStreamResponse = async (
 
     // P0-2: 傳遞 abortController 給 pipeUpstream
     await pipeUpstream(response, options.abortController || null);
+
+    // 🐛 FIX: 串流結束後檢查上游健康狀態，若擁塞則記錄警告
+    try {
+      if (typeof getUpstreamHealth === "function") {
+        const health = getUpstreamHealth();
+        if (health?.congested) {
+          logger.warn(
+            `⚠️ 串流結束時上游仍標記為擁塞 (lastCheck: ${new Date(health.lastCheck).toISOString()})`,
+            "CHAT",
+          );
+        }
+      }
+    } catch (e) {
+      logger.debug(`getUpstreamHealth check failed: ${e.message}`, "CHAT");
+    }
 
     // tool_choice="required" 強校驗：未觸發任何工具呼叫則追加更強提示重試一次
     if (

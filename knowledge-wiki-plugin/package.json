@@ -1,0 +1,15 @@
+{
+  "name": "knowledge-wiki-plugin",
+  "version": "1.0.0",
+  "description": "獨立知識庫與維基插件 - 整合 knowledge/wiki/lesson 功能",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "dev": "bun run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "workspace:*",
+    "zod": "^3.24.0"
+  }
+}
