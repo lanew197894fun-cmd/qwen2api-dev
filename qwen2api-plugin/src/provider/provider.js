@@ -337,9 +337,8 @@ export class Provider {
 
     try {
       const start = Date.now();
-      const headers = this.auth ? this.auth.getHeaders() : {};
       const res = await fetch(`${this.baseUrl}/v1/models`, {
-        headers,
+        headers: this._buildHeaders(),
         signal: AbortSignal.timeout(8000),
       });
       const latency = Date.now() - start;
