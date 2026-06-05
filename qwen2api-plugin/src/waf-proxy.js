@@ -28,11 +28,11 @@ const MEM_RESTART_MB = parseInt(process.env.WAF_MEM_RESTART_MB || "1500"); // 1.
 const STREAM_TIMEOUT = parseInt(process.env.WAF_STREAM_TIMEOUT || "600000");
 
 // ─── Queue / Pool config ───
-const POOL_SIZE = parseInt(process.env.WAF_POOL_SIZE || "2"); // keep 2 pages warm
+const POOL_SIZE = parseInt(process.env.WAF_POOL_SIZE || "4"); // keep 4 pages warm for better concurrency
 const MAX_CONCURRENT = parseInt(
   process.env.WAF_MAX_CONCURRENT || String(POOL_SIZE),
 ); // match pool size by default
-const QUEUE_TIMEOUT = parseInt(process.env.WAF_QUEUE_TIMEOUT || "30000"); // max 30s wait in queue
+const QUEUE_TIMEOUT = parseInt(process.env.WAF_QUEUE_TIMEOUT || "60000"); // max 60s wait in queue to reduce premature timeouts
 
 let browser;
 let cookieJar = "";
@@ -796,7 +796,7 @@ async function main() {
   startServer();
   setInterval(() => refreshCookies().catch(() => {}), REFRESH_MS);
   setInterval(() => checkMemory().catch(() => {}), MEM_CHECK_MS);
-  setInterval(() => checkPoolHealth().catch(() => {}), 30000); // P0: pool health check every 30s
+  setInterval(() => checkPoolHealth().catch(() => {}), 15000); // P0: pool health check every 15s
   scheduleRestart();
   console.log("[waf-proxy] Ready (browser-only streaming, pre-flight status)");
 }
