@@ -282,7 +282,7 @@ async function probeModelStability() {
         max_tokens: 10,
         temperature: 0,
       }),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(15000),
     });
     const latency = Date.now() - start;
     const data = await res.json();
@@ -325,7 +325,7 @@ async function generateHealthReport() {
   const modelIcon = modelProbe.ok ? "🧠" : "💀";
   const modelDetail = `${modelIcon}模型:${modelProbe.ok ? "✅" : "❌"}(${modelProbe.latency}ms)`;
 
-  return `\n${icon} **健康報告**: ${pct}% | ${details.join(" ")} | ${modelDetail}`;
+  return `${icon} **健康報告**: ${pct}% | ${details.join(" ")} | ${modelDetail}`;
 }
 
 async function waitFor(url, label, timeout = 30) {
