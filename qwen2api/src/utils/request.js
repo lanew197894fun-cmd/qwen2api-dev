@@ -58,6 +58,77 @@ module.exports.getUpstreamHealth = () => ({
   lastCheck: lastLatencyCheck,
 });
 
+// ─── 自適應超時推算 ───
+// 根據 prompt 長度 + model 類型自動計算合理 timeout
+// 小請求快，大請求久，不再用固定數字
+const BASE_TIMEOUT_MS = parseInt(
+  process.env.QWEN_BASE_TIMEOUT || "120000", // 2 min base
+  10,
+);
+const TIMEOUT_PER_1K_CHARS = parseInt(
+  process.env.QWEN_TIMEOUT_PER_1K || "30000", // +30s per ~1k chars
+  10,
+);
+const MAX_TIMEOUT_MS = parseInt(
+  process.env.QWEN_MAX_TIMEOUT || "1800000", // 30 min cap
+  10,
+);
+const REASONING_MULTIPLIER = parseFloat(
+  process.env.QWEN_REASONING_TIMEOUT_MUL || "2", // 2x for reasoning models
+);
+
+/** 粗略估算 prompt 字元數（messages 陣列序列化） */
+function estimatePromptChars(body) {
+  if (!body) return 0;
+  const msgs = body.messages;
+  if (!Array.isArray(msgs)) return 0;
+  let total = 0;
+  for (const m of msgs) {
+    if (typeof m.content === "string") total += m.content.length;
+    else if (m.content && Array.isArray(m.content)) {
+      for (const part of m.content) {
+        if (typeof part.text === "string") total += part.text.length;
+      }
+    }
+  }
+  return total;
+}
+
+/** 判斷是否推理模型（需更長 timeout） */
+function isReasoningModel(model) {
+  if (!model) return false;
+  const m = model.toLowerCase();
+  return (
+    m.includes("qwq") ||
+    m.includes("r1") ||
+    m.includes("think") ||
+    m.includes("reasoner") ||
+    m.includes("deepseek") ||
+    m.includes("max")
+  );
+}
+
+/**
+ * 根據 body 動態計算合理 timeout
+ * @param {object} body - 請求 body (含 messages, model)
+ * @returns {number} timeout ms
+ */
+function calcTimeout(body) {
+  const chars = estimatePromptChars(body);
+  const extra = Math.ceil(chars / 1000) * TIMEOUT_PER_1K_CHARS;
+  let t = BASE_TIMEOUT_MS + extra;
+  if (isReasoningModel(body?.model)) t *= REASONING_MULTIPLIER;
+  // 若有 max_tokens，按比例增加（每 1k tokens +30s）
+  const maxTok = parseInt(body?.max_tokens || "0", 10);
+  if (maxTok > 0) t += Math.ceil(maxTok / 1000) * TIMEOUT_PER_1K_CHARS;
+  const final = Math.min(t, MAX_TIMEOUT_MS);
+  logger.debug(
+    `⏱️ timeout: ${final}ms (base=${BASE_TIMEOUT_MS} chars=${chars} model=${body?.model} max_tok=${maxTok})`,
+    "TIMEOUT",
+  );
+  return final;
+}
+
 // ─── 冪等性保護：快取已處理的 Request ID（限制容量防止記憶體洩漏） ───
 const processedRequests = new Map();
 const REQUEST_CACHE_TTL = 60000; // 60秒過期
@@ -204,7 +275,7 @@ const sendChatRequest = async (
       "X-Request-ID": requestId, // 新增 Request ID 標頭
     },
     responseType: "stream",
-    timeout: parseInt(process.env.QWEN_CHAT_TIMEOUT || "600000", 10), // P24: 降低至 10 分鐘，避免無限等待
+    timeout: calcTimeout(body), // 自適應超時：小請求快、大請求久
     signal: signal, // P16: 綁定 AbortSignal 以支援客戶端斷線時中止上游請求
   };
 
@@ -273,7 +344,7 @@ const sendChatRequest = async (
             decompress: true,
             // P19: 增加 keepAlive 與 socket 超時設定，防止上游意外斷線
             agent: proxyAgent || undefined,
-            timeout: parseInt(process.env.QWEN_CHAT_TIMEOUT || "900000", 10),
+            timeout: calcTimeout(body), // 自適應超時
           },
         ),
       2, // FIX: transient 503/504 時重試 2 次（原 0），避免短暫波動直接中斷
