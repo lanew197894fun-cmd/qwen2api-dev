@@ -28,7 +28,7 @@ const MEM_RESTART_MB = parseInt(process.env.WAF_MEM_RESTART_MB || "1500"); // 1.
 const STREAM_TIMEOUT = parseInt(process.env.WAF_STREAM_TIMEOUT || "600000");
 
 // ─── Queue / Pool config ───
-const POOL_SIZE = parseInt(process.env.WAF_POOL_SIZE || "4"); // keep 4 pages warm for better concurrency
+const POOL_SIZE = parseInt(process.env.WAF_POOL_SIZE || "2"); // laptop: 2 pages (原 4), Chrome 記憶體已達 2.5GB
 const MAX_CONCURRENT = parseInt(
   process.env.WAF_MAX_CONCURRENT || String(POOL_SIZE),
 ); // match pool size by default

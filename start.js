@@ -33,7 +33,16 @@ if (fs.existsSync(envFile)) {
   for (const line of lines) {
     if (line.startsWith("API_KEY=")) {
       process.env.API_KEY = line.substring("API_KEY=".length).trim();
-      break;
+    }
+    if (line.startsWith("MASTER_TS_IP=")) {
+      const ip = line.substring("MASTER_TS_IP=".length).trim();
+      // 自動組裝 PEERS URL（若未手動設定 PEERS）
+      if (!process.env.PEERS && ip) {
+        process.env.PEERS = `http://${ip}:4377`;
+      }
+    }
+    if (line.startsWith("PEERS=")) {
+      process.env.PEERS = line.substring("PEERS=".length).trim();
     }
   }
 }
@@ -87,11 +96,11 @@ async function ensureToken() {
   if (!IS_WIN || !isInteractive()) return;
   const { existsSync, readFileSync, writeFileSync } = require("fs");
   const envFile = join(ROOT, ".env");
+  let envContent = existsSync(envFile) ? readFileSync(envFile, "utf-8") : "";
+
   // Check if .env already has TELEGRAM_BOT_TOKEN
-  if (existsSync(envFile)) {
-    const content = readFileSync(envFile, "utf-8");
-    if (content.includes("TELEGRAM_BOT_TOKEN=")) return;
-  }
+  if (envContent.includes("TELEGRAM_BOT_TOKEN=")) return;
+
   console.log("");
   console.log("╔══════════════════════════════════════════════════╗");
   console.log("║   Telegram Bridge 設定                          ║");
@@ -111,8 +120,32 @@ async function ensureToken() {
     console.log("  ⚠️  未輸入，跳過 Telegram Bridge\n");
     return;
   }
-  writeFileSync(envFile, `TELEGRAM_BOT_TOKEN=${token}\n`, "utf-8");
+
+  // Prompt for Master IP (for Laptop/Peer mode)
+  console.log("");
+  console.log("╔══════════════════════════════════════════════════╗");
+  console.log("║   跨裝置同步設定 (可選)                         ║");
+  console.log("╠══════════════════════════════════════════════════╣");
+  console.log("║  若此裝置為筆電 (Peer)，需指定主力機 IP          ║");
+  console.log("║  以啟用自動推送功能。                            ║");
+  console.log("║                                                 ║");
+  console.log("║  取得方式：                                      ║");
+  console.log("║  在主力機執行: tailscale ip -4                  ║");
+  console.log("╚══════════════════════════════════════════════════╝");
+  console.log("  主力機 Tailscale IP (留空則不設定)：");
+  const masterIp = await promptToken();
+
+  let newLines = `TELEGRAM_BOT_TOKEN=${token}\n`;
+  if (masterIp) {
+    newLines += `MASTER_TS_IP=${masterIp}\n`;
+  }
+
+  writeFileSync(envFile, envContent + newLines, "utf-8");
   process.env.TELEGRAM_BOT_TOKEN = token;
+  if (masterIp) {
+    process.env.MASTER_TS_IP = masterIp;
+    process.env.PEERS = `http://${masterIp}:4377`;
+  }
   console.log("  ✅ 已寫入 .env\n");
 }
 
@@ -202,16 +235,15 @@ function killByPort(port) {
 
 // ─── kill ALL qwen2api-related processes (cluster master + workers) ───
 // 🛡️ 排除自身：pkill 不能匹配到當前 start.js 進程
+// 跨裝置相容：使用 ROOT 變數動態建構路徑
 
 function killAllQwen() {
   if (IS_WIN) return;
   const pid = process.pid;
   try {
     // 只殺 qwen2api/ 目錄下的進程（含尾斜線避免匹配 qwen2api-dev/start.js）
-    execSync(
-      `pkill -f '/home/reamaster/opencode-manager/projects/independent/qwen2api/' 2>/dev/null; true`,
-      { timeout: 3000 },
-    );
+    const qwenPath = join(ROOT, "qwen2api") + "/";
+    execSync(`pkill -f '${qwenPath}' 2>/dev/null; true`, { timeout: 3000 });
     // 殺掉舊版 start.js（用 pgrep 輸出 PID，排除自身 PID）
     execSync(
       `pgrep -f 'start\\.js' | grep -v ${pid} | xargs -r kill 2>/dev/null; true`,
@@ -360,7 +392,7 @@ function launch(srv) {
     const proc = spawn(srv.cmd[0], srv.cmd.slice(1), {
       cwd: srv.cwd,
       env: { ...process.env, ...srv.env },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"], // P0: stdin must be pipe/inherit, not ignore (Windows/Bun exit bug)
       windowsHide: true,
     });
 
@@ -457,7 +489,10 @@ async function main() {
       port: 3000,
       cwd: join(ROOT, "qwen2api"),
       cmd: [BUN, "src/start.js", "--force"],
-      env: { API_KEY: process.env.API_KEY || "CHANGE_ME" },
+      env: {
+        API_KEY: process.env.API_KEY || "CHANGE_ME",
+        QWEN_CHAT_PROXY_URL: "http://127.0.0.1:3457", // FIX: 啟用 WAF bypass proxy，不走直連上游
+      },
       waitUrl: "http://127.0.0.1:3000/health",
       waitTimeout: 30,
     },
@@ -482,7 +517,11 @@ async function main() {
       port: 4377,
       cwd: join(ROOT, "telegram-memory-bridge"),
       cmd: [BUN, "src/index.ts"],
-      env: {},
+      env: {
+        // 筆電模式：指定主力機 Tailscale IP 以啟用 Peer 推送
+        // 格式：http://<主力機_TS_IP>:4377
+        PEERS: process.env.PEERS || "",
+      },
       waitUrl: "http://127.0.0.1:4377/api/health",
       waitTimeout: 20,
     },
@@ -574,9 +613,9 @@ async function main() {
     console.log("\n" + healthReport);
 
     log(`──────────────────────────────────────`);
-    log(`  waf-proxy:    http://127.0.0.1:3457`);
-    log(`  qwen2api:     http://127.0.0.1:3000`);
-    log(`  chat-proxy:   http://127.0.0.1:3456`);
+    log(`  waf-proxy:     http://127.0.0.1:3457`);
+    log(`  qwen2api:      http://127.0.0.1:3000`);
+    log(`  chat-proxy:    http://127.0.0.1:3456`);
     if (!IS_WIN) log(`  embed-server: http://127.0.0.1:11436`);
     log(`  telegram:     port 4377`);
     log(`  knowledge-wiki: ${join(ROOT, "knowledge-wiki-plugin")}`);

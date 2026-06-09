@@ -276,7 +276,7 @@ const sendChatRequest = async (
             timeout: parseInt(process.env.QWEN_CHAT_TIMEOUT || "900000", 10),
           },
         ),
-      0, // P0: 重試次數降為 0 — 上游 503/504 放大風暴時重試只會讓事情更糟
+      2, // FIX: transient 503/504 時重試 2 次（原 0），避免短暫波動直接中斷
       1500, // 增加基礎延遲至 1.5s（原 1s）
       shouldRetry, // 使用條件重試
     );
@@ -422,7 +422,7 @@ const generateChatID = async (currentToken, model, account) => {
           },
           requestConfig,
         ),
-      0, // P0: 重試次數降為 0（同步修改）
+      3, // FIX: upstream 503 短暫波動時重試 3 次（原 0），指數退避 500ms→1s→2s
       500,
     );
 
