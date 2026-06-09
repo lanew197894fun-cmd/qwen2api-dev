@@ -411,16 +411,6 @@ function mergeCookies(incoming) {
     .join("; ");
 }
 
-function isWaf(s) {
-  const t = typeof s === "string" ? s.toLowerCase() : "";
-  return (
-    t.includes("aliyun_waf") ||
-    t.includes("captcha-element") ||
-    t.includes("waf_nc") ||
-    t.includes("access verification")
-  );
-}
-
 // ─── Non-streaming proxy (Node.js fetch, no WAF issue for non-API paths) ───
 
 async function proxySimple(method, path, headers, body) {
@@ -456,7 +446,21 @@ async function proxySimple(method, path, headers, body) {
   return { status: resp.status, headers: out, body: text };
 }
 
-// ─── Streaming proxy (browser-only — Aliyun WAF NC, pre-flight status) ───
+// ─── Streaming proxy (hybrid: Node.js fetch first, browser fallback) ───
+// 背景：puppeteer browser consistently times out on this laptop.
+//    → Try Node.js native fetch first (works fine 95% of the time).
+//    → Only use browser when Node.js fetch gets WAF challenge (text/html SSE).
+
+function isWafBody(txt) {
+  if (!txt) return false;
+  const t = txt.toLowerCase();
+  return (
+    t.includes("aliyun_waf") ||
+    t.includes("captcha") ||
+    t.includes("waf_nc") ||
+    t.includes("access verification")
+  );
+}
 
 async function proxyStreaming(method, path, headers, body, res) {
   const url = TARGET + path;
@@ -477,7 +481,6 @@ async function proxyStreaming(method, path, headers, body, res) {
     "sec-ch-ua",
   ];
   for (const k of fwdKeys) if (headers[k]) fwd[k] = headers[k];
-  // Override referer/origin to target domain (incoming values are from proxy URL)
   fwd["referer"] = TARGET + "/c/guest";
   fwd["origin"] = TARGET;
   fwd["accept"] = "text/event-stream";
@@ -485,8 +488,9 @@ async function proxyStreaming(method, path, headers, body, res) {
     fwd["user-agent"] =
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
   if (!fwd["content-type"] && body) fwd["content-type"] = "application/json";
+  fwd["cookie"] = mergeCookies(headers["cookie"] || headers["Cookie"] || "");
 
-  const page = await createPage();
+  // ── Phase A: Try Node.js native fetch first ──
   let ended = false;
   const end = () => {
     if (!ended) {
@@ -494,6 +498,75 @@ async function proxyStreaming(method, path, headers, body, res) {
       if (!res.writableEnded) res.end();
     }
   };
+
+  try {
+    const nativeResp = await fetch(url, {
+      method,
+      headers: fwd,
+      body: body || undefined,
+      signal: AbortSignal.timeout(30000),
+    });
+    updateCookieJar(nativeResp);
+
+    const ct = (nativeResp.headers.get("content-type") || "").toLowerCase();
+    const isWaf =
+      !ct.includes("text/event-stream") && !ct.includes("application/json");
+
+    if (nativeResp.ok || !isWaf) {
+      // ── Native fetch succeeded (or got a real API error) → stream directly ──
+      if (!res.headersSent) {
+        res.writeHead(nativeResp.status, {
+          "Content-Type": ct.includes("text/event-stream")
+            ? "text/event-stream"
+            : "application/json",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        });
+      }
+      if (ct.includes("text/event-stream")) {
+        const reader = nativeResp.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (!res.writableEnded && !ended) {
+            try {
+              res.write(chunk);
+            } catch {
+              end();
+              break;
+            }
+          }
+        }
+      } else {
+        const text = await nativeResp.text();
+        if (!res.writableEnded) res.end(text);
+      }
+      end();
+      console.log(`[waf] Node.js stream OK (${nativeResp.status}, ${ct})`);
+      return;
+    }
+
+    // Native fetch got WAF challenge → fall through to browser
+    console.log(
+      `[waf] WAF challenge detected, falling back to browser (ct=${ct})`,
+    );
+  } catch (e) {
+    // Native fetch failed → fall through to browser
+    console.log(`[waf] Node.js fetch failed (${e.message}), trying browser`);
+  }
+
+  // ── Phase B: Browser fallback (WAF bypass) ──
+  const page = await createPage();
+  if (!page) {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "no_browser_page" }));
+    }
+    return;
+  }
 
   try {
     page.on("console", suppressConsole);
@@ -504,7 +577,6 @@ async function proxyStreaming(method, path, headers, body, res) {
       fnD = "d_" + uid,
       fnS = "s_" + uid;
 
-    // Forward-reported status: resolve pre-flight promise
     let upStatus = 200;
     let statusResolve;
     const statusProm = new Promise((r) => {
@@ -525,42 +597,8 @@ async function proxyStreaming(method, path, headers, body, res) {
     });
     await page.exposeFunction(fnD, () => end());
 
-    // Inject merged cookies
-    const src = cookieJar ? cookieJar.split("; ").filter(Boolean) : [];
-    const rc = headers["cookie"] || headers["Cookie"] || "";
-    if (rc) {
-      for (const c of rc
-        .split(";")
-        .map((s) => s.trim())
-        .filter(Boolean)) {
-        const e = c.indexOf("=");
-        if (e > 0) {
-          const n = c.slice(0, e);
-          const idx = src.findIndex((s) => s.startsWith(n + "="));
-          if (idx >= 0) src.splice(idx, 1);
-          src.push(c);
-        }
-      }
-    }
-    for (const c of src) {
-      const e = c.indexOf("=");
-      if (e > 0)
-        try {
-          await page.setCookie({
-            name: c.slice(0, e),
-            value: c.slice(e + 1),
-            domain: ".chat.qwen.ai",
-            path: "/",
-          });
-        } catch {}
-    }
-
-    // Page already navigated to TARGET in createPage() (with JS bundles blocked to prevent React crash)
-    // Cookies set above on the existing page — no re-navigation needed
     await new Promise((r) => setTimeout(r, 500));
 
-    // Phase 1: Execute fetch in browser — reports status FIRST via fnS, then streams chunks
-    // Fetch timeout prevents browser from hanging on 401 body or slow upstream
     const FETCH_TIMEOUT = 60000;
     const js = `
       (async () => {
@@ -576,7 +614,6 @@ async function proxyStreaming(method, path, headers, body, res) {
             signal: ac.signal,
           });
           clearTimeout(to);
-          // Phase 1: report status before any streaming
           emit(${JSON.stringify(fnS)}, resp.status);
           if (!resp.ok) {
             const text = await resp.text().catch(() => "");
@@ -585,7 +622,6 @@ async function proxyStreaming(method, path, headers, body, res) {
             emit(${JSON.stringify(fnD)});
             return;
           }
-          // Phase 2: stream SSE response
           const ct = (resp.headers.get("content-type") || "").toLowerCase();
           console.log("[waf] Upstream content-type:", ct);
           if (ct.includes("text/event-stream")) {
@@ -620,24 +656,15 @@ async function proxyStreaming(method, path, headers, body, res) {
         }
       })();
     `;
-    // Evaluate without waiting (streaming is async in browser)
     const evalProm = page.evaluate(js).catch(() => {});
 
-    // Wait for status report from browser (with timeout)
     const status = await Promise.race([
       statusProm,
-      new Promise((r) => setTimeout(() => r(0), 30000)), // 30s browser timeout
+      new Promise((r) => setTimeout(() => r(0), 30000)),
     ]);
 
     if (status === 0) {
-      // Browser didn't respond — timeout
       browserHealth.consecutiveTimeouts++;
-      browserHealth.lastTimeoutAt = Date.now();
-      browserHealth.failedRequests++;
-      console.error(
-        `[waf] Browser status timeout (x${browserHealth.consecutiveTimeouts})`,
-      );
-      // 達到連續逾時閾值 → 立即重啟瀏覽器
       if (browserHealth.consecutiveTimeouts >= 3) {
         console.error(
           `[waf] ⚠️ 連續 ${browserHealth.consecutiveTimeouts} 次逾時，強制重啟瀏覽器`,
@@ -654,7 +681,6 @@ async function proxyStreaming(method, path, headers, body, res) {
     }
 
     if (status !== 200) {
-      // Non-200: write real HTTP error code (triggers qwen2api retry)
       if (!res.headersSent) {
         res.writeHead(status, {
           "Content-Type": "application/json",
@@ -662,14 +688,10 @@ async function proxyStreaming(method, path, headers, body, res) {
         });
         res.end(JSON.stringify({ error: "upstream_error", status }));
       }
-      console.log(`[waf] Upstream ${status}, returned as real HTTP status`);
-      // Do NOT await evalProm — browser may be stuck reading 401 body.
-      // The request is already ended; let browser clean up on its own.
       evalProm.catch(() => {});
       return;
     }
 
-    // 200: write SSE headers now
     if (!res.headersSent) {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -678,24 +700,19 @@ async function proxyStreaming(method, path, headers, body, res) {
         "X-Accel-Buffering": "no",
       });
     }
-
-    // Phase 2 streaming continues via fnC/fnD callbacks
     await evalProm;
   } catch (e) {
-    console.error(`[waf] Streaming error: ${e.message}`);
+    console.error(`[waf] Browser stream error: ${e.message}`);
     if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: e.message }));
     } else if (!res.writableEnded) res.end();
   } finally {
-    await syncCookies(page);
-    // 若頁面已死，不要放回 pool
     if (page && !page.isClosed()) {
       try {
         await page.evaluate("1", { timeout: 2000 });
         releasePage(page);
       } catch {
-        console.log(`[waf] Discarding dead page after streaming`);
         try {
           if (!page.isClosed()) await page.close().catch(() => {});
         } catch {}
