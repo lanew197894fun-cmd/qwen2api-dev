@@ -1,0 +1,34 @@
+# AI Orientation — qwen2api-dev
+
+> **你是 qwen2api-dev（主要開發線）。這不是 dev1，也不是 main。**
+
+## 🟢 你在此
+
+| 屬性 | 值 |
+|------|-----|
+| 變體 | **dev** |
+| 定位 | 核心 API + Telegram + 插件系統 + 知識庫 |
+| 子專案數 | 4 |
+| lesson 路徑 | `.opencode/skill/lesson/` |
+| 版本 SOP | `VERSION_SOP.md` |
+| 遠端 | ❌ 未上傳（僅本地） |
+
+## 🔴 不屬 dev 的功能（請勿建立/修改）
+
+- ❌ 管理後端（management-backend）
+- ❌ 帳號管理系統（account-manager/monitor）
+- ❌ 追溯系統 TS（§24-25 鐵律）
+- ❌ 統一配置中心（config-manager）
+- ❌ CLIProxyAPI / CLI Proxy 整合
+- ❌ WAF 繞過進階版（waf-browser.js, waf-proxy.js）
+- ❌ 智慧超時（smart-timeout.js）
+- ❌ Chrome Codex profile（.chrome-codex-profile/）
+- ❌ translate/ 翻譯模組
+
+以上功能屬於 **qwen2api-dev2**。若需要這些功能，請前往 `../qwen2api-dev2/`。
+
+## 用法
+
+- 開發核心 API / Telegram / 插件 → ✅ 在這裡做
+- 需要管理後端／追溯系統 → 去 dev2
+- 比對原始碼 → 去 main

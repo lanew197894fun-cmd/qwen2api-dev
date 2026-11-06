@@ -56,3 +56,7 @@ app.post("/api/cleanup", async (req, res) => {
 ## 等級
 
 P4-最佳實踐
+
+## 相關章節
+
+ARCHITECTURE.md §5（資料同步流向）

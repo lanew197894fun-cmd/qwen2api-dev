@@ -25,11 +25,8 @@ import { createApiKeyAuth } from "./api-key.js";
 import { createOAuthAuth } from "./oauth.js";
 import { createCookieAuth } from "./cookie.js";
 
-const log = {
-  info: (...a) => console.log("[auth]", ...a),
-  warn: (...a) => console.warn("[auth]", ...a),
-  error: (...a) => console.error("[auth]", ...a),
-};
+import { makeLogger } from "../../color.js";
+const log = makeLogger("auth", "success");
 
 const AUTH_TYPES = {
   "api-key": createApiKeyAuth,

@@ -6,128 +6,151 @@ const {
   getChatBaseUrl,
   applyProxyToAxiosConfig,
 } = require("../utils/proxy-helper");
+const { generateUUID } = require("../utils/tools.js");
+const { logger } = require("../utils/logger");
 
-// ─── 模型快取 ───
 let cachedModels = null;
 let fetchPromise = null;
-let lastFetchTime = 0;
-const CACHE_TTL = parseInt(process.env.MODEL_CACHE_TTL || "300000"); // 5min
-
-// ─── 不健康模型追蹤（回傳 Model not found 的模型會自動被排除） ───
-const unhealthyModels = new Set();
-const UNHEALTHY_RESET_MS = parseInt(
-  process.env.UNHEALTHY_RESET_MS || "1800000",
-); // 30min 後重置
-
-/**
- * 標記模型為不健康（上游回傳 Model not found 時呼叫此函式）
- * @param {string} modelId - 上游實際模型 ID
- */
-const markModelUnhealthy = (modelId) => {
-  if (!modelId) return;
-  unhealthyModels.add(modelId);
-  console.log(
-    `[models] Marked unhealthy: ${modelId} (${unhealthyModels.size} total)`,
-  );
-  // 30 分鐘後自動清除，避免上游修復後永遠被排除
-  setTimeout(() => {
-    unhealthyModels.delete(modelId);
-    console.log(`[models] Unhealthy model auto-cleared: ${modelId}`);
-  }, UNHEALTHY_RESET_MS);
-};
-
-/**
- * 檢查模型是否被標記為不健康
- */
-const isModelUnhealthy = (modelId) => {
-  return unhealthyModels.has(modelId);
-};
-
-/**
- * 取得所有被標記為不健康的模型清單
- */
-const getUnhealthyModels = () => {
-  return Array.from(unhealthyModels);
-};
 
 const getLatestModels = async (force = false) => {
-  const now = Date.now();
-
-  // 快取有效且未過期
-  if (cachedModels && !force && now - lastFetchTime < CACHE_TTL) {
-    // 過濾掉不健康模型後回傳
-    return cachedModels.filter((m) => !unhealthyModels.has(m?.id));
-  }
-
-  // 若正在取得中，回傳當前的 Promise
-  if (fetchPromise) {
-    const models = await fetchPromise;
-    return models.filter((m) => !unhealthyModels.has(m?.id));
-  }
+  if (cachedModels && !force) return cachedModels;
+  if (fetchPromise) return fetchPromise;
 
   const chatBaseUrl = getChatBaseUrl();
-  const account = await accountManager.getAccount();
+  const account = accountManager.getAccount();
   const proxyAgent = getProxyAgent(account);
+  const token = account ? account.token : "";
 
-  const requestConfig = {
-    headers: {
-      Authorization: `Bearer ${account ? account.token : ""}`,
-      "Content-Type": "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      ...(getSsxmodItna() && {
-        Cookie: `ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
-      }),
-    },
+  // 嘗試用 Chrome Fetch 取得模型列表 (繞過 WAF)
+  const tryChromeFetch = async () => {
+    try {
+      const { getInstance } = require("../utils/chrome-fetch");
+      const chromeFetch = getInstance();
+      const result = await chromeFetch.fetch(`${chatBaseUrl}/api/v2/configs/`, {
+        headers: { source: "web", version: "0.3.12" },
+      });
+      if (!result || !result.ok) return null;
+      const data = JSON.parse(result.body);
+      if (data?.success && data?.data) {
+        const raw = data.data;
+        if (Array.isArray(raw)) return raw;
+        if (raw?.models && Array.isArray(raw.models)) return raw.models;
+        logger.warn(
+          "Chrome Fetch /api/v2/configs/ 回傳非陣列格式，嘗試 /api/v2/models/",
+          "MODEL",
+        );
+        return null;
+      }
+    } catch (e) {
+      logger.warn(`Chrome Fetch 取得模型列表失敗: ${e.message}`, "MODEL");
+    }
+    return null;
   };
 
-  if (proxyAgent) {
-    requestConfig.httpsAgent = proxyAgent;
-    requestConfig.proxy = false;
-  }
-
-  fetchPromise = axios
-    .get(`${chatBaseUrl}/api/models`, requestConfig)
-    .then((response) => {
-      cachedModels = response.data.data;
-      lastFetchTime = Date.now();
-      fetchPromise = null;
-      console.log(
-        `[models] Cache refreshed: ${cachedModels?.length || 0} models`,
+  const tryChromeFetchModels = async () => {
+    try {
+      const { getInstance } = require("../utils/chrome-fetch");
+      const chromeFetch = getInstance();
+      const result = await chromeFetch.fetch(`${chatBaseUrl}/api/v2/models/`, {
+        headers: {
+          source: "web",
+          version: "0.3.12",
+          Authorization: token ? "Bearer " + token : "",
+        },
+      });
+      if (!result || !result.ok) return null;
+      const data = JSON.parse(result.body);
+      if (data?.success && Array.isArray(data?.data)) {
+        return data.data;
+      }
+    } catch (e) {
+      logger.warn(
+        `Chrome Fetch 取得 /api/v2/models/ 失敗: ${e.message}`,
+        "MODEL",
       );
-      return cachedModels.filter((m) => !unhealthyModels.has(m?.id));
-    })
-    .catch((error) => {
-      // 啟動初期上游尚未就緒是預期行為（白名單降級已處理），不用紅色錯誤
-      if (cachedModels) {
-        console.warn("[models] Failed to refresh, using stale cache");
-      } else {
-        console.warn("[models] Wait for upstream (fallback active)");
+    }
+    return null;
+  };
+
+  fetchPromise = (async () => {
+    const TIMEOUT_MS = 30000;
+    const deadline = Date.now() + TIMEOUT_MS;
+
+    if (Date.now() < deadline) {
+      const modelsData = await tryChromeFetchModels();
+      if (modelsData) {
+        cachedModels = modelsData;
+        fetchPromise = null;
+        return cachedModels;
       }
-      fetchPromise = null;
-      // 如果快取過期但仍有舊資料，回傳舊資料（降級）
-      if (cachedModels) {
-        console.warn("[models] Using stale cache as fallback");
-        return cachedModels.filter((m) => !unhealthyModels.has(m?.id));
+    }
+
+    if (Date.now() < deadline) {
+      const configData = await tryChromeFetch();
+      if (configData) {
+        cachedModels = configData;
+        fetchPromise = null;
+        return cachedModels;
       }
-      return [];
-    });
+    }
+
+    if (Date.now() < deadline) {
+      try {
+        const requestConfig = {
+          headers: {
+            "sec-ch-ua-platform": '"Windows"',
+            authorization: `Bearer ${token}`,
+            referer: `${chatBaseUrl}/`,
+            "accept-language": "zh-CN,zh;q=0.9",
+            "sec-ch-ua":
+              '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+            "sec-ch-ua-mobile": "?0",
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+            "content-type": "application/json",
+            "bx-v": "2.5.36",
+            accept: "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            source: "web",
+            version: "0.3.12",
+            timezone: new Date().toString().replace(/GMT\+0800/, "GMT+0800"),
+            "x-request-id": generateUUID(),
+            connection: "keep-alive",
+            ...(token && {
+              cookie: `token=${token};ssxmod_itna=${getSsxmodItna()};ssxmod_itna2=${getSsxmodItna2()}`,
+            }),
+            origin: chatBaseUrl,
+            host: chatBaseUrl.replace("https://", ""),
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+          },
+        };
+        if (proxyAgent) {
+          requestConfig.httpsAgent = proxyAgent;
+          requestConfig.proxy = false;
+        }
+        const response = await axios.get(
+          `${chatBaseUrl}/api/models`,
+          requestConfig,
+        );
+        cachedModels = response.data.data || [];
+      } catch (error) {
+        logger.error(`取得模型列表失敗: ${error.message}`, "MODEL");
+        cachedModels = [];
+      }
+    } else {
+      logger.warn("取得模型列表超時 (30s)，使用空陣列", "MODEL");
+      cachedModels = [];
+    }
+
+    fetchPromise = null;
+    return cachedModels;
+  })();
 
   return fetchPromise;
 };
 
-/**
- * 強制重新整理模型快取
- */
-const refreshModels = async () => {
-  return getLatestModels(true);
-};
-
-/**
- * 根據聊天型別獲取預設模型
- * @param {string} chatType - 聊天型別
- * @returns {Promise<string|null>} 預設模型 ID
- */
 const getDefaultModelByChatType = async (chatType) => {
   const models = await getLatestModels();
   const matchedModel = models.find((model) =>
@@ -139,8 +162,4 @@ const getDefaultModelByChatType = async (chatType) => {
 module.exports = {
   getLatestModels,
   getDefaultModelByChatType,
-  refreshModels,
-  markModelUnhealthy,
-  isModelUnhealthy,
-  getUnhealthyModels,
 };

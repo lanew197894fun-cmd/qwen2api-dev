@@ -2,16 +2,14 @@
 // opencode 工具執行模組（bash/read/write/edit/glob/grep）
 // 供 telegram bot 透過 /run 指令使用，讓模型能直接操作檔案系統
 
-import { execSync } from "child_process";
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { readdirSync } from "fs";
 import { resolve } from "path";
-import { ConversationStore, makeSessionId } from "./conversation-store";
+import { ConversationStore, makeSessionId } from "./conversation-store.ts";
 import {
   KNOWLEDGE_TOOLS,
   KNOWLEDGE_TOOL_NAMES,
   type KnowledgeToolName,
-} from "./knowledge-tools";
+} from "./knowledge-tools.ts";
 
 // ── Tool types ──
 
@@ -23,17 +21,80 @@ export interface ToolResult {
 
 // ── Tool execution ──
 
-function execBash(cmd: string, timeoutMs = 30000): ToolResult {
-  try {
-    const out = execSync(cmd, {
-      encoding: "utf-8",
-      timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024,
+const MAX_OUT = 10 * 1024 * 1024;
+
+/** 砍掉整個進程樹：Unix 靠進程群組，Windows 靠 taskkill /T */
+function killTree(pid: number, isWin: boolean) {
+  if (isWin) {
+    Bun.spawnSync(["taskkill", "/F", "/T", "/PID", String(pid)], {
+      stdout: "ignore",
+      stderr: "ignore",
     });
-    return { ok: true, output: out || "(completed, no output)" };
-  } catch (e: any) {
-    const msg = e.stdout || e.message || String(e);
-    return { ok: false, output: msg.slice(0, 2000), error: e.message };
+    return;
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // 已結束
+    }
+  }
+}
+
+async function execBash(cmd: string, timeoutMs = 30000): Promise<ToolResult> {
+  const isWin = process.platform === "win32";
+  const argv = isWin
+    ? ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd]
+    : ["/bin/sh", "-c", cmd];
+  const proc = Bun.spawn(argv, {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    // Unix：獨立進程群組，超時可整樹砍掉；Windows 由 taskkill /T 處理
+    detached: !isWin,
+    env: process.env,
+  });
+
+  let timedOut = false;
+  const timer = setTimeout(
+    () => {
+      timedOut = true;
+      killTree(proc.pid, isWin);
+    },
+    Math.max(1000, timeoutMs),
+  );
+
+  const read = async (stream: ReadableStream<Uint8Array>) =>
+    (await new Response(stream).text()).slice(0, MAX_OUT);
+
+  try {
+    const [out, err, code] = await Promise.all([
+      read(proc.stdout as ReadableStream<Uint8Array>),
+      read(proc.stderr as ReadableStream<Uint8Array>),
+      proc.exited,
+    ]);
+    if (timedOut) {
+      return {
+        ok: false,
+        output: `${out}${err}`.trim().slice(0, 2000),
+        error: `timeout after ${timeoutMs}ms (進程樹已終止)`,
+      };
+    }
+    if (code !== 0) {
+      return {
+        ok: false,
+        output: `${out}${err}`.trim().slice(0, 2000),
+        error: `exit code ${code}`,
+      };
+    }
+    const text = out || err;
+    return { ok: true, output: text.trim() || "(completed, no output)" };
+  } finally {
+    clearTimeout(timer);
+    // 保險：確保沒有殘留子進程
+    if (proc.exitCode === undefined) killTree(proc.pid, isWin);
   }
 }
 
@@ -83,15 +144,15 @@ function toolGlob(pattern: string, cwd: string): ToolResult {
   }
 }
 
-function toolGrep(pattern: string, path: string, include?: string): ToolResult {
-  try {
-    const inc = include ? `--include="${include}"` : "";
-    const cmd = `grep -rn ${inc} "${pattern}" "${path}" 2>/dev/null | head -100`;
-    const out = execSync(cmd, { encoding: "utf-8", timeout: 10000 });
-    return { ok: true, output: out || "(no matches)" };
-  } catch (e: any) {
-    return { ok: false, output: "", error: e.message };
-  }
+async function toolGrep(
+  pattern: string,
+  path: string,
+  include?: string,
+): Promise<ToolResult> {
+  const cmd = `grep -rn ${include ? `--include="${include}"` : ""} "${pattern}" "${path}" 2>/dev/null | head -100`;
+  const r = await execBash(cmd, 10000);
+  if (!r.ok && !r.output) return r;
+  return { ok: true, output: r.output || "(no matches)" };
 }
 
 // ── Conversation history context ──
@@ -152,7 +213,7 @@ export async function runTool(
       const cmd = call.args.command || call.args.cmd || "";
       if (!cmd) return { ok: false, output: "", error: "no command" };
       const timeout = parseInt(call.args.timeout || "30000", 10);
-      return execBash(cmd, timeout);
+      return await execBash(cmd, timeout);
     }
     case "read": {
       const fp = call.args.filePath || call.args.path || "";
@@ -188,7 +249,7 @@ export async function runTool(
       const path = call.args.path || call.args.dir || ".";
       const include = call.args.include || "";
       if (!pattern) return { ok: false, output: "", error: "no pattern" };
-      return toolGrep(pattern, resolve(path), include);
+      return await toolGrep(pattern, resolve(path), include);
     }
     case "history": {
       if (!conv || !sessionId)

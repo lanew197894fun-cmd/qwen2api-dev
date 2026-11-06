@@ -12,11 +12,11 @@ import {
   unlinkSync,
 } from "fs";
 import { resolve } from "path";
-import type { MemStore } from "./store";
-import type { ApiError, RecallResult, StoreResult } from "./types";
-import type { Role } from "./types/push";
-import { webSearch, webFetch, summarizeWithQwen } from "./websearch";
-import { ConversationStore } from "./conversation-store";
+import type { MemStore } from "./store.ts";
+import type { ApiError, RecallResult, StoreResult } from "./types.ts";
+import type { Role } from "./types/push.ts";
+import { webSearch, webFetch, summarizeWithQwen } from "./websearch.ts";
+import { ConversationStore } from "./conversation-store.ts";
 
 export interface ApiConfig {
   port: number;
@@ -27,11 +27,16 @@ export interface ApiConfig {
   lessonPath?: string;
   opencodeRoot?: string;
   onPullRequest?: (peerUrl: string) => Promise<void>;
+  /** 啟動完成前回 503，讓 start.mjs 等到真正就緒才印健康報告 */
+  readyRef?: { current: boolean };
 }
 
 // ── 本地 IP 集合（用於跳過 rate limit） ──
 
 const LOCAL_IPS = new Set<string>(["127.0.0.1", "::1", "unknown"]);
+
+// ═══ 追蹤已知 peer 連線（首次推送時顯示🎉）═══
+const _knownPeers = new Set<string>();
 
 function initLocalIPs(): void {
   try {
@@ -185,11 +190,12 @@ export function startApi(cfg: ApiConfig) {
             return json({ error: "question required (max 2000 chars)" }, 400);
           const q = body.question as string;
 
-          // 1. 記憶搜尋
-          const entries = await store.searchByModel(q, 5);
+          // 1. 記憶搜尋（純本地關鍵字檢索 — 背景上下文不需模型評分）
+          const entries = await store.recall(q, 5);
           const mem = entries.entries
             .map(
-              (e, i) => `[${i + 1}] ${e.summary} (${e.category}, ${e.score}%)`,
+              (e, i) =>
+                `[${i + 1}] ${e.summary} (${e.category}, ${(e.score * 100).toFixed(0)}%)`,
             )
             .join("\n");
 
@@ -371,6 +377,9 @@ export function startApi(cfg: ApiConfig) {
 
         // ── Health ──
         if (method === "GET" && path === "/api/health") {
+          // 啟動未完成前回 503，讓 launcher 等到真正就緒
+          if (cfg.readyRef && !cfg.readyRef.current)
+            return json({ status: "starting", mode: cfg.role }, 503);
           const stats = await store.stats();
           return json({
             status: "ok",
@@ -449,11 +458,42 @@ export function startApi(cfg: ApiConfig) {
           return json({ entries, total: entries.length });
         }
 
-        // ── Push memory entry (from peer) ──
+        // ── Push memory entry (from peer) with idempotency check ──
         if (method === "POST" && path === "/api/push/memory") {
           const body = (await req.json()) as Record<string, unknown>;
           if (!validStr(body.summary, 1000))
             return json({ error: "summary required" }, 400);
+
+          // ═══ 首次收到 peer 推送 → 顯示🎉連線確認 ═══
+          const _peerId = (body as any)._peer || "";
+          if (_peerId && !_knownPeers.has(_peerId)) {
+            _knownPeers.add(_peerId);
+            console.log(
+              `🎉🎉🎉 主力機收到來自「${_peerId}」的首次推送！跨裝置連接成功！🎉🎉🎉`,
+            );
+          }
+
+          // P0 修復：冪等性檢查 - 若提供 id 則檢查是否已存在
+          const providedId = body.id as string | undefined;
+          if (providedId) {
+            try {
+              const existing = await store.recallById(providedId);
+              if (existing) {
+                console.log(`[api] 記憶 ${providedId} 已存在，跳過重複推送`);
+                return json({
+                  id: providedId,
+                  skipped: true,
+                  peer: (body as any)._peer || "unknown",
+                });
+              }
+            } catch (e) {
+              // recallById 失敗（如檔案不存在）視為可寫入
+              console.debug(
+                `[api] 檢查 ${providedId} 時發生錯誤: ${(e as Error).message}`,
+              );
+            }
+          }
+
           const result = await store.store(body.summary as string, {
             category: body.category as string | undefined,
             importance: body.importance as number | undefined,

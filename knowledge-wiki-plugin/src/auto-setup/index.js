@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, symlinkSync, realpathSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, totalmem } from "node:os";
 import { readFile, writeFile } from "node:fs/promises";
+import { OPENCODE_DIR } from "../../../config/paths.js";
 
 const PKG_ROOT = dirname(new URL(import.meta.url).pathname);
 const PLUGIN_ROOT = join(PKG_ROOT, "..", "..");
@@ -24,7 +25,7 @@ const SYS_NM = join(
 );
 const SHARED_DEPS = ["@opencode-ai/plugin", "zod"];
 
-const CONFIG_PATH = join(homedir(), ".opencode", "config.json");
+const CONFIG_PATH = join(OPENCODE_DIR, "config.json");
 
 const PLUGIN_CFG = {
   "knowledge-wiki-plugin": {

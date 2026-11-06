@@ -100,111 +100,81 @@ const getRamInfo = () => {
   const totalGB = total / 1024 / 1024 / 1024;
   const freeGB = free / 1024 / 1024 / 1024;
   let s = 0;
-  // 針對入門級筆電優化：8GB 以下嚴格限制
-  if (totalGB >= 32) s = 4;
-  else if (totalGB >= 16) s = 3;
-  else if (totalGB >= 8)
-    s = 1; // 8GB 僅給 1 分，避免誤判為 medium
-  else s = 0; // <8GB 直接 0 分
-
-  // 可用記憶體權重加大
-  if (freeGB >= 8) s += 2;
-  else if (freeGB >= 4) s += 1;
-  else if (freeGB < 1.5) s -= 2; // 可用 <1.5GB 嚴重扣分
-
+  if (totalGB >= 16) s = 3;
+  else if (totalGB >= 8) s = 2;
+  else if (totalGB >= 4) s = 1;
+  if (freeGB >= 4) s += 1;
   return {
     totalGB: +totalGB.toFixed(1),
     freeGB: +freeGB.toFixed(1),
-    score: Math.max(0, Math.min(5, s)),
+    score: Math.max(0, Math.min(4, s)),
   };
 };
 
 // ─── GPU（跨平台） ───
 const getGpuInfo = () => {
   let gpu = null;
-  let score = 0;
-
-  // 1) nvidia-smi 最可靠（名稱 + VRAM 一次完成）
   try {
-    const out = execSync(
-      "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>nul",
-      { timeout: 3000, encoding: "utf8" },
-    );
-    const parts = (out.trim().split("\n")[0] || "").split(",");
-    if (parts.length >= 2) {
-      gpu = parts[0].trim();
-      const mem = parseInt(parts[1].trim());
-      if (mem >= 4096) score = 3;
-      else if (mem >= 2048) score = 2;
-      else score = 1;
+    if (isWin) {
+      const out = execSync(
+        "wmic path win32_VideoController get name /format:csv 2>nul",
+        { timeout: 3000, encoding: "utf8" },
+      );
+      for (const line of out.split("\n")) {
+        if (
+          line.includes("NVIDIA") ||
+          line.includes("AMD") ||
+          line.includes("Intel") ||
+          line.includes("Microsoft")
+        ) {
+          gpu = line.replace(/^[^,]*,/, "").trim();
+          if (gpu && !gpu.includes("Microsoft")) break;
+        }
+      }
+    } else if (process.platform === "darwin") {
+      // macOS: system_profiler
+      const model = detectGpuMac();
+      if (model) gpu = model;
+    } else {
+      // Linux: lspci
+      const out = execSync("lspci 2>/dev/null | grep -iE 'vga|3d|display'", {
+        timeout: 3000,
+        encoding: "utf8",
+      });
+      for (const line of out.trim().split("\n").filter(Boolean)) {
+        if (
+          line.includes("NVIDIA") ||
+          line.includes("AMD") ||
+          line.includes("Intel")
+        ) {
+          gpu = line.replace(/^\S+\s+/, "").trim();
+          break;
+        }
+      }
     }
-  } catch {
-    /* fall through */
-  }
-
-  // 2) 若 nvidia-smi 沒抓到，用 PowerShell（比 wmic 可靠）
-  if (!gpu) {
+  } catch {}
+  let s = 0;
+  if (gpu?.includes("NVIDIA")) {
     try {
-      if (isWin) {
-        const out = execSync(
-          'powershell -NoProfile -Command "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name" 2>nul',
-          { timeout: 5000, encoding: "utf8" },
-        );
-        for (const line of out.trim().split("\n").filter(Boolean)) {
-          if (
-            line.includes("NVIDIA") ||
-            line.includes("AMD") ||
-            line.includes("Intel")
-          ) {
-            gpu = line.trim();
-            break;
-          }
-        }
-      } else if (process.platform === "darwin") {
-        const model = detectGpuMac();
-        if (model) gpu = model;
-      } else {
-        const out = execSync("lspci 2>/dev/null | grep -iE 'vga|3d|display'", {
-          timeout: 3000,
-          encoding: "utf8",
-        });
-        for (const line of out.trim().split("\n").filter(Boolean)) {
-          if (
-            line.includes("NVIDIA") ||
-            line.includes("AMD") ||
-            line.includes("Intel")
-          ) {
-            gpu = line.replace(/^\S+\s+/, "").trim();
-            break;
-          }
-        }
-      }
+      const nvidia = execSync(
+        isWin
+          ? "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits"
+          : "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null",
+        { timeout: 3000, encoding: "utf8" },
+      );
+      const mem = parseInt(nvidia.trim());
+      if (mem >= 4096) s = 3;
+      else if (mem >= 2048) s = 2;
+      else s = 1;
     } catch {
-      /* fall through */
+      s = 1;
     }
-
-    // 3) 如果 PowerShell / lspci 抓到 NVIDIA，順便查 VRAM
-    if (gpu?.includes("NVIDIA")) {
-      try {
-        const nvidia = execSync(
-          "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>nul",
-          { timeout: 3000, encoding: "utf8" },
-        );
-        const mem = parseInt(nvidia.trim());
-        if (mem >= 4096) score = 3;
-        else if (mem >= 2048) score = 2;
-        else score = 1;
-      } catch {
-        score = 1;
-      }
-    } else if (gpu?.includes("AMD")) {
-      score = 2;
-    } else if (gpu?.includes("Intel")) {
-      score = 1;
-    }
+  } else if (gpu?.includes("AMD")) {
+    s = 2;
+  } else if (gpu?.includes("Intel")) {
+    s = 1;
   }
-
-  return { model: gpu || "無獨立 GPU", score };
+  return { model: gpu || "無獨立 GPU", score: s };
 };
 
 // ─── 系統負載（跨平台） ───

@@ -10,11 +10,8 @@
  * 適用於：ChatGPT Web（session token / access token）、Claude Web 等。
  */
 
-const log = {
-  info: (...a) => console.log("[auth:cookie]", ...a),
-  warn: (...a) => console.warn("[auth:cookie]", ...a),
-  error: (...a) => console.error("[auth:cookie]", ...a),
-};
+import { makeLogger } from "../../color.js";
+const log = makeLogger("auth:cookie", "success");
 
 export function createCookieAuth(cfg) {
   const mode = cfg.mode || "sessionToken"; // sessionToken | cookieString | login

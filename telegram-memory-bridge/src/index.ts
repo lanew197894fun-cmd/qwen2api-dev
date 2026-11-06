@@ -7,12 +7,37 @@ import { fileURLToPath } from "url";
 import { platform } from "os";
 import { readFileSync, existsSync } from "fs";
 import { spawn } from "child_process";
-import { decrypt } from "./encryption";
-import { acquireLock } from "./lock";
-import type { PlatformState, Role } from "./types/push";
+import { decrypt } from "./encryption.ts";
+import { acquireLock } from "./lock.ts";
+import { startMonitoring } from "./governor.ts";
+import type { PlatformState, Role } from "./types/push.ts";
+// 使用集中管理的跨裝置路徑
+import {
+  OPENCODE_DIR,
+  MEMORY_DIR,
+  KNOWLEDGE_DIR,
+  WIKI_DIR,
+  LESSON_DIR,
+} from "../../config/paths.js";
 
 const IS_WIN = platform() === "win32";
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// 啟動完成旗標：health endpoint 在橋接器完全就緒前回 503
+const readyRef = { current: false };
+
+// 父行程心跳檢測：每 5 秒檢查 ppid 是否仍存活
+// 若父行程死亡（終端機關閉、crash），子行程立即自盡，防止孤兒推送
+{
+  const PPID = process.ppid;
+  setInterval(() => {
+    try {
+      process.kill(PPID, 0);
+    } catch {
+      process.exit(0);
+    }
+  }, 5000);
+}
 
 // ── Config ──
 
@@ -44,10 +69,12 @@ function loadPeers(): string[] {
   }
 }
 
-async function execAsync(cmd: string, timeoutMs = 3000): Promise<string> {
+async function execAsync(cmd: string, timeoutMs = 5000): Promise<string> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      proc.kill("SIGKILL");
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
       reject(new Error(`Timeout after ${timeoutMs}ms`));
     }, timeoutMs);
 
@@ -85,11 +112,9 @@ async function getLocalTailscaleIP(): Promise<string> {
 
 function loadConfig(): Config {
   let envToken = process.env.TELEGRAM_BOT_TOKEN || "";
+
   if (!process.env.ENCRYPTION_KEY) {
-    const kp = resolve(
-      process.env.HOME || process.env.USERPROFILE || "",
-      ".opencode/encryption.key",
-    );
+    const kp = resolve(OPENCODE_DIR, "encryption.key");
     if (existsSync(kp))
       process.env.ENCRYPTION_KEY = readFileSync(kp, "utf-8").trim();
   }
@@ -98,52 +123,37 @@ function loadConfig(): Config {
   return {
     token: envToken,
     apiPort: parseInt(process.env.API_PORT || "4377", 10),
-    memoryPath: resolve(
-      __dirname,
-      process.env.MEMORY_PATH || "../../../../.opencode/memory",
-    ),
-    knowledgePath: resolve(
-      __dirname,
-      process.env.KNOWLEDGE_PATH || "../../../../.opencode/knowledge",
-    ),
-    wikiPath: resolve(
-      __dirname,
-      process.env.WIKI_PATH || "../../../../.opencode/wiki",
-    ),
-    lessonPath: resolve(
-      __dirname,
-      process.env.LESSON_PATH || "../../../../.opencode/lesson-learned",
-    ),
-    opencodeRoot: resolve(
-      __dirname,
-      process.env.OPENCODE_ROOT || "../../../../.opencode",
-    ),
+    memoryPath: process.env.MEMORY_PATH || MEMORY_DIR,
+    knowledgePath: process.env.KNOWLEDGE_PATH || KNOWLEDGE_DIR,
+    wikiPath: process.env.WIKI_PATH || WIKI_DIR,
+    lessonPath: process.env.LESSON_PATH || LESSON_DIR,
+    opencodeRoot: OPENCODE_DIR,
     qwenModel: process.env.QWEN_MODEL || "Qwen3.6-Max-Preview",
   };
 }
 
-// ── 角色偵測（不呼叫 detect，避免開局載入硬體偵測） ──
+// ── 角色偵測（使用 device-config 抽象層） ──
 
-async function detectRole(cfg: Config): Promise<PlatformState> {
-  const localIP = await getLocalTailscaleIP();
-  const peers = loadPeers();
-  const hasMasterIP = !!process.env.MASTER_IP;
+import { detectDevice, type DeviceConfig } from "./device-config.ts";
+
+async function detectRole(
+  cfg: Config,
+): Promise<PlatformState & { deviceCfg: DeviceConfig }> {
+  const deviceCfg = await detectDevice(
+    cfg.token,
+    process.env.MASTER_IP,
+    process.env.PEERS || loadPeers().join(","),
+    cfg.opencodeRoot,
+  );
+
   return {
-    tailscale: localIP.length > 0,
-    hasPeers: peers.length > 0,
+    tailscale: !!deviceCfg.tailscaleIP,
+    hasPeers: deviceCfg.peers.length > 0,
     hasToken: cfg.token.length > 0,
-    role:
-      cfg.token && localIP && peers.length
-        ? "master"
-        : hasMasterIP && cfg.token && peers.length && !localIP
-          ? "peer" // TAILSCALE_WATCH=off + MASTER_IP → 跳過 ts 掃描直接推送
-          : cfg.token
-            ? "standalone"
-            : localIP && peers.length
-              ? "peer"
-              : "standalone",
-    localIP,
-    peers,
+    role: deviceCfg.role as Role,
+    localIP: deviceCfg.tailscaleIP || "",
+    peers: deviceCfg.peers,
+    deviceCfg,
   };
 }
 
@@ -160,13 +170,21 @@ async function main() {
     `[role] ${lbl} — ${state.hasToken ? "有 Token" : "無 Token"}, ${state.tailscale ? "🌐 Tailscale" : "🚫 無 TS"}, ${state.hasPeers ? `📡 ${state.peers.length}P` : "📡 無 P"}`,
   );
 
-  // standalone: 無作用及早退出
-  if (state.role === "standalone" && !state.hasToken) {
-    if (!state.tailscale) console.log("🌐 Tailscale 未連線 → 推送平台隱藏");
-    else if (!state.hasPeers) console.log("📡 無 peer 設定 → 推送平台隱藏");
+  // standalone: 無作用及早退出（僅在無 Token 且無 Tailscale 時）
+  if (state.role === "standalone" && !state.hasToken && !state.tailscale) {
+    console.log("🌐 Tailscale 未連線 → 推送平台隱藏");
     console.log("❌ 無 Token 也無平台，無作用可執行，退出");
     process.exit(0);
   }
+
+  // 🐛 FIX: Peer 模式但無 Peers 列表 → 嘗試自動偵測 Master
+  if (state.role === "peer" && !state.hasPeers && state.tailscale) {
+    console.log("📡 Peer 模式但無 Peers 列表，嘗試自動偵測 Master...");
+    // 不退出，讓 startPeer 的 checkAndStart 邏輯處理偵測
+  }
+
+  // ── 啟動 Governor 主動監控（P0 修復） ──
+  startMonitoring(10_000); // 每 10 秒採集指標
 
   // ── MemStore（所有模式都需要，但 peer 只啟用輕量 API） ──
   const { MemStore } = await import("./store");
@@ -196,6 +214,7 @@ async function main() {
     opencodeRoot: cfg.opencodeRoot,
     onPullRequest: (peerUrl) =>
       _pullHandler ? _pullHandler(peerUrl) : Promise.resolve(),
+    readyRef,
   });
   console.log(`🌐 API: http://0.0.0.0:${cfg.apiPort}/api/health (tailnet)`);
 
@@ -204,13 +223,13 @@ async function main() {
     await startMaster(cfg, store, state, (fn) => {
       _pullHandler = fn;
     });
+    readyRef.current = true;
+    console.log("\n✅ 系統就緒");
   }
   // ── peer 模式：fs.watch + push sender ──
   else if (state.role === "peer") {
     await startPeer(cfg, state);
   }
-
-  console.log("\n✅ 系統就緒");
 }
 
 // ── master 啟動（dynamic import，不佔 peer 記憶體） ──
@@ -276,7 +295,12 @@ async function startMaster(
   });
 
   // 初始化知識工具（knowledge/wiki/lesson 功能）
-  await initKnowledgeTools(__dirname, cfg.knowledgePath, cfg.wikiPath);
+  await initKnowledgeTools(
+    __dirname,
+    cfg.knowledgePath,
+    cfg.wikiPath,
+    cfg.lessonPath,
+  );
   console.log("📚 知識工具已就緒（knowledge/wiki/lesson）");
 
   await bot.start(hw.pollIntervalMs);
@@ -341,21 +365,46 @@ async function startPeer(cfg: Config, state: PlatformState) {
       memoryRoot: cfg.memoryPath,
       knowledgeRoot: cfg.knowledgePath,
       wikiRoot: cfg.wikiPath,
+      lessonRoot: cfg.lessonPath,
     });
     console.log(`[peer] 📤 推送中 → ${peerUrl}`);
-    // 不跑 tailscale 輪詢，純輕量推送
     return;
   }
 
   // 節點模式：持續偵測遠端主機角色，僅在確認 Master 在線時啟動推送
-  // 避免雙向推送衝突（兩個 Peer 互相推送造成無限循環）
   const selfHostname = require("os").hostname();
   let _watchStopped = false;
   let _stopWatch: (() => void) | null = null;
+  let retryCount = 0;
+  const maxRetries = 10;
 
   const checkAndStart = async () => {
     let foundMaster = false;
-    for (const p of state.peers) {
+    let masterUrl = "";
+    const peersToCheck = state.peers.length > 0 ? [...state.peers] : [];
+
+    if (peersToCheck.length === 0 && state.tailscale) {
+      console.log("[peer] 📡 Peers 列表為空，嘗試自動掃描 Tailscale 網路...");
+      try {
+        const out = await execAsync("tailscale status --json", 3000);
+        const data = JSON.parse(out) as Record<string, unknown>;
+        const peerList = data.Peer as
+          | Record<string, Record<string, unknown>>
+          | undefined;
+        if (peerList) {
+          for (const [, val] of Object.entries(peerList)) {
+            const ip = (val.TailscaleIPs as string[])?.[0];
+            if (ip && ip !== state.localIP) {
+              peersToCheck.push(`http://${ip}:${cfg.apiPort}`);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`[peer] ⚠️ Tailscale 掃描失敗: ${(e as Error).message}`);
+      }
+    }
+
+    for (const p of peersToCheck) {
       try {
         const url = `${p.replace(/\/+$/, "")}/api/health`;
         const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -366,8 +415,10 @@ async function startPeer(cfg: Config, state: PlatformState) {
           body.hostname &&
           body.hostname !== selfHostname
         ) {
-          console.log(`[peer] ✅ 偵測到遠端 Master: ${body.hostname} (${p})`);
+          console.log(`[peer] 🎉✅ 偵測到遠端 Master: ${body.hostname} (${p})`);
+          console.log(`[peer] 🎉🎉🎉 連接成功！跨裝置同步就緒 🎉🎉🎉`);
           foundMaster = true;
+          masterUrl = p;
           break;
         } else if (body.mode === "peer") {
           console.warn(
@@ -380,20 +431,19 @@ async function startPeer(cfg: Config, state: PlatformState) {
     }
 
     if (!foundMaster) {
-      console.log("[peer] 🔄 未偵測到 Master，60 秒後重試...");
+      retryCount++;
+      if (retryCount >= maxRetries) {
+        console.error(`[peer] ❌ 達到最大重試次數 (${maxRetries})，停止偵測`);
+        return;
+      }
+      console.log(
+        `[peer] 🔄 未偵測到 Master，60 秒後重試... (${retryCount}/${maxRetries})`,
+      );
       setTimeout(checkAndStart, 60_000);
       return;
     }
-
-    // 過濾掉本機 IP
-    const targets = state.peers.filter(
-      (p) =>
-        p.replace(/^https?:\/\//, "").replace(/:\d+$/, "") !== state.localIP,
-    );
-    if (!targets.length) {
-      console.log("[peer] ⚠️ 無可推送目標，所有 peer 皆本機");
-      return;
-    }
+    retryCount = 0;
+    const targets = [masterUrl];
 
     console.log(`[peer] 🎯 推送目標: ${targets[0]}`);
     const { startWatchAndPush, stopWatchAndPush } = await import(
@@ -404,36 +454,36 @@ async function startPeer(cfg: Config, state: PlatformState) {
       memoryRoot: cfg.memoryPath,
       knowledgeRoot: cfg.knowledgePath,
       wikiRoot: cfg.wikiPath,
+      lessonRoot: cfg.lessonPath,
     });
     _stopWatch = stopWatchAndPush;
+    readyRef.current = true;
+    console.log("\n✅ 系統就緒\n");
 
-    // 定時重新確認 Master 狀態（每 5 分鐘），若 Master 離線則停止推送
     const healthTimer = setInterval(async () => {
       try {
         const url = `${targets[0].replace(/\/+$/, "")}/api/health`;
         const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
         if (!res.ok) throw new Error(`status ${res.status}`);
         const body = (await res.json()) as Record<string, unknown>;
-        if (body.mode === "master") return; // Master 仍在線，繼續推送
+        if (body.mode === "master") return;
         console.warn(
           `[peer] ⚠️ 遠端不再為 Master (mode=${body.mode})，停止推送`,
         );
       } catch {
         console.warn("[peer] ⚠️ Master 健康檢查失敗，停止推送");
       }
-      // Master 離線或角色變更 → 停止推送
       if (_stopWatch) {
         _stopWatch();
         _stopWatch = null;
       }
       clearInterval(healthTimer);
-      // 60 秒後重新偵測
       setTimeout(checkAndStart, 60_000);
     }, 300_000);
   };
 
-  // 啟動偵測循環
-  checkAndStart();
+  // 先掃再印 ✅ 系統就緒
+  await checkAndStart();
 
   process.on("SIGINT", () => {
     console.log("\n👋 關閉...");
@@ -637,6 +687,36 @@ function startTailscaleWatcher(
       } catch {}
     }, 120_000);
   })().catch(() => {});
+}
+
+// ── 全域例外防護 ──
+// 任何未捕捉的 rejection / 例外都不允許帶走整個 bot：
+// 單一指令（/run bash、上游空回覆…）失敗只能影響該次請求。
+let crash = 0;
+process.on("unhandledRejection", (reason) => {
+  crash++;
+  console.error(
+    `⚠️ [unhandledRejection #${crash}] ${reason instanceof Error ? reason.message : String(reason)}`,
+  );
+  if (reason instanceof Error && reason.stack) console.error(reason.stack);
+  decay();
+});
+process.on("uncaughtException", (err) => {
+  crash++;
+  console.error(`⚠️ [uncaughtException #${crash}] ${err.message}`);
+  console.error(err.stack || "");
+  // 連續 10 次才視為不可恢復（避免無限崩潰迴圈）
+  if (crash >= 10) {
+    console.error("❌ 例外過多無法恢復，退出");
+    process.exit(1);
+  }
+  decay();
+});
+
+function decay() {
+  setTimeout(() => {
+    crash = Math.max(0, crash - 1);
+  }, 60_000).unref();
 }
 
 main().catch((err) => {

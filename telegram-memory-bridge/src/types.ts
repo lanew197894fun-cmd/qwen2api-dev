@@ -31,6 +31,8 @@ export interface StoreResult {
   id: string;
   path: string;
   synced: boolean;
+  /** 內容重複而跳過寫入（冪等性命中） */
+  skipped?: boolean;
 }
 
 export interface RecallResult {

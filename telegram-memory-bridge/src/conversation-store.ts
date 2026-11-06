@@ -9,11 +9,9 @@ import { mkdir, readFile, writeFile, appendFile, readdir } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve } from "path";
 import { hostname } from "os";
+import { CONVERSATIONS_DIR } from "../../config/paths.js";
 
-const CONV_DIR = resolve(
-  process.env.HOME || process.env.USERPROFILE || "~",
-  ".opencode/conversations",
-);
+const CONV_DIR = CONVERSATIONS_DIR;
 
 export interface ConvMsg {
   role: "user" | "assistant" | "system" | "tool";
@@ -50,6 +48,8 @@ interface ConvIdx {
 }
 
 const DAY = 86_400_000;
+const TTL_DAYS = 30; // P1 修復：對話歷史保留 30 天
+const MAX_SESSIONS = 500; // P1 修復：最大 Session 數量限制
 
 export function makeSessionId(
   source: string,
@@ -394,6 +394,72 @@ export class ConversationStore {
     } catch (e) {
       console.error(`[conv] summarizeSession 失敗:`, (e as Error).message);
       return null;
+    }
+  }
+
+  /** P1 修復：清理過期對話歷史（TTL + 最大數量限制） */
+  async cleanup(): Promise<{ removed: number; reason: string[] }> {
+    const idx = await this.loadIdx();
+    const now = Date.now();
+    const cutoff = now - TTL_DAYS * DAY;
+    const reason: string[] = [];
+    let removed = 0;
+
+    // 1. 清理超過 TTL 的 session
+    const expiredIds: string[] = [];
+    for (const [id, s] of Object.entries(idx)) {
+      const lastTs = new Date(s.lastTs).getTime();
+      if (lastTs < cutoff) {
+        expiredIds.push(id);
+      }
+    }
+
+    if (expiredIds.length > 0) {
+      reason.push(`TTL 過期 (${TTL_DAYS}天): ${expiredIds.length} 個 session`);
+      for (const id of expiredIds) {
+        delete idx[id];
+        removed++;
+        // 刪除實體檔案（非同步，不阻塞）
+        this._deleteSessionFiles(id).catch(() => {});
+      }
+    }
+
+    // 2. 若仍超過最大數量，依時間刪除最舊的
+    const sessions = Object.values(idx).sort((a, b) =>
+      a.lastTs.localeCompare(b.lastTs),
+    );
+    if (sessions.length > MAX_SESSIONS) {
+      const toRemove = sessions.slice(0, sessions.length - MAX_SESSIONS);
+      reason.push(
+        `超過最大數量 (${MAX_SESSIONS}): 刪除 ${toRemove.length} 個最舊 session`,
+      );
+      for (const s of toRemove) {
+        delete idx[s.id];
+        removed++;
+        this._deleteSessionFiles(s.id).catch(() => {});
+      }
+    }
+
+    if (removed > 0) {
+      await this.saveIdx();
+      console.log(
+        `[conv] 清理完成: 移除 ${removed} 個 session (${reason.join(", ")})`,
+      );
+    }
+
+    return { removed, reason };
+  }
+
+  /** 輔助：刪除 session 相關檔案 */
+  private async _deleteSessionFiles(sessionId: string): Promise<void> {
+    try {
+      const sf = resolve(this.sessionDir, `${sessionId}.json`);
+      if (existsSync(sf)) await Bun.write(sf, ""); // 標記為空或刪除
+      // raw JSONL 檔案因按月分組，不單獨刪除（避免碎片化），由定期歸檔處理
+    } catch (e) {
+      console.debug(
+        `[conv] 刪除 ${sessionId} 檔案失敗: ${(e as Error).message}`,
+      );
     }
   }
 

@@ -12,7 +12,7 @@ import { join, basename, extname } from "node:path";
 
 const CACHE_TTL = 60_000;
 const DUPLICATE_TIMEOUT = 5_000;
-const MAX_FILES = 50;
+const MAX_FILES = 200; // Increased from 50 to improve duplicate detection coverage
 
 const DEFAULT_CATEGORIES: Record<string, string[]> = {
   "01-技術主題": ["技術", "架構", "設計", "最佳實踐", "pattern", "原理"],

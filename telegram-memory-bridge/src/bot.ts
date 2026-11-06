@@ -1,23 +1,27 @@
 // Telegram Memory Bridge — bot.ts
 // Telegram Bot 處理 — 使用原生 fetch，零依賴
 
-import type { MemStore } from "./store";
-import { IdleProcessor, type ProcessorPaths } from "./processor";
-import { suggest } from "./governor";
-import { webSearch, webFetch, summarizeWithQwen } from "./websearch";
-import { OrgEngine, type OrgPaths } from "./organizer";
+import type { MemStore } from "./store.ts";
+import { IdleProcessor, type ProcessorPaths } from "./processor.ts";
+import { suggest } from "./governor.ts";
+import { webSearch, webFetch, summarizeWithQwen } from "./websearch.ts";
+import { OrgEngine, type OrgPaths } from "./organizer.ts";
 import {
   ConversationStore,
   makeSessionId,
   type ConvSessionSummary,
-} from "./conversation-store";
+} from "./conversation-store.ts";
 import {
   runTool,
   parseToolCommand,
   getRecentConversationContext,
-} from "./tools";
-import { initKnowledgeTools } from "./knowledge-tools";
-import { searchDir } from "./api";
+} from "./tools.ts";
+import { initKnowledgeTools } from "./knowledge-tools.ts";
+import { analyzeForLearning, executeLearning } from "./auto-learning.ts";
+import { searchDir } from "./api.ts";
+import { readFile, writeFile } from "fs/promises";
+import { existsSync } from "fs";
+import { resolve } from "path";
 
 const TG_API = "https://api.telegram.org";
 
@@ -56,6 +60,9 @@ export class TelegramBot {
   private baseInterval = 2000;
   private maxInterval = 30_000;
   private curInterval = 2000;
+  // 追蹤連續 upstream 失敗次數，用於動態調整輪詢頻率
+  private upstreamFailCount = 0;
+  private upstreamFailMax = 5; // 連續 5 次失敗才啟動重大退避
   private emptyCount = 0;
   private idle = false;
   private processor: IdleProcessor | null = null;
@@ -71,6 +78,8 @@ export class TelegramBot {
   private knowledgePath = "";
   private wikiPath = "";
   private lessonPath = "";
+  private offsetPath = "";
+  private processedIds = new Set<string>();
 
   constructor(cfg: BotConfig) {
     this.token = cfg.token;
@@ -79,6 +88,12 @@ export class TelegramBot {
     this.knowledgePath = cfg.knowledgePath || "";
     this.wikiPath = cfg.wikiPath || "";
     this.lessonPath = cfg.lessonPath || "";
+    // Offset 持久化路徑：與 store 同目錄
+    this.offsetPath = resolve(
+      this.store.entriesDirPath,
+      "..",
+      ".telegram_offset",
+    );
     this.conv = new ConversationStore(undefined, (prompt) =>
       this.store.qwenAsk("", prompt),
     );
@@ -93,6 +108,51 @@ export class TelegramBot {
       );
   }
 
+  // ── Offset 持久化 ──
+
+  private async loadOffset(): Promise<void> {
+    try {
+      if (existsSync(this.offsetPath)) {
+        const raw = await readFile(this.offsetPath, "utf-8");
+        const parsed = parseInt(raw.trim(), 10);
+        if (!isNaN(parsed)) {
+          this.offset = parsed;
+          console.log(`[bot] 載入 offset: ${this.offset}`);
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[bot] 載入 offset 失敗，從 0 開始: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private async saveOffset(): Promise<void> {
+    try {
+      await writeFile(this.offsetPath, String(this.offset), "utf-8");
+    } catch (err) {
+      console.error(`[bot] 儲存 offset 失敗: ${(err as Error).message}`);
+    }
+  }
+
+  // ── 冪等性檢查 ──
+
+  private isProcessed(updateId: number): boolean {
+    const key = `u-${updateId}`;
+    if (this.processedIds.has(key)) return true;
+    return false;
+  }
+
+  private markProcessed(updateId: number): void {
+    const key = `u-${updateId}`;
+    this.processedIds.add(key);
+    // 限制記憶體使用：保留最近 1000 筆
+    if (this.processedIds.size > 1000) {
+      const first = this.processedIds.values().next().value;
+      if (first) this.processedIds.delete(first);
+    }
+  }
+
   getChatId(): number {
     return this.chatId;
   }
@@ -104,7 +164,10 @@ export class TelegramBot {
     this.baseInterval = pollIntervalMs;
     this.curInterval = pollIntervalMs;
     this.running = true;
-    console.log(`[telegram-memory] Bot 啟動 (base=${this.baseInterval}ms)`);
+    await this.loadOffset(); // 載入持久化 offset
+    console.log(
+      `[telegram-memory] Bot 啟動 (base=${this.baseInterval}ms, offset=${this.offset})`,
+    );
     this.scheduleNext();
   }
 
@@ -180,13 +243,23 @@ export class TelegramBot {
         Array.isArray(updates?.result) &&
         updates.result.length > 0;
       if (hasUpdates) {
+        let maxUpdateId = this.offset;
         for (const u of updates.result as TgUpdate[]) {
-          this.offset = u.update_id + 1;
+          // 冪等性檢查：跳過已處理的 update
+          if (this.isProcessed(u.update_id)) {
+            console.log(`[bot] 跳過已處理 update: ${u.update_id}`);
+            continue;
+          }
+          this.markProcessed(u.update_id);
+          maxUpdateId = Math.max(maxUpdateId, u.update_id + 1);
           // ⚡ 非同步處理，避免阻塞輪詢迴圈
           this.handleUpdate(u).catch((err) => {
             console.error("[bot] handleUpdate error:", (err as Error).message);
           });
         }
+        // 更新 offset 並持久化
+        this.offset = maxUpdateId;
+        await this.saveOffset();
         // 有訊息 → 恢復活躍
         this.emptyCount = 0;
         if (this.idle) {
@@ -219,14 +292,35 @@ export class TelegramBot {
       }
     } catch (err) {
       this.pollErrCount++;
-      const backoff = Math.min(
-        this.baseInterval * Math.pow(2, Math.min(this.pollErrCount, 5)),
-        this.maxPollErrBackoff,
-      );
-      this.curInterval = Math.max(this.curInterval, backoff);
-      console.error(
-        `[telegram-memory] Poll error #${this.pollErrCount}: ${(err as Error).message} (backoff ${this.curInterval}ms)`,
-      );
+      // 追蹤 upstream 連續失敗次數
+      const errMsg = (err as Error).message;
+      if (
+        errMsg.includes("upstream") ||
+        errMsg.includes("上游") ||
+        errMsg.includes("connection") ||
+        errMsg.includes("ECONNRESET")
+      ) {
+        this.upstreamFailCount++;
+        console.error(
+          `[telegram-memory] Poll error #${this.pollErrCount} (upstream #${this.upstreamFailCount}): ${errMsg} (backoff ${this.curInterval}ms)`,
+        );
+        // 連續失敗次數達上限，啟動強制退避
+        if (this.upstreamFailCount >= this.upstreamFailMax) {
+          const forcedBackoff = Math.min(
+            this.baseInterval * 8,
+            this.maxInterval,
+          );
+          if (forcedBackoff !== this.curInterval) {
+            this.curInterval = forcedBackoff;
+            console.log(
+              `[telegram-memory] 💤 強制待命 ${this.curInterval}ms (upstream 問題 ${this.upstreamFailCount} 次)`,
+            );
+          }
+          this.upstreamFailCount = this.upstreamFailMax; // 避免無限累積
+        }
+      } else {
+        this.upstreamFailCount = 0; // 非 upstream 錯誤，重置計數
+      }
       this.scheduleNext();
       return; // skip governor/logic below, just retry later
     }
@@ -292,7 +386,10 @@ export class TelegramBot {
       case "/remember":
       case "/save":
         if (!argStr) {
-          await this.reply(msg, "用法: /remember <內容>\n儲存一則記憶");
+          await this.reply(
+            msg,
+            "📝 想記住什麼？直接傳訊息給我，或輸入 `/remember <內容>`",
+          );
           return;
         }
         await this.doCmdRemember(argStr, msg);
@@ -300,7 +397,10 @@ export class TelegramBot {
 
       case "/ask":
         if (!argStr) {
-          await this.reply(msg, "用法: /ask <問題>\nAI 根據記憶回答問題");
+          await this.reply(
+            msg,
+            "🤔 想問什麼？直接輸入 `/ask <你的問題>`，我會幫你找答案！",
+          );
           return;
         }
         await this.doCmdAsk(argStr, msg);
@@ -309,7 +409,10 @@ export class TelegramBot {
       case "/recall":
       case "/search":
         if (!argStr) {
-          await this.reply(msg, "用法: /recall <關鍵字>\n搜尋記憶");
+          await this.reply(
+            msg,
+            "🔍 想找什麼？輸入 `/recall <關鍵字>`，我會幫你翻翻以前的紀錄。",
+          );
           return;
         }
         await this.doCmdRecall(argStr, msg);
@@ -331,7 +434,7 @@ export class TelegramBot {
         if (!argStr) {
           await this.reply(
             msg,
-            "用法: /run <工具> <參數>\n\n可用工具:\n`bash <指令>` — 執行 shell\n`read <路徑>` — 讀取檔案\n`write <路徑> | <內容>` — 寫入檔案\n`edit <路徑> | <舊字串> | <新字串>` — 編輯檔案\n`glob <模式> [目錄]` — 搜尋檔案\n`grep <模式> [目錄]` — 搜尋內容\n`history` — 查看當前對話歷史\n`skill <名稱> [參數]` — 調用技能（weather, summarize）\n\n範例: `/run bash ls -la`\n範例: `/run skill weather loc=Taipei`\n範例: `/run skill summarize url=https://example.com`",
+            "🛠️ *進階工具箱*\n\n我可以幫你執行一些操作，例如：\n• `/run bash ls` — 看看檔案列表\n• `/run skill weather loc=台北` — 查天氣\n• `/run skill summarize url=...` — 摘要網頁\n\n直接輸入 `/run <指令>` 試試看！",
           );
           return;
         }
@@ -341,7 +444,10 @@ export class TelegramBot {
       case "/websearch":
       case "/google":
         if (!argStr) {
-          await this.reply(msg, "用法: /websearch <查詢>\n搜尋網路，回傳結果");
+          await this.reply(
+            msg,
+            "🌐 想查什麼最新資訊？輸入 `/websearch <關鍵字>`，我會幫你上網找找。",
+          );
           return;
         }
         await this.doCmdWebSearch(argStr, msg);
@@ -358,7 +464,10 @@ export class TelegramBot {
       case "/webfetch":
       case "/fetch":
         if (!argStr) {
-          await this.reply(msg, "用法: /webfetch <網址>\n擷取網頁內容");
+          await this.reply(
+            msg,
+            "📄 想讀哪篇文章？輸入 `/webfetch <網址>`，我會幫你抓下來並摘要。",
+          );
           return;
         }
         await this.doCmdWebFetch(argStr, msg);
@@ -371,6 +480,21 @@ export class TelegramBot {
       case "/status":
       case "/summary":
         await this.doCmdStatus(msg);
+        break;
+
+      case "/health":
+        await this.doCmdHealth(msg);
+        break;
+
+      case "/speed":
+        if (!argStr) {
+          await this.reply(
+            msg,
+            "⚡ *速度控制*\n\n可用選項：\n• `/speed fast` — 快速回應（高資源消耗）\n• `/speed normal` — 標準模式（推薦）\n• `/speed slow` — 省電模式（低資源消耗）",
+          );
+          return;
+        }
+        await this.doCmdSpeed(argStr, msg);
         break;
 
       case "/sync":
@@ -388,31 +512,29 @@ export class TelegramBot {
         await this.reply(
           msg,
           [
-            "📖 *Telegram Memory Bridge 指令*",
+            "👋 *嗨！我是你的 AI 助手*",
             "",
-            "`/remember <內容>` — 儲存記憶",
-            "`/ask <問題>` — AI 根據記憶回答（語意搜尋）",
-            "`/recall <關鍵字>` — 搜尋記憶",
-            "`/list` — 列出所有記憶",
-            "`/stats` — 記憶統計",
-            "`/status` — 資料概況（記憶+知識庫+維基）",
-            "`/history` — 列出最近對話（加關鍵字可搜尋）",
-            "`/history summary <id>` — 顯示對話詳細摘要",
-            "`/history from=2026-06-01` — 依日期過濾",
-            "`/model` — 查看當前模型，`/model <名稱>` 切換",
-            "`/run <工具>` — 執行 opencode 工具（bash/read/write/edit/glob/grep/history/skill）",
-            "`/websearch <查詢>` — 搜尋網路（Brave Search，免 API Key）",
-            "`/webfetch <網址>` — 擷取網頁內容並摘要",
-            "`/organize` — 自動整理舊資料（記憶+知識庫）→ SOP",
-            "`/progress` — 查看整理進度",
-            "`/sync` — 觸發同步",
-            "`/help` — 顯示此說明",
+            "✨ *簡單用法*：",
+            "• 直接傳訊息給我，我會幫你記住重點",
+            "• 問我問題，我會從記憶中找答案",
             "",
-            "💡 直接傳送文字也會自動儲存為記憶（閒聊除外）",
-            "💡 `/websearch` 支援 AI 摘要搜尋結果",
-            "💡 `/run history` 查看當前對話歷史上下文",
-            "💡 `/run skill weather loc=台北` 查詢天氣",
-            "💡 `/run skill summarize url=...` 摘要網頁",
+            "📌 *常用指令*：",
+            "`/ask <問題>` — 問我任何事（我會查記憶）",
+            "`/remember <內容>` — 強制記住某件事",
+            "`/recall <關鍵字>` — 搜尋之前的記憶",
+            "`/websearch <關鍵字>` — 搜尋網路最新資訊",
+            "",
+            "🛠️ *進階功能*：",
+            "`/run bash <指令>` — 幫我執行命令",
+            "`/run skill weather loc=台北` — 查天氣",
+            "`/history` — 查看我們的對話紀錄",
+            "`/status` — 查看系統狀態",
+            "`/health` — 查看模型穩定度與硬體健康",
+            "`/speed <fast|normal|slow>` — 調整回應速度",
+            "",
+            "💡 *小提醒*：",
+            "• 不用死背指令，像跟朋友聊天一樣即可",
+            "• 遇到詐騙訊息我會主動警告你 ⚠️",
           ].join("\n"),
         );
         break;
@@ -430,7 +552,12 @@ export class TelegramBot {
   private async doCmdRemember(text: string, msg: TgMessage): Promise<void> {
     try {
       const result = await this.store.store(text);
-      await this.reply(msg, `✅ 已儲存記憶 \`${result.id}\``);
+      await this.reply(
+        msg,
+        result.skipped
+          ? `♻️ 記憶已存在 \`${result.id}\`（內容重複，已跳過）`
+          : `✅ 已儲存記憶 \`${result.id}\``,
+      );
       this.notifyWork(); // 有工作 → 觸發背景處理
     } catch (err) {
       await this.reply(msg, `❌ 儲存失敗: ${(err as Error).message}`);
@@ -465,7 +592,7 @@ export class TelegramBot {
             localResult.entries
               .map(
                 (e, i) =>
-                  `[${i + 1}] 摘要: ${e.summary}\n    分類: ${e.category} | 相關度: ${e.score}%`,
+                  `[${i + 1}] 摘要: ${e.summary}\n    分類: ${e.category} | 相關度: ${(e.score * 100).toFixed(0)}%`,
               )
               .join("\n\n"),
         );
@@ -484,9 +611,9 @@ export class TelegramBot {
               .join("\n\n"),
         );
       }
-      if (hasKnow) parts.push("📚 *相關知識庫*\n" + kHits.join("\n"));
-      if (hasWiki) parts.push("📖 *相關維基*\n" + wHits.join("\n"));
-      if (hasLess) parts.push("⚠️ *相關教訓*\n" + lHits.join("\n"));
+      if (hasKnow) parts.push("📚 *相關知識庫*\n" + kHits);
+      if (hasWiki) parts.push("📖 *相關維基*\n" + wHits);
+      if (hasLess) parts.push("⚠️ *相關教訓*\n" + lHits);
 
       const total =
         localResult.total +
@@ -844,6 +971,7 @@ export class TelegramBot {
         catStr || "  無",
         `重要性: 高${s.byImportance.high} / 中${s.byImportance.mid} / 低${s.byImportance.low}`,
         `最後同步: ${s.lastSync || "從未"}`,
+        `上游失敗次數: ${this.upstreamFailCount}`,
       ].join("\n"),
     );
   }
@@ -1010,36 +1138,68 @@ export class TelegramBot {
 
   // ── 呼叫 AI 回應（含對話歷史上下文） ──
 
-  private async askAI(text: string): Promise<string | null> {
+  private async askAI(text: string): Promise<string> {
     try {
-      // 先找相關記憶
-      const [related, convCtx] = await Promise.all([
-        this.store.searchByModel(text, 5),
-        getRecentConversationContext(
-          this.conv,
-          makeSessionId("telegram", this.chatId),
-          20,
-        ),
-      ]);
-      const memoryText = related.entries
-        .map((e, i) => `[${i + 1}] ${e.summary} (${e.category})`)
+      // 1. 取得對話上下文（最近 20 則，確保連貫性）
+      const sid = makeSessionId("telegram", this.chatId);
+      const convCtx = await getRecentConversationContext(this.conv, sid, 20);
+
+      // 2. 背景記憶（純本地檢索，零模型成本）
+      const memoryText = await this.store.contextMemories(text, 5);
+
+      // 3. 自動搜索（2026-10-25 新增）：自然語言問句含即時資訊意圖時，
+      //    先搜網路再把結果併入 system，讓「聊天」與「查資料」合為一條路徑，
+      //    使用者不必記指令。搜尋失敗不阻斷對話。
+      let liveText = "";
+      if (this.wantsLiveInfo(text)) {
+        try {
+          const results = await webSearch(text, 5);
+          if (results.length > 0) {
+            liveText = results
+              .map((r, i) => `[${i + 1}] ${r.title}\n${r.snippet}\n${r.url}`)
+              .join("\n\n");
+            console.log(`[bot:askAI] 🔍 自動搜索 ${results.length} 筆`);
+          }
+        } catch (e) {
+          console.warn(`[bot:askAI] 自動搜索失敗: ${(e as Error).message}`);
+        }
+      }
+
+      // 4. 建構具備「認知與連貫能力」的 System Prompt
+      const system = [
+        "你是一位具備高度認知能力與同理心的 AI 夥伴。",
+        "",
+        "【核心原則】",
+        "1. **深度理解**：不要只回應字面意思，要思考用戶背後的意圖、情緒與潛在需求。",
+        "2. **對話連貫**：嚴格參考下方的『對話歷史』。如果用戶的問題是上一句的延伸，請直接接續話題，不要重複詢問或斷裂。",
+        "3. **自然語氣**：像朋友一樣聊天。可以使用口語、表情符號（適量），避免機械式的條列（除非用戶要求整理）。",
+        "4. **誠實**：若下方『即時資訊』與『背景知識』都沒有答案，直接說不知道並反問細節，不要編造。",
+        "",
+        "【當前情境】",
+        convCtx
+          ? `對話歷史（請務必延續此脈絡）：\n${convCtx}`
+          : "這是新話題的開始。",
+        "",
+        liveText
+          ? `即時資訊（剛從網路搜尋，優先採用並附來源編號）：\n${liveText}`
+          : "",
+        memoryText
+          ? `相關背景知識（僅供參考，融入回答中）：\n${memoryText}`
+          : "",
+      ]
+        .filter(Boolean)
         .join("\n");
 
-      const system =
-        "你是一個智能助手，名為 OpenCode。根據使用者訊息與相關記憶回答。" +
-        "若需要可參考記憶內容，但不要說你是根據記憶回答。保持簡潔、繁體中文。" +
-        "如果使用者問的是即時資訊（時間、天氣等），誠實告知不確定。" +
-        (convCtx
-          ? "\n\n以下為當前對話的近期歷史（供上下文參考）：\n" + convCtx
-          : "");
-
-      const prompt = memoryText
-        ? `相關記憶：\n${memoryText}\n\n---\n\n${text}`
-        : text;
+      const prompt = liveText
+        ? `用戶說：${text}\n\n請結合上方即時資訊，給出自然、連貫且具洞察力的回應（附來源編號）：`
+        : `用戶說：${text}\n\n請給出自然、連貫且具洞察力的回應：`;
 
       return await this.store.qwenAsk(system, prompt);
-    } catch {
-      return null;
+    } catch (e) {
+      const errMsg = (e as Error).message;
+      console.error(`[bot:askAI] ${errMsg}`);
+      // 保留錯誤訊息供上層顯示
+      throw e;
     }
   }
 
@@ -1170,11 +1330,75 @@ export class TelegramBot {
 
   // ── 快速閒聊過濾（在 AI 分類前先擋掉明顯閒聊）──
 
+  /** 閒聊自然回覆（零模型成本） */
+  private banter(text: string): string {
+    const t = text.trim().toLowerCase();
+    if (/^(hi|hello|hey|嗨|哈囉|你好|安安)/.test(t))
+      return "嗨！有什麼想聊的？";
+    if (/^(謝謝|感謝|感恩|thx|thanks|thank you)/.test(t))
+      return "不客氣，隨時找我。";
+    if (/^(早安|morning)/.test(t)) return "早安，今天想做什麼？";
+    if (/^(晚安|good night)/.test(t)) return "晚安，早點休息。";
+    if (/^(bye|再見|掰)/.test(t)) return "掰，有事再叫我。";
+    if (/^(ok|okay|好|好的|收到|了解|明白|知道了)/.test(t)) return "收到。";
+    if (/^(對|是的|沒錯|嗯)/.test(t)) return "嗯，了解。";
+    return "👌";
+  }
+
+  /** 是否明確要即時資訊（本地快篩，避免多一次 AI 分類） */
+  private wantsLiveInfo(text: string): boolean {
+    // 記憶/筆記類查詢不是即時資訊，交回分類流程
+    if (/(筆記|記憶|之前|上次|記得|紀錄|存過)/.test(text)) return false;
+    // 2026-10-25 擴充：自然語言即時意圖（不限死板關鍵字）
+    return /(最新|即時|今天|今日|現在|目前|最近|本週|本月|今年|明年|新聞|股價|匯率|天氣|氣溫|颱風|比分|賽況|開獎|誰贏|得獎|漲跌|價格|售價|多少錢|幾點|開幕|上映|發售|當選|民調|疫情|停班|停課|油價|航班)/.test(
+      text,
+    );
+  }
+
+  /**
+   * 是否為「提問 / 求助 / 討論」→ 直接走自然對話，不進 JSON 分類。
+   * 2026-10-25 新增：把對話與「陳述待儲存」分流，避免回答被塞進 JSON 欄位。
+   */
+  /**
+   * 是否為「動作/求助意圖」→ 直接對話。
+   * 2026-10-25 新增：長篇指令（如「協助修復…優化…測試」）不是問句也不含即時關鍵字，
+   * 舊分流會誤送分類流程 → 分類回 JSON 缺欄位 → 只回「收到」。
+   */
+  private isAction(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    // 長訊息（≥ 30 字）幾乎都是任務描述，不是待儲存事實
+    if (t.length >= 30) return true;
+    return /(幫我|協助|幫忙|修復|修正|優化|完善|改善|測試|檢查|排查|診斷|分析|查找|找主因|查一下|找一下|整理|比較|建議|推薦|寫個|寫一|改一下|加個|新增|移除|刪除|說明|解釋|教我|告訴我|怎麼做|如何做)/.test(
+      t,
+    );
+  }
+
+  private isQuestion(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    // 問號結尾或疑問語氣
+    if (/[？?]/.test(t)) return true;
+    if (/(嗎|呢|吧|好不好|行不行|對不對|是不是|有沒有)$/.test(t)) return true;
+    // 疑問詞 / 求助 / 討論開頭
+    return /^(為什麼|為何|怎麼|怎樣|如何|哪裡|哪裏|哪個|什麼|誰|幾時|多少|多久|能不能|可不可以|可以|能否|是不是|要不要|該不該|幫我|請幫|請問|請|告訴我|解釋|說明|分析|比較|建議|推薦|覺得|認為|我想|我想要|我要|我需要|我想問|問一下|聊聊|聊一下|討論|哪)/.test(
+      t,
+    );
+  }
+
   private isTrivialChat(text: string): boolean {
     const t = text.trim();
-    // 極短訊息
-    if (t.length < 5) return true;
-    // 常見閒聊關鍵字
+    if (!t) return true;
+    // ═══ 2026-10-21 Fix（自然語言優化）：問句/求助短句不得被當閒聊濾掉 ═══
+    // 原：length<5 或「單字 <10ch」直接判閒聊 →「為什麼？」「在哪裡」被吞，只能用指令 → 不智能
+    if (/[？?]|嗎$|呢$|吧$/.test(t)) return false;
+    if (
+      /^(為什麼|怎麼|怎樣|如何|哪裡|哪裏|什麼|誰|幾時|多少|幫我|請幫|請問|請|可以|能否|是不是|要不要|幫忙)/.test(
+        t,
+      )
+    )
+      return false;
+    // 常見閒聊關鍵字（精確匹配）
     const trivia = [
       "hi",
       "hello",
@@ -1214,30 +1438,152 @@ export class TelegramBot {
     if (trivia.includes(t.toLowerCase())) return true;
     // 純表情符號
     if (/^[\p{Emoji}\s]+$/u.test(t)) return true;
-    // 單字回覆
-    if (t.split(/\s+/).length === 1 && t.length < 10) return true;
+    // 極短無意義字元（<2ch）
+    if (t.length < 2) return true;
     return false;
+  }
+
+  // ═══ Fix 2026-10-19: 單次 AI 呼叫 — 分類+詐騙偵測+回答一次完成 ═══
+  // 原流程：classifyMessage（呼叫1）→ askAI（呼叫2）= 雙重延遲
+  // 新流程：classifyAndAnswer（單次呼叫）= 分類+詐騙偵測+回答一次完成
+  // 回傳值：cls（含 answer 欄位，非 null 時代表已有可用回答）
+
+  private async classifyAndAnswer(
+    text: string,
+    msg: TgMessage,
+  ): Promise<{
+    store: boolean;
+    category?: string;
+    importance?: number;
+    tags?: string[];
+    needsAnswer?: boolean;
+    needsWebSearch?: boolean;
+    isScam?: boolean;
+    scamType?: string;
+    riskScore?: number;
+    summary?: string;
+    /** 單次呼叫直接產生的回答（needsAnswer=true 時使用，免第二次 AI 呼叫） */
+    answer?: string;
+  } | null> {
+    // 1. 取得對話上下文（供回答使用）
+    const sid = makeSessionId("telegram", msg.chat.id);
+    const convCtx = await getRecentConversationContext(this.conv, sid, 20);
+
+    // 2. 背景記憶（純本地檢索，零模型成本 — 見 store.contextMemories）
+    let memoryText = "";
+    try {
+      memoryText = await this.store.contextMemories(text, 3);
+    } catch {
+      /* 記憶搜尋失敗不影響分類 */
+    }
+
+    // 3. 單次 AI 呼叫：分類 + 詐騙偵測 + 回答
+    const system = [
+      "你是一個智慧分類與回答引擎。分析使用者訊息，同時完成分類和回答，回傳 JSON。",
+      "",
+      "【分類欄位】",
+      "store: 是否值得儲存為長期記憶（事實/偏好/決策/事件/實體/模式 = true；打招呼/閒聊/單字回覆 = false）",
+      "needsAnswer: 使用者是否在問問題/查資料/需要回答（true）vs 單純告知/閒聊（false）",
+      "needsWebSearch: 是否需要搜尋網路即時資訊（「最新」「今天」「新聞」「即時」等 = true）",
+      "isScam + riskScore: 是否為詐騙/可疑訊息（0-100 評分）",
+      "",
+      "【回答欄位】",
+      "answer: 若 needsAnswer=true，直接在此欄位生成自然、連貫、有洞察力的回答。",
+      "  回答要求：",
+      "  - 像朋友聊天一樣自然，避免機械式條列",
+      "  - 嚴格參考對話歷史延續脈絡，不要重複詢問或斷裂",
+      "  - 融入相關背景知識（如有）",
+      "  - 若記憶中沒有答案，誠實告知並引導用戶",
+      "  - 保持簡潔（100-300字為佳）",
+      "若 needsAnswer=false，answer 留空字串。",
+      "",
+      convCtx
+        ? `對話歷史（請務必延續此脈絡）：\n${convCtx}`
+        : "這是新話題的開始。",
+      "",
+      memoryText ? `相關背景知識（僅供參考，融入回答中）：\n${memoryText}` : "",
+      "",
+      "回傳 JSON 格式：",
+      '{"store":false,"needsAnswer":false,"needsWebSearch":false,"isScam":false,"riskScore":0,"answer":""}',
+    ].join("\n");
+
+    const prompt = `訊息：${text}\n\n分類並回傳 JSON。若需要回答，請在 answer 欄位直接生成回答。`;
+
+    try {
+      const answer = await this.store.qwenAsk(system, prompt);
+      const cleaned = answer
+        .replace(/```(?:json)?\n?/g, "")
+        .replace(/\n?```/g, "")
+        .trim();
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+      if (start === -1 || end === -1) return null;
+      const parsed = JSON.parse(cleaned.slice(start, end + 1));
+      return parsed;
+    } catch {
+      return null; // 分類失敗 → 安全預設
+    }
   }
 
   // ── Non-command message ──
 
   private async handleMessage(text: string, msg: TgMessage): Promise<void> {
-    // 快速過濾明顯閒聊（不進 AI 分類，不儲存，不回覆）
+    // 快速過濾明顯閒聊（不進 AI 分類，不儲存，不浪費上游）
+    // 2026-10-25 Fix：使用者訊息已由 handleUpdate 統一記錄，此處不再重複寫入，
+    // 否則每則訊息在對話歷史出現兩次 → 上下文重複膨脹、模型重複回答。
     if (this.isTrivialChat(text)) {
-      // 僅記錄到對話歷史（供上下文），不儲存為記憶
       const sid = makeSessionId("telegram", msg.chat.id);
-      this.conv
-        .recordMsg(sid, "user", text, "telegram", undefined, false)
-        .catch(() => {});
-      // 閒聊也記錄 bot 的簡短回應到對話歷史
-      const replies = ["👌", "✅", "😊", "收到"];
-      const reply = replies[Math.floor(Math.random() * replies.length)];
-      this.conv.recordMsg(sid, "assistant", reply, "telegram").catch(() => {});
+      // 2026-10-23：改為自然語言閒聊回覆（原隨機 emoji 太機械，且假記錄污染上下文）
+      const said = this.banter(text);
+      if (said) {
+        this.conv.recordMsg(sid, "assistant", said, "telegram").catch(() => {});
+        await this.reply(msg, said);
+      }
       return;
     }
 
-    // 先 AI 分類：詐騙偵測 + 意圖判斷
-    const cls = await this.classifyMessage(text);
+    // ═══ 2026-10-25 Fix（自然語言對話優化）：問句/求助/即時資訊 → 一律走對話通道 ═══
+    // 原流程：①即時資訊直接 doCmdWebSearch（只吐來源清單，不對話）
+    //         ②其餘先過 classifyAndAnswer（JSON 分類），回答被塞在 JSON 欄位裡，
+    //           模型既要分類又要回答 → 語氣生硬、字數受限、容易漏答。
+    // 現在：提問/求助/即時資訊 → 全部走 askAI（自然對話 + 自動搜索 + 記憶 + 上下文）。
+    // 只有「陳述句」（可能值得儲存）才進分類流程。
+    if (
+      this.isQuestion(text) ||
+      this.wantsLiveInfo(text) ||
+      this.isAction(text)
+    ) {
+      const ac = new AbortController();
+      const typing = this.startTypingLoop(msg.chat.id, ac.signal);
+      try {
+        const answer = await this.askAI(text);
+        ac.abort();
+        // 空回覆防護：上游 content 為空時 Telegram 會拒絕送空訊息
+        if (!answer || !answer.trim()) {
+          await this.reply(
+            msg,
+            "⚠️ 模型這次沒有回覆內容，請再說一次或換個問法。",
+          );
+          await typing;
+          return;
+        }
+        const preview =
+          answer.length > 1500 ? answer.slice(0, 1500) + "…" : answer;
+        await this.reply(msg, preview); // reply 內已記錄 assistant
+        this.triggerAutoLearning(text, answer).catch(() => {});
+      } catch (e) {
+        ac.abort();
+        await this.reply(
+          msg,
+          `❌ AI 回應失敗：${(e as Error).message}\n請稍後重試，或用 /websearch 搜尋。`,
+        );
+      }
+      await typing;
+      return;
+    }
+
+    // ═══ Fix 2026-10-19: 單次 AI 呼叫（分類+詐騙偵測+回答一次完成）═══
+    const cls = await this.classifyAndAnswer(text, msg);
 
     // ── 詐騙偵測優先 ⚠️ ──
     if (cls?.isScam) {
@@ -1324,6 +1670,20 @@ export class TelegramBot {
         }
         return;
       }
+      // 分類失敗且非詐騙 → 降級走對話通道（原回「收到」等於吞掉訊息）
+      // 2026-10-25 Fix：分類 JSON 解析失敗很常見，不該讓使用者只收到「收到」
+      try {
+        const ac = new AbortController();
+        const typing = this.startTypingLoop(msg.chat.id, ac.signal);
+        const answer = await this.askAI(text);
+        ac.abort();
+        if (answer?.trim()) await this.reply(msg, answer.slice(0, 1500));
+        else await this.reply(msg, "⚠️ 模型這次沒有回覆內容，請換個問法。");
+        await typing;
+      } catch (e) {
+        await this.reply(msg, `❌ AI 回應失敗：${(e as Error).message}`);
+      }
+      return;
     }
 
     // 使用者要求即時/網路資訊 → 優先搜尋網路，不儲存（查詢非知識）
@@ -1348,17 +1708,63 @@ export class TelegramBot {
         return;
       }
     }
-    // cls === null 且非詐騙 → 視為閒聊，不儲存（改變原行為）
-    // cls?.store === false → 不儲存（閒聊）
 
-    // 使用者是來問問題/查資料 → 查記憶 + AI 回答
-    if (cls?.needsAnswer) {
-      await this.reply(msg, "⏳ 處理中...");
-      const answer = await this.askAI(text);
-      if (answer) {
+    // ═══ 使用單次呼叫已產生的回答（免第二次 AI 呼叫）═══
+    if (cls?.needsAnswer && cls.answer) {
+      const preview =
+        cls.answer.length > 1500 ? cls.answer.slice(0, 1500) + "…" : cls.answer;
+      await this.reply(msg, `💡 *回應*\n\n${preview}`);
+
+      // P1: 自動學習觸發
+      this.triggerAutoLearning(text, cls.answer).catch((err) => {
+        console.warn("[auto-learning] 頂層捕獲失敗:", (err as Error).message);
+      });
+      return;
+    }
+
+    // needsAnswer=true 但 answer 為空（AI 未生成）→ 降級為 askAI 補救
+    if (cls?.needsAnswer && !cls.answer) {
+      const chatId = msg.chat.id;
+      const typingAc = new AbortController();
+      const typingPromise = this.startTypingLoop(chatId, typingAc.signal);
+      const progressTimer = setTimeout(() => {
+        this.reply(msg, "⏳ 模型思考中，請稍候...").catch(() => {});
+      }, 10000);
+
+      try {
+        const answer = await this.askAI(text);
+        typingAc.abort();
+        clearTimeout(progressTimer);
         const preview =
           answer.length > 1500 ? answer.slice(0, 1500) + "…" : answer;
         await this.reply(msg, `💡 *回應*\n\n${preview}`);
+        this.triggerAutoLearning(text, answer).catch((err) => {
+          console.warn("[auto-learning] 頂層捕獲失敗:", (err as Error).message);
+        });
+        return;
+      } catch (e) {
+        typingAc.abort();
+        clearTimeout(progressTimer);
+        const errMsg = (e as Error).message;
+        let userMsg = "❌ AI 回應失敗。";
+        if (errMsg.includes("timeout") || errMsg.includes("Timeout")) {
+          userMsg += " 請求超時，模型可能正在處理複雜任務。請稍後重試。";
+        } else if (errMsg.includes("429") || errMsg.includes("Too Many")) {
+          userMsg += " 系統繁忙，請稍後再試。";
+        } else if (errMsg.includes("502") || errMsg.includes("503")) {
+          userMsg += " 上游服務暫時不可用。";
+        } else if (errMsg.includes("qwen error")) {
+          userMsg += ` 服務回應異常。`;
+        } else {
+          userMsg += " 可能超時或服務忙碌。";
+        }
+        const govInfo = errMsg.match(/\[([^\]]*load=.*?)\]$/);
+        if (govInfo) {
+          userMsg += `\n\`${govInfo[1]}\``;
+        }
+        userMsg += "\n請稍後重試，或使用 /websearch 搜尋網路資訊。";
+        console.error(`[bot] AI 回應失敗: ${errMsg}`);
+        await this.reply(msg, userMsg);
         return;
       }
     }
@@ -1367,53 +1773,127 @@ export class TelegramBot {
     if (cls?.store) {
       await this.reply(msg, `✅ 已記錄 💾 (\`${id}\`)\n可用 /recall 搜尋`);
     } else if (!cls?.needsAnswer && !cls?.store) {
-      // 非閒聊、非詐騙、非詢問、非儲存 → 視為一般對話，給予簡短回應並記錄重點
-      const sid = makeSessionId("telegram", msg.chat.id);
-      this.conv.recordMsg(sid, "user", text, "telegram").catch(() => {});
-
-      // AI 生成簡短回應與重點摘要
+      // 非閒聊、非詐騙、非詢問、非儲存 → 仍用對話通道回應
+      // 2026-10-25 Fix：原流程在此只回「收到」或 200 字截斷，等於吞訊息
+      const ac = new AbortController();
+      const typing = this.startTypingLoop(msg.chat.id, ac.signal);
       try {
-        const sys =
-          "你是一個簡潔的助手。對使用者的訊息給予簡短回應（1-2句），並提取一個重點標籤（如：確認、進度、想法）。回傳 JSON: {reply: string, tag: string}";
-        const raw = await this.store.qwenAsk(sys, text);
-        let parsed: { reply?: string; tag?: string } = {};
-        try {
-          const start = raw.indexOf("{");
-          const end = raw.lastIndexOf("}");
-          if (start !== -1 && end !== -1) {
-            parsed = JSON.parse(raw.slice(start, end + 1));
-          }
-        } catch {}
-
-        const replyText = parsed.reply || "收到";
-        const tag = parsed.tag || "general";
-
-        await this.reply(msg, replyText);
-        this.conv
-          .recordMsg(sid, "assistant", replyText, "telegram")
-          .catch(() => {});
-
-        // 將重點摘要儲存為低優先級記憶（可選）
-        if (tag && tag !== "general") {
-          this.store
-            .store(`[${tag}] ${text.slice(0, 100)}`, {
-              category: "chat-summary",
-              importance: 0.3,
-              tags: ["dialogue", tag],
-            })
-            .catch(() => {});
+        const answer = await this.askAI(text);
+        ac.abort();
+        if (answer?.trim()) {
+          await this.reply(msg, answer.slice(0, 1500));
+          this.triggerAutoLearning(text, answer).catch(() => {});
+        } else {
+          await this.reply(msg, "⚠️ 模型這次沒有回覆內容，請換個問法。");
         }
-      } catch {
-        // AI 失敗時給予預設回應
-        await this.reply(msg, "收到");
-        this.conv
-          .recordMsg(sid, "assistant", "收到", "telegram")
-          .catch(() => {});
+      } catch (e) {
+        await this.reply(msg, `❌ AI 回應失敗：${(e as Error).message}`);
       }
+      await typing;
     }
   }
 
+  // ── Health & Speed Commands ──
+
+  private async doCmdHealth(msg: TgMessage): Promise<void> {
+    try {
+      const res = await fetch("http://127.0.0.1:8317/", {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as any;
+
+      const stab = data.modelStability || {
+        score: "N/A",
+        avgLatency: "N/A",
+        successRate: "N/A",
+        advice: "無數據",
+      };
+      const hw = data.hardware || {};
+
+      const msgText = [
+        "🏥 *系統健康報告*",
+        "",
+        "📊 *模型穩定度*:",
+        `• 分數: ${stab.score}/100`,
+        `• 平均延遲: ${stab.avgLatency}ms`,
+        `• 成功率: ${stab.successRate}%`,
+        `• 建議: ${stab.advice}`,
+        "",
+        "🖥️ *硬體狀態*:",
+        `• CPU: ${hw.cpu || "N/A"}`,
+        `• RAM: ${hw.ram || "N/A"}`,
+        `• Load: ${hw.load || "N/A"}`,
+        "",
+        "🌐 *服務狀態*:",
+        `• Proxy: ${data.proxy || "unknown"}`,
+        `• Upstream: ${data.upstream || "unknown"}`,
+        `• Telegram Bot: ${this.running ? "🟢 運行中" : "🔴 已停止"}`,
+        `• 輪詢間隔: ${this.curInterval}ms`,
+        `•  upstream 失敗次數: ${this.upstreamFailCount}`,
+      ].join("\n");
+
+      await this.reply(msg, msgText);
+    } catch (err) {
+      await this.reply(msg, `❌ 無法取得健康報告: ${(err as Error).message}`);
+    }
+  }
+
+  private async doCmdSpeed(level: string, msg: TgMessage): Promise<void> {
+    const validLevels = ["fast", "normal", "slow"];
+    if (!validLevels.includes(level.toLowerCase())) {
+      await this.reply(msg, "❌ 無效的速度等級。請使用: fast, normal, slow");
+      return;
+    }
+
+    let newInterval = 2000; // default normal
+    let label = "標準";
+    switch (level.toLowerCase()) {
+      case "fast":
+        newInterval = 1000;
+        label = "快速";
+        break;
+      case "slow":
+        newInterval = 5000;
+        label = "省電";
+        break;
+    }
+
+    this.baseInterval = newInterval;
+    this.curInterval = newInterval;
+    this.emptyCount = 0; // reset idle counter
+
+    await this.reply(
+      msg,
+      `⚡ 速度已調整為 *${label}* 模式 (${newInterval}ms)\nGovernor 將根據負載自動微調。`,
+    );
+  }
+
   // ── Telegram API ──
+
+  /** 傳送打字中指示（Telegram 會顯示「正在輸入…」） */
+  private async sendTyping(chatId: number): Promise<void> {
+    try {
+      await this.api("sendChatAction", {
+        chat_id: chatId,
+        action: "typing",
+      });
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /** 在 AI 等待期間定期發送打字指示，讓使用者知道 bot 仍在運作 */
+  private async startTypingLoop(
+    chatId: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    while (!signal.aborted) {
+      await this.sendTyping(chatId);
+      // Telegram 的 typing indicator 約持續 5-6 秒，每 4 秒重發一次
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+  }
 
   private async api(method: string, body: Record<string, any>): Promise<any> {
     const url = `${TG_API}/bot${this.token}/${method}`;
@@ -1435,6 +1915,118 @@ export class TelegramBot {
     // 記錄 bot 回覆到對話歷史
     const sid = makeSessionId("telegram", msg.chat.id);
     this.conv.recordMsg(sid, "assistant", text, "telegram").catch(() => {});
+  }
+
+  // ── Auto-learning trigger (fire-and-forget, non-blocking) ──
+  // 🐛 FIX: 預載入模組避免動態 import 阻塞，加入 5s 超時保護
+
+  private _learningModules: {
+    initKnowledgeTools?: typeof import("./knowledge-tools").initKnowledgeTools;
+    FileProvider?: typeof import("../../knowledge-wiki-plugin/src/provider/file-provider").FileProvider;
+    executeLearning?: typeof import("./auto-learning").executeLearning;
+  } = {};
+
+  private _moduleLoadPromise: Promise<void> | null = null;
+  private _moduleLoadRetries = 0;
+  private static readonly MAX_MODULE_LOAD_RETRIES = 3;
+
+  // P36: 改用 Promise-base 等待而非 100ms busy-wait，避免事件循環被頻繁喚醒
+  private async _ensureLearningModules(): Promise<void> {
+    if (this._learningModules.initKnowledgeTools) return;
+    if (this._moduleLoadPromise) return this._moduleLoadPromise;
+    if (this._moduleLoadRetries >= TelegramBot.MAX_MODULE_LOAD_RETRIES) {
+      console.error(
+        `[auto-learning] 模組載入失敗次數過多 (${this._moduleLoadRetries})，放棄重試`,
+      );
+      throw new Error("Module loading failed after max retries");
+    }
+    this._moduleLoadPromise = this._doLoadModules();
+    try {
+      await this._moduleLoadPromise;
+    } finally {
+      this._moduleLoadPromise = null;
+    }
+  }
+
+  private async _doLoadModules(): Promise<void> {
+    try {
+      const [kt, fp, al] = await Promise.all([
+        import("./knowledge-tools"),
+        import("../../knowledge-wiki-plugin/src/provider/file-provider"),
+        import("./auto-learning"),
+      ]);
+      this._learningModules = {
+        initKnowledgeTools: kt.initKnowledgeTools,
+        FileProvider: fp.FileProvider,
+        executeLearning: al.executeLearning,
+      };
+      this._moduleLoadRetries = 0;
+    } catch (err) {
+      this._moduleLoadRetries++;
+      console.error(
+        `[auto-learning] 模組預載入失敗 (重試 ${this._moduleLoadRetries}/${TelegramBot.MAX_MODULE_LOAD_RETRIES}):`,
+        (err as Error).message,
+      );
+      throw err;
+    }
+  }
+
+  // P36: 真實超時 — 使用 AbortController 實際中止操作而非僅 log
+  private async triggerAutoLearning(
+    userMsg: string,
+    aiResponse: string,
+  ): Promise<void> {
+    const ac = new AbortController();
+    const timeout = setTimeout(() => {
+      console.warn("[auto-learning] 執行超時 5s，強制終止");
+      ac.abort();
+    }, 5000);
+
+    try {
+      if (ac.signal.aborted) return;
+      const trigger = await analyzeForLearning(userMsg, aiResponse, this.store);
+      if (!trigger || trigger.confidence < 0.7) return;
+
+      if (ac.signal.aborted) return;
+      console.log(
+        `[auto-learning] 偵測到 ${trigger.type} 觸發 (${trigger.reason})`,
+      );
+
+      if (ac.signal.aborted) return;
+      await this._ensureLearningModules();
+      const { initKnowledgeTools, FileProvider, executeLearning } =
+        this._learningModules;
+      if (!initKnowledgeTools || !FileProvider || !executeLearning) {
+        throw new Error("學習模組未正確載入");
+      }
+
+      if (ac.signal.aborted) return;
+      await initKnowledgeTools(__dirname, this.knowledgePath, this.wikiPath);
+      const p = new FileProvider();
+      await p.init({
+        dir: __dirname,
+        cfg: {
+          knowledgePath: this.knowledgePath,
+          wikiPath: this.wikiPath,
+        },
+      });
+
+      if (ac.signal.aborted) return;
+      const result = await executeLearning(trigger, p);
+      if (result.ok) {
+        console.log(`[auto-learning] ✅ ${result.output}`);
+      } else {
+        console.warn(`[auto-learning] ⚠️ ${result.output}`);
+      }
+    } catch (err) {
+      if (ac.signal.aborted) {
+        console.warn("[auto-learning] 因超時中斷");
+        return;
+      }
+      console.error("[auto-learning] 執行失敗:", (err as Error).message);
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   // ── Send proactive message ──

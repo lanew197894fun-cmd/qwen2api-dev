@@ -5,7 +5,7 @@
 import { readdir, readFile, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve } from "path";
-import { suggest as govSuggest } from "./governor";
+import { suggest as govSuggest } from "./governor.ts";
 
 export interface ProcessorPaths {
   memoryIndex: string; // memory-index.json
@@ -153,6 +153,82 @@ async function processWiki(paths: ProcessorPaths): Promise<ProcReport> {
   return { ok: true, summary: `維基 ${idx.length} 條`, detail };
 }
 
+// ── 演化報告（記憶成長追蹤）──
+
+/** 記錄各輪的數據快照，用於計算成長 */
+interface ProcSnapshot {
+  cycle: number;
+  at: number;
+  memCount: number;
+  knwCount: number;
+  wikiCount: number;
+}
+
+const snapshots: ProcSnapshot[] = [];
+
+function extractCount(summary: string): number {
+  const m = summary.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function generateEvolutionReport(
+  mem: ProcReport,
+  knw: ProcReport,
+  wik: ProcReport,
+  cycle: number,
+): string | null {
+  const cur: ProcSnapshot = {
+    cycle,
+    at: Date.now(),
+    memCount: extractCount(mem.summary),
+    knwCount: extractCount(knw.summary),
+    wikiCount: extractCount(wik.summary),
+  };
+  snapshots.push(cur);
+  // 保留最近 20 筆
+  if (snapshots.length > 20) snapshots.shift();
+
+  // 至少需要 2 筆才能計算變化
+  if (snapshots.length < 2) return null;
+
+  const prev = snapshots[snapshots.length - 2];
+  const memDelta = cur.memCount - prev.memCount;
+  const knwDelta = cur.knwCount - prev.knwCount;
+  const wikiDelta = cur.wikiCount - prev.wikiCount;
+  const elapsed = ((cur.at - prev.at) / 1000 / 60).toFixed(1);
+
+  // 無變化時跳過（避免刷頻）
+  if (memDelta === 0 && knwDelta === 0 && wikiDelta === 0) return null;
+
+  const report: string[] = [];
+  report.push(`📊 *演化報告* (最近 ${elapsed} 分鐘)`);
+  if (memDelta !== 0)
+    report.push(
+      `🧠 記憶: ${prev.memCount} → ${cur.memCount} (${memDelta > 0 ? "+" : ""}${memDelta})`,
+    );
+  if (knwDelta !== 0)
+    report.push(
+      `📚 知識庫: ${prev.knwCount} → ${cur.knwCount} (${knwDelta > 0 ? "+" : ""}${knwDelta})`,
+    );
+  if (wikiDelta !== 0)
+    report.push(
+      `📖 維基: ${prev.wikiCount} → ${cur.wikiCount} (${wikiDelta > 0 ? "+" : ""}${wikiDelta})`,
+    );
+
+  // 總成長
+  const first = snapshots[0];
+  if (first && first !== cur) {
+    const totalMem = cur.memCount - first.memCount;
+    const totalKnw = cur.knwCount - first.knwCount;
+    const totalWiki = cur.wikiCount - first.wikiCount;
+    report.push(
+      `📈 總成長: +${totalMem} 記憶 / +${totalKnw} 知識 / +${totalWiki} 維基`,
+    );
+  }
+
+  return report.join("\n");
+}
+
 // ── 主處理器 ──
 
 export class IdleProcessor {
@@ -192,6 +268,15 @@ export class IdleProcessor {
       if (this.cycle % 5 === 1) {
         for (const d of [...mem.detail, ...knw.detail, ...wik.detail])
           lines.push(`  ${d}`);
+      }
+
+      // 每 3 輪產生演化報告
+      if (this.cycle % 3 === 0) {
+        const evo = generateEvolutionReport(mem, knw, wik, this.cycle);
+        if (evo) {
+          lines.push("");
+          lines.push(evo);
+        }
       }
 
       const elapsed = Date.now() - start;

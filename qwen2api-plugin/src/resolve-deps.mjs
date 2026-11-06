@@ -36,8 +36,8 @@ const PLUGIN_NODE_MODULES = path.join(PLUGIN_DIR, "..", "node_modules");
 const log = {
   debug: (...a) => {},
   info: (...a) => console.log("[resolve-deps]", ...a),
-  warn: (...a) => console.warn("[resolve-deps] ⚠️", ...a),
-  error: (...a) => console.error("[resolve-deps] ❌", ...a),
+  warn: (...a) => console.log("[resolve-deps] ⚠️", ...a),
+  error: (...a) => console.log("[resolve-deps] ❌", ...a),
 };
 
 // ─── 工具函數 ───

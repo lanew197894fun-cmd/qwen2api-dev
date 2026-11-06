@@ -10,10 +10,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { networkInterfaces } from "node:os";
 
-const ROOT = path.resolve(
-  process.env.OPENCODE_DIR ||
-    "/home/reamaster/opencode-manager/projects/.opencode",
-);
+// ─── 路徑 ───
+import { OPENCODE_DIR } from "./config/paths.js";
+
+const ROOT = path.resolve(process.env.OPENCODE_DIR || OPENCODE_DIR);
 const PORT = parseInt(process.env.PORT || "7777", 10);
 
 // 自動取得 Tailscale IP

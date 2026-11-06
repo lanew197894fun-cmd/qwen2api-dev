@@ -10,15 +10,14 @@
 import { Provider } from "./provider.js";
 import { Router } from "./router.js";
 import { createAuth } from "./auth/index.js";
+import { loadSystemProviders } from "./system-auth-bridge.js";
+import { makeLogger } from "../color.js";
 
 export { Provider };
 export { Router };
 export { createAuth };
 
-const log = {
-  info: (...a) => console.log("[provider]", ...a),
-  warn: (...a) => console.warn("[provider]", ...a),
-};
+const log = makeLogger("provider", "tertiary");
 
 /**
  * 從 CFG 配置建立 Router 實例
@@ -34,16 +33,25 @@ export function createRouter(cfg) {
     const prefix = `PROVIDER_${key}`;
 
     // 從 cfg（環境變數）讀取
-    let baseUrl = cfg[`${prefix}_URL`] || cfg[`${prefix}_BASE_URL`];
+    let baseUrl =
+      cfg[`${prefix}_URL`] ||
+      cfg[`${prefix}_BASE_URL`] ||
+      process.env[`${prefix}_URL`] ||
+      process.env[`${prefix}_BASE_URL`];
     let apiKey = cfg[`${prefix}_KEY`] || cfg[`${prefix}_API_KEY`] || "";
 
-    // 預設 qwen2api 端點
+    // 預設 qwen2api 端點 (browser-proxy 模式)
     if (!baseUrl && name === "qwen2api") {
       baseUrl = `http://${cfg.QWEN2API_HOST || "127.0.0.1"}:${cfg.QWEN2API_PORT || 3000}`;
     }
 
+    // 預設 qwen2api-direct 端點 (直連 API 模式，port 3001)
+    if (!baseUrl && name === "qwen2api-direct") {
+      baseUrl = `http://${cfg.QWEN2API_HOST || "127.0.0.1"}:3001`;
+    }
+
     // 通用 API_KEY 作為 qwen2api provider 的最終 fallback
-    if (!apiKey && name === "qwen2api") {
+    if (!apiKey && (name === "qwen2api" || name === "qwen2api-direct")) {
       apiKey = cfg.API_KEY || "";
     }
 
@@ -91,7 +99,10 @@ export function createRouter(cfg) {
         10,
       ),
       retries: parseInt(cfg[`${prefix}_RETRIES`] ?? cfg.RETRIES ?? "1", 10),
-      priority: parseInt(cfg[`${prefix}_PRIORITY`] || "1", 10),
+      priority: parseInt(
+        cfg[`${prefix}_PRIORITY`] || process.env[`${prefix}_PRIORITY`] || "1",
+        10,
+      ),
       weight: parseInt(cfg[`${prefix}_WEIGHT`] || "1", 10),
       cbThreshold: parseInt(
         cfg[`${prefix}_CB_THRESHOLD`] || cfg.CB_THRESHOLD || "3",
@@ -106,7 +117,26 @@ export function createRouter(cfg) {
     providers.push(provider);
   }
 
-  const router = new Router(providers, cfg.ROUTER_STRATEGY || "failover");
+  // ═══ Fix 2026-07-08: 從 opencode 系統 auth store 載入已登入的供應商憑證 ═══
+  // 當使用者透過 `opencode auth login` 登入供應商後，憑證自動成為 chat-proxy 備援
+  if (cfg.SYSTEM_AUTH_BRIDGE !== false) {
+    const sysProviders = loadSystemProviders({
+      timeout: cfg.CHAT_TIMEOUT || 120000,
+      retries: cfg.RETRIES ?? 1,
+      defaultPriority: parseInt(cfg.SYSTEM_AUTH_PRIORITY || "5", 10),
+    });
+    for (const sp of sysProviders) {
+      // 不重複加入已存在的同名 provider
+      if (!providers.some((p) => p.name === sp.name)) {
+        providers.push(sp);
+      }
+    }
+    if (sysProviders.length > 0) {
+      log.info(`🔌 系統供應商橋接: ${sysProviders.length} 個供應商已載入`);
+    }
+  }
+
+  const router = new Router(providers, cfg.ROUTER_STRATEGY || "adaptive");
 
   // 背景健康檢查
   if (cfg.ROUTER_HEALTH_ENABLED !== false) {

@@ -11,3 +11,5 @@ dist/
 *.backup*
 *.orig
 telegram-memory-bridge/.env
+**/.qwen-cookies.json
+**/.qwen-token.json

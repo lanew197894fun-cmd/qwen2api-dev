@@ -6,11 +6,8 @@
  * 適用於：ChatGPT API（OAuth2）、GitHub API、Google API 等。
  */
 
-const log = {
-  info: (...a) => console.log("[auth:oauth]", ...a),
-  warn: (...a) => console.warn("[auth:oauth]", ...a),
-  error: (...a) => console.error("[auth:oauth]", ...a),
-};
+import { makeLogger } from "../../color.js";
+const log = makeLogger("auth:oauth", "success");
 
 export function createOAuthAuth(cfg) {
   const clientId = cfg.clientId || "";

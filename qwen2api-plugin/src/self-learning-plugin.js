@@ -48,11 +48,29 @@ const ESC = {
   dim: "\x1b[2m",
   rst: "\x1b[0m",
 };
+// ═══ Fix 2026-10-18: 非 TTY 自動降為 warn，避免污染 opencode 輸出 ═══
+// 原碼寫死 return 3（info），導致 `bun dev run` 等非互動環境也噴載入訊息，
+// 混入模型輸出前，干擾「對話前不做多餘注入」的原則。
+// 開發期要顯示請明確設 PROXY_LOG_LEVEL=info。
+const _LOG_LEVEL = (() => {
+  const raw = process.env.PROXY_LOG_LEVEL || process.env.LOG_LEVEL || "";
+  const map = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
+  if (raw && map[raw] !== undefined) return map[raw];
+  return process.stdout.isTTY ? 3 : 2;
+})();
 const log = {
-  ok: (...a) => console.log(`${ESC.grn}✓${ESC.rst}`, ...a),
-  info: (...a) => console.log(`${ESC.cyn}ℹ${ESC.rst}`, ...a),
-  warn: (...a) => console.warn(`${ESC.yel}⚠${ESC.rst}`, ...a),
-  error: (...a) => console.error(`${ESC.red}✗${ESC.rst}`, ...a),
+  ok: (...a) => {
+    if (_LOG_LEVEL >= 2) console.log(`${ESC.grn}✓${ESC.rst}`, ...a);
+  },
+  info: (...a) => {
+    if (_LOG_LEVEL >= 3) console.log(`${ESC.cyn}ℹ${ESC.rst}`, ...a);
+  },
+  warn: (...a) => {
+    if (_LOG_LEVEL >= 2) console.log(`${ESC.yel}⚠${ESC.rst}`, ...a);
+  },
+  error: (...a) => {
+    if (_LOG_LEVEL >= 1) console.log(`${ESC.red}✗${ESC.rst}`, ...a);
+  },
 };
 
 // 將 "a.b.c" = val 轉成 {a: {b: {c: val}}}
@@ -451,16 +469,17 @@ const Plugin = async (input) => {
     },
 
     // ═══ 系統提示注入（含即時學習狀態） ═══
+    // Fix 2026-10-18: 精簡為 2 行。原文 5 行含完整用法範例，屬「描述過多」——
+    // 工具用途由工具 description 自我說明，system 只需給入口與調用意圖。
+    // 重點改為「自動調用」：依規則判斷何時該調，不代表獨立意志。
     "experimental.chat.system.transform": async (_input, output) => {
       const m = getLearningMetrics().metrics;
-      const level = m.level,
-        acc = (m.accuracy * 100).toFixed(0);
-      output.system.push(`\n<plugin_info name="self-learning">
-自我學習系統 Level ${level}・準確度 ${acc}%
-可用工具（AI 函式呼叫）：self_learn_*（配置/學習/分析）| self_config_*（系統設定）
-用法範例：呼叫 self_learn_trait 工具調整語氣，呼叫 self_record_feedback 記錄偏好
-注意：以上均為 AI 函式呼叫工具，不可透過 bash 執行。
-</plugin_info>`);
+      output.system.push(
+        `\n<plugin_info name="self-learning">自我學習系統 L${m.level}・準確度 ${(m.accuracy * 100).toFixed(0)}%。` +
+          `工具：self_learn_*（學習/分析）、self_config_*（設定）、self_record_feedback（記錄偏好）。` +
+          `主動調用：使用者表達偏好或你被糾正時即時呼叫，勿等待指示；不可用 bash 執行。` +
+          `語義：自我學習＝自動記錄／分析的工具流程，不代表有意識、情感或獨立目標。</plugin_info>`,
+      );
     },
   };
 };

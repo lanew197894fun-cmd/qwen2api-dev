@@ -11,31 +11,47 @@
  *   QWEN2API_HOST — qwen2api 主機（預設 localhost）
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { CFG } from "./config/index.js";
+import { fileURLToPath } from "node:url";
+import { makeLogger } from "./color.js";
+const log = makeLogger("platform", "muted");
 
 export const PLATFORM = process.platform;
 export const IS_WIN = PLATFORM === "win32";
 export const IS_MAC = PLATFORM === "darwin";
 export const IS_LINUX = PLATFORM === "linux";
 
-// ─── 跨平台路徑（定義集中於 config/index.js） ───
+// ─── 路徑管理：統一從 config/paths.js 匯入（單一事實來源） ───
+// 2026-07-12: 消除與 config/paths.js 的重複定義，跨裝置一致
+import {
+  QWEN2API_DIR as _QWEN2API_DIR,
+  SYSTEM_DIR as _SYSTEM_DIR,
+  logCrossDeviceWarn,
+} from "../../config/paths.js";
 
 export const getPath = (name) => {
-  const envKey = CFG.PATH_ENV_MAP[name];
-  if (envKey && process.env[envKey]) return process.env[envKey];
-  const tbl = CFG.PATHS[name];
-  return tbl?.[PLATFORM] || tbl?.linux || "";
+  // 環境變數覆蓋仍保留
+  if (name === "qwen2api" && process.env.QWEN2API_DIR)
+    return process.env.QWEN2API_DIR;
+  if (name === "projectDir" && process.env.PROJECT_DIR)
+    return process.env.PROJECT_DIR;
+  // 統一從 config/paths.js 取得
+  if (name === "qwen2api") return _QWEN2API_DIR;
+  if (name === "projectDir") return _SYSTEM_DIR;
+  return "";
 };
+
+// 跨裝置警告（轉介 paths.js）
+export { logCrossDeviceWarn };
 
 // ─── 共享依賴路徑 ───
 
 /** 取得專案根目錄（從插件目錄往上推） */
 export const getProjectRoot = () => {
-  const srcDir = path.resolve(path.dirname(new URL(import.meta.url).pathname));
-  return path.resolve(srcDir, "../../../");
+  const srcDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(srcDir, "../../");
 };
 
 /** 取得 shared-deps 目錄路徑 */
@@ -87,7 +103,9 @@ export const killPort = (port) => {
         { timeout: 3000 },
       );
     } else {
-      execSync(`kill -9 $(lsof -ti:${p}) 2>/dev/null`, { timeout: 3000 });
+      execSync(`kill -9 $(lsof -ti:${p} -sTCP:LISTEN) 2>/dev/null`, {
+        timeout: 3000,
+      });
     }
   } catch (_) {}
 };
@@ -97,11 +115,15 @@ export const killPort = (port) => {
 export const execShell = (cmd, opts = {}) => {
   const [shell, flag] = IS_WIN ? ["cmd", "/c"] : ["bash", "-c"];
   try {
-    const proc = Bun.spawnSync([shell, flag, cmd], opts);
+    const proc = spawnSync(shell, [flag, cmd], {
+      encoding: "utf-8",
+      timeout: 30000,
+      ...opts,
+    });
     return {
-      stdout: (proc.stdout || "").toString(),
-      stderr: (proc.stderr || "").toString(),
-      exitCode: proc.exitCode,
+      stdout: proc.stdout || "",
+      stderr: proc.stderr || "",
+      exitCode: proc.status ?? 0,
     };
   } catch {
     try {
@@ -117,30 +139,127 @@ export const execShell = (cmd, opts = {}) => {
   }
 };
 
+// ─── Shell 非同步執行（不阻塞 event loop） ───
+
+/**
+ * execShellAsync — 非同步執行 shell 命令，不阻塞 event loop
+ * 支援超時自動 kill、stdout/stderr 收集
+ * @param {string} cmd
+ * @param {object} [opts]
+ * @param {number}  [opts.timeout] — 超時毫秒（預設 30000）
+ * @returns {Promise<{stdout: string, stderr: string, exitCode: number, timedOut: boolean}>}
+ */
+export const execShellAsync = (cmd, opts = {}) => {
+  const [shell, flag] = IS_WIN ? ["cmd", "/c"] : ["bash", "-c"];
+  const timeout = opts.timeout || 30000;
+  return new Promise((resolve) => {
+    let stdoutBuf = "";
+    let stderrBuf = "";
+    let done = false;
+    let _timer;
+
+    const finish = (code, timedOut = false) => {
+      if (done) return;
+      done = true;
+      clearTimeout(_timer);
+      resolve({
+        stdout: stdoutBuf,
+        stderr: stderrBuf,
+        exitCode: code ?? 0,
+        timedOut,
+      });
+    };
+
+    let proc;
+    try {
+      proc = spawn(shell, [flag, cmd], {
+        stdio: ["pipe", "pipe", "pipe"],
+        ...opts,
+      });
+    } catch (e) {
+      clearTimeout(_timer);
+      resolve({ stdout: "", stderr: e.message, exitCode: 1, timedOut: false });
+      return;
+    }
+
+    // ═══ Fix 2026-07-06: timer 在 proc 就緒後再啟動，避免 race ═══
+    // 原本 timer 在 proc 宣告前就設定，proc.kill 參考到 undefined → TypeError 被吞
+    _timer = setTimeout(() => {
+      try {
+        if (proc?.kill) {
+          proc.kill("SIGTERM");
+          setTimeout(() => {
+            try {
+              proc.kill("SIGKILL");
+            } catch (e) {
+              log.warn("SIGKILL 失敗:", e?.message);
+            }
+          }, 1000);
+        }
+      } catch (e) {
+        log.warn("timeout handler 錯誤:", e?.message);
+      }
+      finish(null, true);
+    }, timeout);
+
+    proc.stdout.on("data", (d) => {
+      stdoutBuf += d.toString();
+    });
+    proc.stderr.on("data", (d) => {
+      stderrBuf += d.toString();
+    });
+    proc.on("close", (code) => {
+      clearTimeout(_timer);
+      finish(code);
+    });
+    proc.on("error", (e) => {
+      clearTimeout(_timer);
+      if (!done) finish(1);
+    });
+    proc.unref();
+  });
+};
+
 // ─── Grep（跨平台，有限支援） ───
 
 export const execGrep = (pattern, filePath, includes = []) => {
   if (IS_WIN) {
     try {
       const args = ["findstr", "/s", "/n", "/i", pattern, `${filePath}\\*`];
-      const proc = Bun.spawnSync(args);
+      const proc = spawnSync(args[0], args.slice(1), {
+        encoding: "utf-8",
+        timeout: 10000,
+      });
       return {
-        stdout: (proc.stdout || "").toString(),
-        stderr: (proc.stderr || "").toString(),
-        exitCode: proc.exitCode,
+        stdout: proc.stdout || "",
+        stderr: proc.stderr || "",
+        exitCode: proc.status ?? 0,
       };
     } catch {
       return { stdout: "", stderr: "", exitCode: 1 };
     }
   }
-  const args = ["grep", "-rn", pattern, filePath];
+  // 2026-11-05 Fix：預設排除大型/產物目錄，避免全檔搜尋時掃 node_modules 造成 10s 超時。
+  const args = [
+    "grep",
+    "-rnI",
+    "--exclude-dir=node_modules",
+    "--exclude-dir=.git",
+    "--exclude-dir=.chrome-qwen-profile",
+    pattern,
+    filePath,
+  ];
   for (const inc of includes) args.push(`--include=${inc}`);
   try {
-    const proc = Bun.spawnSync(args);
+    const proc = spawnSync(args[0], args.slice(1), {
+      encoding: "utf-8",
+      timeout: 15000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
     return {
-      stdout: (proc.stdout || "").toString(),
-      stderr: (proc.stderr || "").toString(),
-      exitCode: proc.exitCode,
+      stdout: proc.stdout || "",
+      stderr: proc.stderr || "",
+      exitCode: proc.status ?? 0,
     };
   } catch (e) {
     return { stdout: "", stderr: e.message, exitCode: 1 };

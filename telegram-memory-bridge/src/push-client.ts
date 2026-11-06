@@ -116,6 +116,7 @@ export async function pushToPeer(opts: PushOpts): Promise<PushResult> {
 
   console.log(`🌐 推送目標: ${peer}`);
   console.log(`📡 來源裝置: ${device}`);
+  console.log(`🤝 📤 已連接主力機，開始推送資料...`);
   console.log("");
 
   // ── 記憶 ──

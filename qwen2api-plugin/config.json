@@ -1,0 +1,19 @@
+{
+    coding: {
+      performance: 90,
+      features: [
+        "自動化",
+        "除錯",
+        "測試生成"
+      ]
+    },
+    reasoning: {
+      performance: 85,
+      features: [
+        "邏輯推理",
+        "知識庫查詢",
+        "複雜問題解決"
+      ]
+    }
+  }
+  

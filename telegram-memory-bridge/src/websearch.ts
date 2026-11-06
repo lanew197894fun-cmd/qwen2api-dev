@@ -18,6 +18,21 @@ export async function webSearch(
   query: string,
   maxResults = 5,
 ): Promise<SearchResult[]> {
+  // 2026-10-25 Fix：Brave 常回 429（免 API Key 限流）→ 多後端依序嘗試
+  const errs: string[] = [];
+  for (const fn of [brave, duck]) {
+    try {
+      const out = await fn(query, maxResults);
+      if (out.length > 0) return out;
+      errs.push(`${fn.name}: 0 筆`);
+    } catch (e) {
+      errs.push(`${fn.name}: ${(e as Error).message}`);
+    }
+  }
+  throw new Error(errs.join(" / "));
+}
+
+async function brave(query: string, max: number): Promise<SearchResult[]> {
   const params = new URLSearchParams({ q: query, source: "web" });
   const res = await fetch(`${BRAVE_URL}?${params}`, {
     headers: {
@@ -27,9 +42,50 @@ export async function webSearch(
     },
     signal: AbortSignal.timeout(15_000),
   });
-  if (!res.ok) throw new Error(`Brave Search 回傳 ${res.status}`);
-  const html = await res.text();
-  return parseBraveResults(html, maxResults);
+  if (!res.ok) throw new Error(`Brave ${res.status}`);
+  return parseBraveResults(await res.text(), max);
+}
+
+// ── DuckDuckGo HTML 後端（Brave 429 時接手） ──
+
+async function duck(query: string, max: number): Promise<SearchResult[]> {
+  const params = new URLSearchParams({ q: query });
+  const res = await fetch(`https://html.duckduckgo.com/html/?${params}`, {
+    headers: {
+      "User-Agent": UA,
+      Accept: "text/html",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) throw new Error(`DuckDuckGo ${res.status}`);
+  return parseDuck(await res.text(), max);
+}
+
+function parseDuck(html: string, max: number): SearchResult[] {
+  const out: SearchResult[] = [];
+  const re =
+    /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  const strip = (s: string) =>
+    s
+      .replace(/<[^>]*>/g, "")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#x27;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/\s+/g, " ")
+      .trim();
+  for (const m of html.matchAll(re)) {
+    if (out.length >= max) break;
+    // DDG 會包一層 redirect，取出 uddg 參數
+    let url = m[1];
+    const u = url.match(/[?&]uddg=([^&]+)/);
+    if (u) url = decodeURIComponent(u[1]);
+    const title = strip(m[2]);
+    if (title) out.push({ title, url, snippet: strip(m[3]) });
+  }
+  return out;
 }
 
 function parseBraveResults(html: string, max: number): SearchResult[] {

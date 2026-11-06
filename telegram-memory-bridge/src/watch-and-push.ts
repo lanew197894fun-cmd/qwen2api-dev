@@ -1,14 +1,14 @@
 /// <reference types="bun" />
 // watch-and-push.ts — 輕量檔案監聽 + 主動推送代理
 // 使用 polling 取代 recursive fs.watch，減少 Linux inotify 消耗
-// 有事做工，無事待命中
+// 有事做工，無事待命中 — 僅砍掉「待命中」「調整」「跳過」三種重複噪音
 
 import { watch } from "fs";
 import { readFile, readdir, stat, mkdir, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { resolve, dirname, relative } from "path";
 import { hostname } from "os";
-import { suggest } from "./governor";
+import { suggest } from "./governor.ts";
 
 // ── JS-length-aware truncation ──
 // JS `.length` = UTF-16 code units. Emoji (Non-BMP) = 2 units, Python `len()` = 1.
@@ -32,27 +32,55 @@ interface PushOpts {
   memoryRoot: string;
   knowledgeRoot: string;
   wikiRoot: string;
+  lessonRoot: string;
+}
+
+interface FileMeta {
+  path: string;
+  mtime: number;
 }
 
 interface PushHistory {
   memory: string[];
-  knowledge: string[];
-  wiki: string[];
+  knowledge: FileMeta[];
+  wiki: FileMeta[];
+  lesson: FileMeta[];
 }
 
 let _peerUrl = "";
 let _opts: PushOpts | null = null;
-let _history: PushHistory = { memory: [], knowledge: [], wiki: [] };
+let _history: PushHistory = { memory: [], knowledge: [], wiki: [], lesson: [] };
+
+function toMeta(p: string, m: number): FileMeta {
+  return { path: p, mtime: m };
+}
+
+function hasMeta(arr: FileMeta[], p: string, m: number): boolean {
+  const f = arr.find((x) => x.path === p);
+  return !!f && f.mtime >= m;
+}
+
+function upsertMeta(arr: FileMeta[], p: string, m: number): void {
+  const i = arr.findIndex((x) => x.path === p);
+  if (i >= 0) arr[i] = toMeta(p, m);
+  else arr.push(toMeta(p, m));
+}
 let _historyPath = "";
 let _busy = false;
+let _pollBusy = false;
 let _timer: ReturnType<typeof setTimeout> | null = null;
 let _pollTimer: ReturnType<typeof setInterval> | null = null;
+let _fsWatcher: ReturnType<typeof watch> | null = null;
 const _debounceMs = 5000;
-// P1.1 修復：使用 Governor 動態調整輪詢間隔，預設 120s
 let _pollMs = 120_000;
+let _pollCycle = 0;
 const BATCH_SIZE = 50;
 const BASE_DELAY_MS = 1000;
 const MAX_RETRIES = 5;
+
+function tag(): string {
+  return `[push ${new Date().toLocaleTimeString()}]`;
+}
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -94,30 +122,29 @@ async function pushWithBackoff(
   return { ok: false, status: 0 };
 }
 
-function tag(): string {
-  return `[push ${new Date().toLocaleTimeString()}]`;
-}
-function idle(): void {
-  console.log(`${tag()} 待命中...`);
-}
-
 async function loadHistory(): Promise<void> {
   if (!_historyPath) return;
   try {
-    if (existsSync(_historyPath))
-      _history = JSON.parse(await readFile(_historyPath, "utf-8"));
+    if (existsSync(_historyPath)) {
+      const loaded = JSON.parse(await readFile(_historyPath, "utf-8"));
+      _history.memory = loaded.memory ?? [];
+      _history.knowledge = loaded.knowledge ?? [];
+      _history.wiki = loaded.wiki ?? [];
+      _history.lesson = loaded.lesson ?? [];
+    }
   } catch {}
 }
 
 async function saveHistory(): Promise<void> {
   if (!_historyPath) return;
   try {
-    // 歷史過長時修剪（防止無限膨脹）
     if (_history.memory.length > 5000)
       _history.memory = _history.memory.slice(-3000);
     if (_history.knowledge.length > 2000)
       _history.knowledge = _history.knowledge.slice(-1000);
     if (_history.wiki.length > 2000) _history.wiki = _history.wiki.slice(-1000);
+    if (_history.lesson.length > 2000)
+      _history.lesson = _history.lesson.slice(-1000);
     await writeFile(_historyPath, JSON.stringify(_history), "utf-8");
   } catch {}
 }
@@ -147,10 +174,10 @@ async function pushBatch(
       const r = await pushFn(item);
       if (r.ok) success++;
       else errors++;
-      await sleep(50); // 節流：避免 burst 打爆 rate limit
+      await sleep(50);
     }
     if (b < batches.length - 1) {
-      const delay = Math.min(BASE_DELAY_MS * Math.pow(2, b), 30000); // 🐛 FIX: 上限 30 秒
+      const delay = Math.min(BASE_DELAY_MS * Math.pow(2, b), 30000);
       console.log(`${tag()} ⏱️ 批次間等待 ${delay}ms...`);
       await sleep(delay);
     }
@@ -161,10 +188,7 @@ async function pushBatch(
 const PUSH_TIMEOUT_MS = 60_000;
 
 async function doPush(): Promise<void> {
-  if (_busy) {
-    console.log(`${tag()} ⏳ 前次推送尚未完成，跳過本輪`);
-    return;
-  }
+  if (_busy) return;
   _busy = true;
   const device = hostname();
   let pushed = 0;
@@ -221,21 +245,28 @@ async function doPush(): Promise<void> {
         pushed += r.success;
       }
     }
-    await sleep(50); // 記憶→知識庫 節流
+    await saveHistory();
+    await sleep(50);
 
     // ── 知識庫 ──
     if (existsSync(_opts!.knowledgeRoot)) {
       const files = await walkDir(_opts!.knowledgeRoot);
-      const known = new Set(_history.knowledge);
-      const newFiles = files.filter((f) => !known.has(f));
+      const newFiles: { rel: string; mtime: number }[] = [];
+      for (const f of files) {
+        try {
+          const s = await stat(resolve(_opts!.knowledgeRoot, f));
+          const mtime = s.mtimeMs;
+          if (!hasMeta(_history.knowledge, f, mtime)) {
+            newFiles.push({ rel: f, mtime });
+          }
+        } catch {}
+      }
+
       if (newFiles.length > 0) {
-        const kItems = newFiles.map((rel) => ({
-          rel,
-          full: resolve(_opts!.knowledgeRoot, rel),
-        }));
         const r = await pushBatch(
-          kItems,
-          async ({ rel, full }) => {
+          newFiles,
+          async ({ rel, mtime }) => {
+            const full = resolve(_opts!.knowledgeRoot, rel);
             const content = await readFile(full, "utf-8");
             const title = rel.replace(/\.md$/, "").replace(/[_-]/g, " ");
             const result = await pushWithBackoff(
@@ -249,7 +280,7 @@ async function doPush(): Promise<void> {
               },
               15_000,
             );
-            if (result.ok) _history.knowledge.push(rel);
+            if (result.ok) upsertMeta(_history.knowledge, rel, mtime);
             return result;
           },
           "知識庫",
@@ -257,21 +288,28 @@ async function doPush(): Promise<void> {
         pushed += r.success;
       }
     }
-    await sleep(50); // 知識庫→維基 節流
+    await saveHistory();
+    await sleep(50);
 
     // ── 維基 ──
     if (existsSync(_opts!.wikiRoot)) {
       const files = await walkDir(_opts!.wikiRoot);
-      const known = new Set(_history.wiki);
-      const newFiles = files.filter((f) => !known.has(f));
+      const newFiles: { rel: string; mtime: number }[] = [];
+      for (const f of files) {
+        try {
+          const s = await stat(resolve(_opts!.wikiRoot, f));
+          const mtime = s.mtimeMs;
+          if (!hasMeta(_history.wiki, f, mtime)) {
+            newFiles.push({ rel: f, mtime });
+          }
+        } catch {}
+      }
+
       if (newFiles.length > 0) {
-        const wItems = newFiles.map((rel) => ({
-          rel,
-          full: resolve(_opts!.wikiRoot, rel),
-        }));
         const r = await pushBatch(
-          wItems,
-          async ({ rel, full }) => {
+          newFiles,
+          async ({ rel, mtime }) => {
+            const full = resolve(_opts!.wikiRoot, rel);
             const content = await readFile(full, "utf-8");
             const id = rel.replace(/\.md$/, "");
             const cat = dirname(rel) === "." ? "general" : dirname(rel);
@@ -286,10 +324,53 @@ async function doPush(): Promise<void> {
               },
               15_000,
             );
-            if (result.ok) _history.wiki.push(rel);
+            if (result.ok) upsertMeta(_history.wiki, rel, mtime);
             return result;
           },
           "維基",
+        );
+        pushed += r.success;
+      }
+    }
+    await saveHistory();
+    await sleep(50);
+
+    // ═══ Fix 2026-07-14: lesson 推送 — skill/lesson/ 目錄下的學習經驗 ═══
+    if (_opts!.lessonRoot && existsSync(_opts!.lessonRoot)) {
+      const files = await walkDir(_opts!.lessonRoot);
+      const newFiles: { rel: string; mtime: number }[] = [];
+      for (const f of files) {
+        try {
+          const s = await stat(resolve(_opts!.lessonRoot, f));
+          const mtime = s.mtimeMs;
+          if (!hasMeta(_history.lesson, f, mtime)) {
+            newFiles.push({ rel: f, mtime });
+          }
+        } catch {}
+      }
+
+      if (newFiles.length > 0) {
+        const r = await pushBatch(
+          newFiles,
+          async ({ rel, mtime }) => {
+            const full = resolve(_opts!.lessonRoot, rel);
+            const content = await readFile(full, "utf-8");
+            const id = rel.replace(/\.md$/, "");
+            const result = await pushWithBackoff(
+              `${_peerUrl}/api/push/wiki`,
+              {
+                id: `lesson/${id}`,
+                content,
+                category: "lesson",
+                tags: ["lesson", "peer", device],
+                _peer: device,
+              },
+              15_000,
+            );
+            if (result.ok) upsertMeta(_history.lesson, rel, mtime);
+            return result;
+          },
+          "學習經驗",
         );
         pushed += r.success;
       }
@@ -302,8 +383,7 @@ async function doPush(): Promise<void> {
     clearTimeout(timeoutId);
     _busy = false;
   }
-  if (pushed === 0) idle();
-  else console.log(`${tag()} ✅ 推送 ${pushed} 筆完成`);
+  if (pushed > 0) console.log(`${tag()} ✅ 推送 ${pushed} 筆完成`);
 }
 
 function trigger(): void {
@@ -331,9 +411,7 @@ async function walkDir(base: string): Promise<string[]> {
         const s = await stat(full);
         if (s.isDirectory()) await walk(full, prefix ? `${prefix}/${e}` : e);
         else if (e.endsWith(".md")) files.push(prefix ? `${prefix}/${e}` : e);
-      } catch {
-        /* skip */
-      }
+      } catch {}
     }
   };
   await walk(base, "");
@@ -351,11 +429,31 @@ async function dryRun(): Promise<number> {
   }
   if (existsSync(_opts!.knowledgeRoot)) {
     const files = await walkDir(_opts!.knowledgeRoot);
-    count += files.filter((f) => !new Set(_history.knowledge).has(f)).length;
+    for (const f of files) {
+      try {
+        const s = await stat(resolve(_opts!.knowledgeRoot, f));
+        if (!hasMeta(_history.knowledge, f, s.mtimeMs)) count++;
+      } catch {}
+    }
   }
   if (existsSync(_opts!.wikiRoot)) {
     const files = await walkDir(_opts!.wikiRoot);
-    count += files.filter((f) => !new Set(_history.wiki).has(f)).length;
+    for (const f of files) {
+      try {
+        const s = await stat(resolve(_opts!.wikiRoot, f));
+        if (!hasMeta(_history.wiki, f, s.mtimeMs)) count++;
+      } catch {}
+    }
+  }
+  // ═══ lesson dryRun ═══
+  if (_opts!.lessonRoot && existsSync(_opts!.lessonRoot)) {
+    const files = await walkDir(_opts!.lessonRoot);
+    for (const f of files) {
+      try {
+        const s = await stat(resolve(_opts!.lessonRoot, f));
+        if (!hasMeta(_history.lesson, f, s.mtimeMs)) count++;
+      } catch {}
+    }
   }
   return count;
 }
@@ -372,7 +470,7 @@ export async function startWatchAndPush(opts: PushOpts): Promise<void> {
     `[watch-push] 📡 記憶=${opts.memoryRoot} 知識=${opts.knowledgeRoot} 維基=${opts.wikiRoot}`,
   );
   console.log(
-    `[watch-push] 📋 歷史: ${_history.memory.length}M ${_history.knowledge.length}K ${_history.wiki.length}W`,
+    `[watch-push] 📋 歷史: ${_history.memory.length}M ${_history.knowledge.length}K ${_history.wiki.length}W ${_history.lesson.length}L`,
   );
 
   // 啟動後先檢查一次
@@ -380,43 +478,52 @@ export async function startWatchAndPush(opts: PushOpts): Promise<void> {
   if (n > 0) {
     console.log(`[watch-push] 🔍 ${n} 筆未推送`);
     await doPush();
-  } else idle();
+  }
 
   // ── 記憶索引：單檔 fs.watch（低成本） ──
   const idxPath = resolve(opts.memoryRoot, "memory-index.json");
-  try {
-    const w = watch(idxPath, (evt) => {
-      if (evt === "change") trigger();
-    });
-    // 不需要保存 watcher 到陣列，單檔無洩漏風險
-    // 但需要留著以便關閉。用 stopWatchAndPush 處理
-  } catch (err) {
-    console.log(`[watch-push] ⚠️ 無法監聽索引: ${(err as Error).message}`);
+  if (existsSync(idxPath)) {
+    try {
+      _fsWatcher = watch(idxPath, (evt) => {
+        if (evt === "change") trigger();
+      });
+    } catch (err) {
+      console.log(`[watch-push] ⚠️ 無法監聽索引: ${(err as Error).message}`);
+    }
+  } else {
+    console.log(`[watch-push] ℹ️ 索引尚未建立 (${idxPath})，polling 會接手`);
   }
 
-  // ── 知識庫 + 維基：polling 取代 recursive fs.watch（避免 inotify 爆炸） ──
-  // P1.1 修復：每輪檢查前根據 Governor 建議動態調整間隔
+  // ── 知識庫 + 維基：polling ──
   const runPoll = async () => {
-    const gov = suggest();
-    // Governor pollMs 是針對 bot idle 的建議，這裡我們映射到 watch-push 的輪詢
-    // 負載高時延長輪詢（減少 I/O），負載低時縮短輪詢（提高即時性）
-    const suggestedPollMs = gov.pollMs * 10; // bot poll 是秒級，watch-push 是分鐘級
-    if (suggestedPollMs !== _pollMs) {
-      console.log(
-        `[watch-push] 🔄 輪詢間隔調整: ${_pollMs / 1000}s → ${suggestedPollMs / 1000}s (${gov.info})`,
-      );
-      _pollMs = suggestedPollMs;
-      if (_pollTimer) clearInterval(_pollTimer);
-      _pollTimer = setInterval(runPoll, _pollMs);
+    if (_pollBusy) {
+      _pollTimer = setTimeout(runPoll, _pollMs) as unknown as ReturnType<
+        typeof setInterval
+      >;
+      return;
     }
-
-    const n = await dryRun();
-    if (n > 0) {
-      console.log(`[watch-push] 🔍 polling 發現 ${n} 筆新資料`);
-      doPush().catch(() => {});
+    _pollBusy = true;
+    try {
+      const gov = suggest();
+      const suggestedPollMs = gov.pollMs * 10;
+      if (suggestedPollMs !== _pollMs) {
+        _pollMs = suggestedPollMs;
+      }
+      const pending = await dryRun();
+      if (pending > 0) {
+        console.log(`[watch-push] 🔍 polling 發現 ${pending} 筆新資料`);
+        doPush().catch(() => {});
+      }
+    } finally {
+      _pollBusy = false;
+      _pollTimer = setTimeout(runPoll, _pollMs) as unknown as ReturnType<
+        typeof setInterval
+      >;
     }
   };
-  _pollTimer = setInterval(runPoll, _pollMs);
+  _pollTimer = setTimeout(runPoll, _pollMs) as unknown as ReturnType<
+    typeof setInterval
+  >;
 
   console.log(
     `[watch-push] ✅ 就緒（fs.watch 索引 + polling ${_pollMs / 1000}s 知識/維基）`,
@@ -425,8 +532,13 @@ export async function startWatchAndPush(opts: PushOpts): Promise<void> {
 
 export function stopWatchAndPush(): void {
   if (_timer) clearTimeout(_timer);
-  if (_pollTimer) clearInterval(_pollTimer);
+  if (_pollTimer) clearTimeout(_pollTimer);
+  if (_fsWatcher) {
+    _fsWatcher.close();
+    _fsWatcher = null;
+  }
   _timer = null;
   _pollTimer = null;
+  _pollBusy = false;
   console.log(`[watch-push] ⏹ 已停止`);
 }

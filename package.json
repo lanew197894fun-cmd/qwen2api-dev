@@ -1,0 +1,10 @@
+{
+  "name": "qwen2api-dev",
+  "version": "2026.07.01",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun start.mjs",
+    "stop": "bun start.mjs --stop"
+  }
+}

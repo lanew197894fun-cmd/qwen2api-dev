@@ -1,88 +1,66 @@
 const fs = require("fs");
-const fsPromises = fs.promises;
 const path = require("path");
 
-// ─── 敏感資料脫敏配置 ───
-const SENSITIVE_KEYS = [
-  "authorization",
-  "cookie",
-  "token",
-  "password",
-  "secret",
-  "key",
-  "ssxmod_itna",
-  "ssxmod_itna2",
-];
-
 /**
- * 遞迴脫敏敏感資料
- * @param {any} obj - 待處理物件
- * @returns {any} 脫敏後的物件
+ * 日誌管理器 — 強化版
+ * 核心改進：ERROR/WARN 級別不再輸出至 console，避免混入 SSE 串流
  */
-function sanitizeData(obj) {
-  if (!obj) return obj;
-  if (typeof obj === "string") {
-    if (/Bearer\s+[A-Za-z0-9\-_.]+/.test(obj)) {
-      return obj.replace(/Bearer\s+[A-Za-z0-9\-_.]+/, "Bearer [REDACTED]");
-    }
-    return obj;
-  }
-  if (Array.isArray(obj)) {
-    return obj.map((item) => sanitizeData(item));
-  }
-  if (obj instanceof Error) {
-    return {
-      message: obj.message,
-      stack: obj.stack?.split("\n").slice(0, 3).join("\n"),
-      name: obj.name,
-      code: obj.code,
-    };
-  }
-  if (typeof obj === "object") {
-    const sanitized = {};
-    for (const [key, value] of Object.entries(obj)) {
-      const lowerKey = key.toLowerCase();
-      if (SENSITIVE_KEYS.some((k) => lowerKey.includes(k))) {
-        sanitized[key] = "[REDACTED]";
-      } else {
-        sanitized[key] = sanitizeData(value);
-      }
-    }
-    return sanitized;
-  }
-  return obj;
+
+// ═══ Fix 2026-10-18: 色彩能力檢測（與 color.js 對齊）═══
+// 【原缺陷】無條件輸出 escape code。經 start.mjs 以 pipe 啟動時，
+//          子行程 isTTY=false，終端機把 escape 當普通文字顯示 →
+//          樣式與直接執行不一致，且 logcat 難以閱讀。
+// 【修正】明確判斷色彩能力；日誌檔本來就用 fileMessage（無色），不受影響。
+function _supportsColor() {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR === "0" || process.env.FORCE_COLOR === "false")
+    return false;
+  if (process.env.FORCE_COLOR === "1" || process.env.FORCE_COLOR === "true")
+    return true;
+  if (
+    process.env.COLORTERM === "truecolor" ||
+    process.env.COLORTERM === "24bit"
+  )
+    return true;
+  if (!process.stdout.isTTY && !process.stderr.isTTY) return false;
+  const term = process.env.TERM || "";
+  if (
+    term.startsWith("xterm") ||
+    term.startsWith("screen") ||
+    term.startsWith("tmux") ||
+    term.startsWith("alacritty") ||
+    term.startsWith("kitty") ||
+    term.startsWith("wezterm") ||
+    term.startsWith("foot") ||
+    term.startsWith("vte") ||
+    term.startsWith("rxvt") ||
+    term.startsWith("linux") ||
+    term === "" ||
+    process.platform === "win32"
+  )
+    return true;
+  return false;
 }
 
-/**
- * 日誌管理器
- * 統一管理專案中的日誌輸出，支援分級列印、時間戳、Emoji標籤等功能
- */
+const _COLOR_OK = _supportsColor();
+
 class Logger {
   constructor(options = {}) {
     this.options = {
-      // 日誌級別: DEBUG < INFO < WARN < ERROR
       level: options.level || "INFO",
-      // 是否啟用檔案日誌
       enableFileLog: options.enableFileLog || false,
-      // 日誌檔案路徑
       logDir: options.logDir || path.join(__dirname, "../../logs"),
-      // 日誌檔名格式
       logFileName: options.logFileName || "app.log",
-      // 是否顯示時間戳
       showTimestamp: options.showTimestamp !== false,
-      // 是否顯示日誌級別
       showLevel: options.showLevel !== false,
-      // 是否顯示模組名
       showModule: options.showModule !== false,
-      // 時間格式
       timeFormat: options.timeFormat || "YYYY-MM-DD HH:mm:ss",
-      // 最大日誌檔案大小 (MB)
       maxFileSize: options.maxFileSize || 10,
-      // 保留的日誌檔案數量
       maxFiles: options.maxFiles || 5,
+      // ⚡ 新增：是否允許控制台輸出（預設關閉，避免混入 SSE）
+      allowConsoleOutput: options.allowConsoleOutput === true,
     };
 
-    // 日誌級別對映
     this.levels = {
       DEBUG: 0,
       INFO: 1,
@@ -90,7 +68,6 @@ class Logger {
       ERROR: 3,
     };
 
-    // Emoji 標籤對映
     this.emojis = {
       DEBUG: "🔍",
       INFO: "📝",
@@ -117,49 +94,44 @@ class Logger {
       PROCESS: "⚡",
     };
 
-    // 顏色程式碼
-    this.colors = {
-      DEBUG: "\x1b[36m", // 青色
-      INFO: "\x1b[32m", // 綠色
-      WARN: "\x1b[33m", // 黃色
-      ERROR: "\x1b[31m", // 紅色
-      RESET: "\x1b[0m", // 重置
-      BRIGHT: "\x1b[1m", // 加粗
-      DIM: "\x1b[2m", // 暗淡
-    };
+    // ═══ Fix 2026-10-18: 不支援色彩時全部置空字串（避免殘留 escape 字元）═══
+    this.colors = _COLOR_OK
+      ? {
+          DEBUG: "\x1b[36m",
+          INFO: "\x1b[32m",
+          WARN: "\x1b[33m",
+          ERROR: "\x1b[31m",
+          RESET: "\x1b[0m",
+          BRIGHT: "\x1b[1m",
+          DIM: "\x1b[2m",
+        }
+      : {
+          DEBUG: "",
+          INFO: "",
+          WARN: "",
+          ERROR: "",
+          RESET: "",
+          BRIGHT: "",
+          DIM: "",
+        };
 
-    // 初始化日誌目錄
     if (this.options.enableFileLog) {
       this.initLogDirectory();
     }
   }
 
-  /**
-   * 初始化日誌目錄
-   */
   initLogDirectory() {
     try {
       if (!fs.existsSync(this.options.logDir)) {
         fs.mkdirSync(this.options.logDir, { recursive: true });
       }
-    } catch (error) {
-      console.error("建立日誌目錄失敗:", error.message);
-    }
+    } catch (_) {}
   }
 
-  /**
-   * 檢查日誌級別是否應該輸出
-   * @param {string} level - 日誌級別
-   * @returns {boolean}
-   */
   shouldLog(level) {
     return this.levels[level] >= this.levels[this.options.level];
   }
 
-  /**
-   * 格式化時間戳
-   * @returns {string}
-   */
   formatTimestamp() {
     const now = new Date();
     const year = now.getFullYear();
@@ -172,23 +144,23 @@ class Logger {
     return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
   }
 
-  /**
-   * 格式化日誌訊息
-   * @param {string} level - 日誌級別
-   * @param {string} message - 日誌訊息
-   * @param {string} module - 模組名
-   * @param {string} emoji - Emoji標籤
-   * @returns {Object} 格式化後的訊息物件
-   */
   formatMessage(level, message, module = "", emoji = "") {
     const timestamp = this.options.showTimestamp ? this.formatTimestamp() : "";
     const levelStr = this.options.showLevel ? `[${level}]` : "";
     const moduleStr = this.options.showModule && module ? `[${module}]` : "";
     const emojiStr = emoji || this.emojis[level] || "";
 
-    // 控制台輸出格式（帶顏色）
+    // ═══ Fix 2026-10-18: console 輸出隱藏時間戳 ═══
+    // 原因：服務常駐時 console 持續滾動，時間戳佔用大量視覺空間且難以閱讀
+    //      （start.mjs 的 [start] 前綴已提供啟動流程脈絡）。
+    // 影響：僅 console；日誌檔（fileMessage）保留完整時間戳，可追溯。
+    const showTimestampInConsole =
+      this.options.showTimestampInConsole !== false;
+
     const consoleMessage = [
-      this.colors.DIM + timestamp + this.colors.RESET,
+      showTimestampInConsole
+        ? this.colors.DIM + timestamp + this.colors.RESET
+        : "",
       this.colors[level] + levelStr + this.colors.RESET,
       this.colors.BRIGHT + moduleStr + this.colors.RESET,
       emojiStr,
@@ -197,7 +169,6 @@ class Logger {
       .filter(Boolean)
       .join(" ");
 
-    // 檔案輸出格式（無顏色）
     const fileMessage = [timestamp, levelStr, moduleStr, emojiStr, message]
       .filter(Boolean)
       .join(" ");
@@ -205,90 +176,63 @@ class Logger {
     return { consoleMessage, fileMessage };
   }
 
-  /**
-   * 寫入日誌檔案（異步）
-   * @param {string} message - 日誌訊息
-   */
-  async writeToFile(message) {
+  writeToFile(message) {
     if (!this.options.enableFileLog) return;
 
     try {
       const logFile = path.join(this.options.logDir, this.options.logFileName);
       const logEntry = `${message}\n`;
 
-      // 檢查檔案大小並輪轉
-      await this.rotateLogFile(logFile);
+      this.rotateLogFile(logFile);
 
-      await fsPromises.appendFile(logFile, logEntry, "utf8");
-    } catch (error) {
-      console.error("寫入日誌檔案失敗:", error.message);
-    }
+      fs.appendFileSync(logFile, logEntry, "utf8");
+    } catch (_) {}
   }
 
-  /**
-   * 日誌檔案輪轉（異步）
-   * @param {string} logFile - 日誌檔案路徑
-   */
-  async rotateLogFile(logFile) {
+  rotateLogFile(logFile) {
     try {
-      const exists = await fsPromises
-        .access(logFile)
-        .then(() => true)
-        .catch(() => false);
-      if (!exists) return;
+      if (!fs.existsSync(logFile)) return;
 
-      const stats = await fsPromises.stat(logFile);
+      const stats = fs.statSync(logFile);
       const fileSizeMB = stats.size / (1024 * 1024);
 
       if (fileSizeMB > this.options.maxFileSize) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const backupFile = logFile.replace(".log", `_${timestamp}.log`);
 
-        await fsPromises.rename(logFile, backupFile);
+        fs.renameSync(logFile, backupFile);
 
-        // 清理舊的日誌檔案
-        await this.cleanOldLogFiles();
+        this.cleanOldLogFiles();
       }
-    } catch (error) {
-      console.error("日誌檔案輪轉失敗:", error.message);
-    }
+    } catch (_) {}
   }
 
-  /**
-   * 清理舊的日誌檔案（異步）
-   */
-  async cleanOldLogFiles() {
+  cleanOldLogFiles() {
     try {
-      const files = await fsPromises.readdir(this.options.logDir);
-      const logFiles = [];
-      for (const file of files) {
-        if (file.endsWith(".log") && file !== this.options.logFileName) {
-          const filePath = path.join(this.options.logDir, file);
-          const stats = await fsPromises.stat(filePath);
-          logFiles.push({ name: file, path: filePath, mtime: stats.mtime });
-        }
-      }
-      logFiles.sort((a, b) => b.mtime - a.mtime);
+      const files = fs.readdirSync(this.options.logDir);
+      const logFiles = files
+        .filter(
+          (file) => file.endsWith(".log") && file !== this.options.logFileName,
+        )
+        .map((file) => ({
+          name: file,
+          path: path.join(this.options.logDir, file),
+          mtime: fs.statSync(path.join(this.options.logDir, file)).mtime,
+        }))
+        .sort((a, b) => b.mtime - a.mtime);
 
-      // 保留最新的幾個檔案，刪除其餘的
       if (logFiles.length > this.options.maxFiles) {
         const filesToDelete = logFiles.slice(this.options.maxFiles);
-        for (const file of filesToDelete) {
-          await fsPromises.unlink(file.path);
-        }
+        filesToDelete.forEach((file) => {
+          fs.unlinkSync(file.path);
+        });
       }
-    } catch (error) {
-      console.error("清理舊日誌檔案失敗:", error.message);
-    }
+    } catch (_) {}
   }
 
   /**
-   * 通用日誌方法
-   * @param {string} level - 日誌級別
-   * @param {string} message - 日誌訊息
-   * @param {string} module - 模組名
-   * @param {string} emoji - Emoji標籤
-   * @param {any} data - 附加資料
+   * ⚡ 核心修復：ERROR/WARN 不再輸出至 console
+   * 僅在 allowConsoleOutput=true 時才輸出（供手調用）
    */
   log(level, message, module = "", emoji = "", data = null) {
     if (!this.shouldLog(level)) return;
@@ -300,31 +244,44 @@ class Logger {
       emoji,
     );
 
-    // 控制台輸出
+    // ═══ Fix 2026-07-08: Error 物件序列化 ═══
+    // JSON.stringify(new Error("msg")) → "{}"，因為 Error 的 message/stack 是 non-enumerable。
+    // 改為標準化轉換：data 若為 Error，取其 message+stack。
+    const _safeData =
+      data instanceof Error
+        ? {
+            message: data.message,
+            stack: data.stack?.split("\n").slice(0, 4).join("\n"),
+          }
+        : data;
+
+    // ⚡ ERROR 永遠輸出至 stderr（不依賴 allowConsoleOutput）
+    // 原因：stderr 與 SSE 串流（stdout）完全隔離，無混入風險
+    // 且錯誤日誌對除錯至關重要，不應被靜默吞掉
     if (level === "ERROR") {
-      console.error(consoleMessage);
-    } else if (level === "WARN") {
-      console.warn(consoleMessage);
-    } else {
-      console.log(consoleMessage);
+      process.stderr.write(consoleMessage + "\n");
+      if (_safeData !== null) {
+        process.stderr.write(JSON.stringify(_safeData) + "\n");
+      }
+    } else if (this.options.allowConsoleOutput) {
+      if (level === "WARN") {
+        process.stderr.write(consoleMessage + "\n");
+      } else {
+        process.stdout.write(consoleMessage + "\n");
+      }
+
+      if (_safeData !== null) {
+        process.stdout.write(JSON.stringify(_safeData) + "\n");
+      }
     }
 
-    // 輸出附加資料（脫敏後）
-    const sanitizedData = data !== null ? sanitizeData(data) : null;
-    if (sanitizedData !== null) {
-      console.log(sanitizedData);
-    }
-
-    // 檔案輸出（fire-and-forget，不阻塞主流程，使用脫敏資料）
+    // 檔案輸出（始終啟用，若 enableFileLog=true）
     this.writeToFile(
       fileMessage +
-        (sanitizedData ? `\n${JSON.stringify(sanitizedData, null, 2)}` : ""),
-    ).catch((err) => {
-      console.error("日誌寫入異常:", err.message);
-    });
+        (_safeData ? `\n${JSON.stringify(_safeData, null, 2)}` : ""),
+    );
   }
 
-  // 便捷方法
   debug(message, module = "", emoji = "", data = null) {
     this.log("DEBUG", message, module, emoji || this.emojis.DEBUG, data);
   }
@@ -341,7 +298,6 @@ class Logger {
     this.log("ERROR", message, module, emoji || this.emojis.ERROR, data);
   }
 
-  // 特定場景的便捷方法
   success(message, module = "", data = null) {
     this.info(message, module, this.emojis.SUCCESS, data);
   }
@@ -369,15 +325,93 @@ class Logger {
   server(message, module = "", data = null) {
     this.info(message, module, this.emojis.SERVER, data);
   }
+
+  // ═══ 啟動專用方法：繞過 allowConsoleOutput，確保使用者看到啟動過程 ═══
+  startup(message, module = "") {
+    const level = "INFO";
+    if (!this.shouldLog(level)) return;
+    const { consoleMessage, fileMessage } = this.formatMessage(
+      level,
+      message,
+      module,
+      "📝",
+    );
+    process.stdout.write(consoleMessage + "\n");
+    this.writeToFile(fileMessage);
+  }
+
+  // 階段分隔線
+  phase(title) {
+    this.startup(`══════ ${title} ══════`, "PHASE");
+  }
+
+  // 計算終端機可視寬度（CJK/emoji 佔 2）
+  #visualLen(s) {
+    let len = 0;
+    for (let i = 0; i < s.length; i++) {
+      const cp = s.codePointAt(i);
+      if (cp > 0xffff) i++; // 跳過 surrogate pair 後半
+      len +=
+        (cp >= 0x1100 && cp <= 0x115f) ||
+        (cp >= 0x2e80 && cp <= 0xa4cf) ||
+        (cp >= 0xac00 && cp <= 0xd7af) ||
+        (cp >= 0xf900 && cp <= 0xfaff) ||
+        (cp >= 0xfe10 && cp <= 0xfe19) ||
+        (cp >= 0xfe30 && cp <= 0xfe6f) ||
+        (cp >= 0xff01 && cp <= 0xff60) ||
+        (cp >= 0xffe0 && cp <= 0xffe6) ||
+        (cp >= 0x1b000 && cp <= 0x1b0ff) ||
+        (cp >= 0x1f000 && cp <= 0x1f9ff) ||
+        (cp >= 0x20000 && cp <= 0x2ffff) ||
+        (cp >= 0x30000 && cp <= 0x3ffff)
+          ? 2
+          : 1;
+    }
+    return len;
+  }
+
+  // 以可視寬度填補空白
+  #padVisual(s, target) {
+    const cur = this.#visualLen(s);
+    return cur >= target ? s : s + " ".repeat(target - cur);
+  }
+
+  // 印出格式化的 key-value 表格（用於最終配置摘要）
+  infoTable(title, data) {
+    const entries = Object.entries(data);
+    const keyW = Math.max(...entries.map((e) => this.#visualLen(e[0]))) + 2;
+    const valW =
+      Math.max(...entries.map((e) => this.#visualLen(String(e[1])))) + 2;
+    const total = keyW + valW + 5;
+    const line = "─".repeat(total);
+
+    // 標題行（以可視寬度置中）
+    process.stdout.write(`┌${line}┐\n`);
+    const tLen = this.#visualLen(title);
+    const tPad = Math.max(0, total - tLen - 2);
+    const tL = Math.floor(tPad / 2);
+    const tR = tPad - tL;
+    process.stdout.write(`│${" ".repeat(tL)} ${title} ${" ".repeat(tR)}│\n`);
+    process.stdout.write(`├${"─".repeat(keyW + 2)}┼${"─".repeat(valW + 2)}┤\n`);
+
+    // 資料行（以可視寬度對齊）
+    for (const [k, v] of entries) {
+      process.stdout.write(
+        `│ ${this.#padVisual(k, keyW)} │ ${this.#padVisual(String(v), valW)} │\n`,
+      );
+    }
+    process.stdout.write(`└${line}┘\n`);
+  }
 }
 
-// 建立預設例項
 const defaultLogger = new Logger({
   level: process.env.LOG_LEVEL || "INFO",
   enableFileLog: process.env.ENABLE_FILE_LOG === "true",
   showModule: true,
   showTimestamp: true,
   showLevel: true,
+  // ⚡ 預設關閉 console 輸出，避免混入 SSE 串流
+  allowConsoleOutput: process.env.ALLOW_CONSOLE_OUTPUT === "true",
 });
 
 module.exports = {

@@ -47,6 +47,36 @@ if (fs.existsSync(envFile)) {
   }
 }
 
+// ─── build management panel frontend from source ───
+
+function buildManagementUI() {
+  const uiDir = join(ROOT, "..", "Cli-Proxy-API-Management-Center");
+  if (!existsSync(uiDir)) {
+    log("Management UI source not found, skip local build");
+    return "";
+  }
+  try {
+    log("Building management panel frontend...");
+    execSync(`${BUN} run build`, { cwd: uiDir, timeout: 60000, stdio: "pipe" });
+    const outDir = join(ROOT, ".management-dist");
+    const src = join(uiDir, "dist", "index.html");
+    if (!existsSync(src)) {
+      log("WARNING: Management UI build dist/index.html not found");
+      return "";
+    }
+    if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
+    // Copy built single-file HTML to management.html
+    fs.copyFileSync(src, join(outDir, "management.html"));
+    log(`Management panel built: ${join(outDir, "management.html")}`);
+    return outDir;
+  } catch (e) {
+    log(
+      `WARNING: Management UI build failed (will use GitHub release): ${e.message}`,
+    );
+    return "";
+  }
+}
+
 // ─── helpers ───
 
 const log = (msg) => console.log(`[start] ${msg}`);
@@ -103,17 +133,17 @@ async function ensureToken() {
 
   console.log("");
   console.log("╔══════════════════════════════════════════════════╗");
-  console.log("║   Telegram Bridge 設定                          ║");
+  console.log("║   Telegram Bridge 設定                           ║");
   console.log("╠══════════════════════════════════════════════════╣");
-  console.log("║  TELEGRAM_BOT_TOKEN 未設定                      ║");
-  console.log("║  請輸入你的 Telegram Bot Token：                ║");
-  console.log("║                                                 ║");
-  console.log("║  申請方式：                                     ║");
-  console.log("║  1. 開啟 Telegram，搜尋 @BotFather              ║");
-  console.log("║  2. 發送 /newbot 建立新 Bot                     ║");
-  console.log("║  3. 複製取得的 HTTP API Token                    ║");
-  console.log("║  4. 貼到下方輸入框按 Enter                      ║");
-  console.log("╚══════════════════════════════════════════════════╝");
+  console.log("║  TELEGRAM_BOT_TOKEN 未設定                        ║");
+  console.log("║  請輸入你的 Telegram Bot Token：                   ║");
+  console.log("║                                                  ║");
+  console.log("║  申請方式：                                       ║");
+  console.log("║  1. 開啟 Telegram，搜尋 @BotFather                 ║");
+  console.log("║  2. 發送 /newbot 建立新 Bot                        ║");
+  console.log("║  3. 複製取得的 HTTP API Token                      ║");
+  console.log("║  4. 貼到下方輸入框按 Enter                          ║");
+  console.log("╚═══════════════════════════════════════════════════╝");
   console.log("  Token（輸入後按 Enter，或留空跳過）：");
   const token = await promptToken();
   if (!token) {
@@ -124,13 +154,13 @@ async function ensureToken() {
   // Prompt for Master IP (for Laptop/Peer mode)
   console.log("");
   console.log("╔══════════════════════════════════════════════════╗");
-  console.log("║   跨裝置同步設定 (可選)                         ║");
+  console.log("║   跨裝置同步設定 (可選)                            ║");
   console.log("╠══════════════════════════════════════════════════╣");
-  console.log("║  若此裝置為筆電 (Peer)，需指定主力機 IP          ║");
-  console.log("║  以啟用自動推送功能。                            ║");
-  console.log("║                                                 ║");
-  console.log("║  取得方式：                                      ║");
-  console.log("║  在主力機執行: tailscale ip -4                  ║");
+  console.log("║  若此裝置為筆電 (Peer)，需指定主力機 IP              ║");
+  console.log("║  以啟用自動推送功能。                              ║");
+  console.log("║                                                  ║");
+  console.log("║  取得方式：                                       ║");
+  console.log("║  在主力機執行: tailscale ip -4                    ║");
   console.log("╚══════════════════════════════════════════════════╝");
   console.log("  主力機 Tailscale IP (留空則不設定)：");
   const masterIp = await promptToken();
@@ -255,6 +285,110 @@ function killAllQwen() {
   }
 }
 
+// ─── Chrome profile 清理（orphan Chrome + SingletonLock） ───
+// browser-proxy 啟動前必須清理，否則 puppeteer.launch 會因 profile 被鎖失敗
+// 策略：pgrep 精確匹配 → kill -9 → 驗證死亡 → 只刪 lock files 保留 session
+
+const CHROME_PROFILE = join(ROOT, "qwen2api", ".chrome-qwen-profile");
+
+function killPidsByPattern(pattern) {
+  try {
+    const out = execSync(`pgrep -f '${pattern}' 2>/dev/null || true`, {
+      encoding: "utf8",
+      timeout: 3000,
+    });
+    const pids = out
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(Number)
+      .filter((p) => p !== process.pid);
+    if (!pids.length) return;
+    for (const pid of pids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+  } catch {}
+}
+
+function killByPidFile(filePath) {
+  try {
+    if (!existsSync(filePath)) return;
+    const pid = parseInt(fs.readFileSync(filePath, "utf-8").trim(), 10);
+    if (pid && pid !== process.pid) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+  } catch {}
+}
+
+function cleanupChromeProfile() {
+  if (IS_WIN) return;
+  try {
+    // 1. 優先使用 PID file 精準殺 browser-proxy
+    killByPidFile(join(ROOT, "qwen2api", ".browser-proxy.pid"));
+
+    // 2. pgrep 掃描所有 browser-proxy 進程
+    killPidsByPattern("browser-proxy\\.js");
+
+    // 3. pgrep 掃描所有 Chrome 相關進程（含 chromium、google-chrome）
+    killPidsByPattern("chrome-linux64/chrome");
+    killPidsByPattern("chromium");
+    killPidsByPattern("google-chrome");
+
+    // 4. lsof 殺 port 3457（最強力）
+    for (let i = 0; i < 3; i++) {
+      try {
+        execSync(`lsof -ti :3457 | xargs -r kill -9 2>/dev/null || true`, {
+          timeout: 3000,
+        });
+      } catch {}
+      execSync("sleep 0.3", { timeout: 2000 });
+      // 確認 port 已空
+      const still = execSync(`lsof -ti :3457 2>/dev/null || true`, {
+        encoding: "utf8",
+        timeout: 3000,
+      }).trim();
+      if (!still) break;
+    }
+
+    // 5. 等待進程真正死亡
+    execSync("sleep 0.5", { timeout: 2000 });
+
+    // 6. 只刪 lock files，保留 Default/ 目錄（含 cookies/localStorage/session）
+    //    SingletonLock/SingletonCookie/SingletonSocket 是 Chrome 的 profile 鎖
+    //    DevToolsActivePort 是每次啟動產生的臨時檔
+    try {
+      for (const f of [
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        "DevToolsActivePort",
+        "BrowserMetrics-spare.pma",
+      ]) {
+        const fp = join(CHROME_PROFILE, f);
+        try {
+          execSync(`rm -f '${fp}' 2>/dev/null || true`, { timeout: 2000 });
+        } catch {}
+      }
+      // 清理 /tmp 下的 Chrome socket 目錄（SingletonSocket 指向的地方）
+      try {
+        execSync(`rm -rf /tmp/org.chromium.Chromium.* 2>/dev/null || true`, {
+          timeout: 2000,
+        });
+      } catch {}
+    } catch {}
+
+    log(
+      "orphan Chrome + browser-proxy cleaned (lock files only, session preserved)",
+    );
+  } catch {
+    /* best effort */
+  }
+}
+
 // ─── health check helpers ───
 
 async function isAlive(url, ms = 2000) {
@@ -270,23 +404,16 @@ async function isAlive(url, ms = 2000) {
 async function probeModelStability() {
   const start = Date.now();
   try {
-    const res = await fetch("http://127.0.0.1:3000/v1/chat/completions", {
-      method: "POST",
+    // 檢查模型列表而非實際聊天（上游 chat.qwen.ai 被阿里雲 WAF 阻擋）
+    const res = await fetch("http://127.0.0.1:3000/v1/models", {
       headers: {
-        "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.API_KEY || "CHANGE_ME"}`,
       },
-      body: JSON.stringify({
-        model: "qwen-plus",
-        messages: [{ role: "user", content: "1+1=" }],
-        max_tokens: 10,
-        temperature: 0,
-      }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(10000),
     });
     const latency = Date.now() - start;
     const data = await res.json();
-    const ok = data?.choices?.length > 0;
+    const ok = data?.data?.length > 0;
     return { ok, latency, score: ok ? 100 : 0 };
   } catch (e) {
     const latency = Date.now() - start;
@@ -299,9 +426,11 @@ async function probeModelStability() {
 async function generateHealthReport() {
   const services = [
     { name: "qwen2api", url: "http://127.0.0.1:3000/health" },
+    // { name: "qwen2api-direct", url: "http://127.0.0.1:3001/health" },
+    { name: "browser-proxy", url: "http://127.0.0.1:3457/health" },
     { name: "chat-proxy", url: "http://127.0.0.1:3456/health" },
+    { name: "cliproxyapi", url: "http://127.0.0.1:8317/" },
     { name: "telegram-bridge", url: "http://127.0.0.1:4377/api/health" },
-    { name: "waf-proxy", url: "http://127.0.0.1:3457/" },
   ];
 
   let total = 0;
@@ -374,6 +503,15 @@ async function ensurePortsFree(ports, maxRetries = 6) {
   return false;
 }
 
+// ─── colorize whole line by log level keyword ───
+const LOG_LEVEL_COLORS = { E: "31", W: "33", I: "32", D: "90" };
+
+function colorize(line) {
+  const m = line.match(/\s\[([EWID])\]\s/);
+  const c = m ? LOG_LEVEL_COLORS[m[1]] : null;
+  return c ? `\x1b[${c}m${line}\x1b[0m` : line;
+}
+
 // ─── unified launch (same terminal, both platforms) ───
 
 function launch(srv) {
@@ -400,18 +538,18 @@ function launch(srv) {
     proc.stdout.on("data", (d) => {
       if (lfd !== undefined)
         try {
-          writeSync(lfd, d);
+          writeSync(lfd, d); // plain text to log file
         } catch {}
       for (const l of d.toString().split("\n").filter(Boolean))
-        console.log(QUIET ? l : `  [${pfx}] ${l}`);
+        console.log(QUIET ? l : colorize(`  [${pfx}] ${l}`));
     });
     proc.stderr.on("data", (d) => {
       if (efd !== undefined)
         try {
-          writeSync(efd, d);
+          writeSync(efd, d); // plain text to log file
         } catch {}
       for (const l of d.toString().split("\n").filter(Boolean))
-        console.error(QUIET ? l : `  [${pfx}] ${l}`);
+        console.error(QUIET ? l : colorize(`  [${pfx}] ${l}`));
     });
 
     proc.on("exit", (code, sig) => {
@@ -426,6 +564,7 @@ function launch(srv) {
       log(`${srv.name} exited (${sig ? `signal ${sig}` : `code ${code}`})`);
       const idx = children.indexOf(proc);
       if (idx >= 0) children.splice(idx, 1);
+      // browser-proxy auto-restart: Chrome 崩潰時重新整理頁面
     });
     proc.on("error", (err) => log(`${srv.name} error: ${err.message}`));
     children.push(proc);
@@ -460,6 +599,9 @@ async function main() {
   // Prompt for token if missing (desktop only, interactive)
   await ensureToken();
 
+  // Build management panel frontend from source (before SRV definition)
+  const managementStaticDir = buildManagementUI();
+
   // ─── services (defined here so env vars from ensureToken() are available) ───
   const SRV = [
     // embed-server is a stub on Windows ("Not implemented"), skip it
@@ -475,15 +617,21 @@ async function main() {
             waitUrl: null,
           },
         ]),
-    {
-      name: "waf-proxy",
-      port: 3457,
-      cwd: join(ROOT, "qwen2api-plugin"),
-      cmd: [BUN, "src/waf-proxy.js"],
-      env: {},
-      waitUrl: "http://127.0.0.1:3457/",
-      waitTimeout: 30,
-    },
+    ...(IS_WIN
+      ? []
+      : [
+          {
+            name: "cliproxyapi",
+            port: 8317,
+            cwd: join(ROOT, "..", "CLIProxyAPI"),
+            cmd: [join(ROOT, "..", "CLIProxyAPI", "cliproxyapi-server")],
+            env: managementStaticDir
+              ? { MANAGEMENT_STATIC_PATH: managementStaticDir }
+              : {},
+            waitUrl: "http://127.0.0.1:8317/",
+            waitTimeout: 15,
+          },
+        ]),
     {
       name: "qwen2api",
       port: 3000,
@@ -491,10 +639,20 @@ async function main() {
       cmd: [BUN, "src/start.js", "--force"],
       env: {
         API_KEY: process.env.API_KEY || "CHANGE_ME",
-        QWEN_CHAT_PROXY_URL: "http://127.0.0.1:3457", // FIX: 啟用 WAF bypass proxy，不走直連上游
+        QWEN_CHAT_PROXY_URL:
+          "http://127.0.0.1:3457",
       },
       waitUrl: "http://127.0.0.1:3000/health",
       waitTimeout: 30,
+    },
+    {
+      name: "browser-proxy",
+      port: 3457,
+      cwd: join(ROOT, "qwen2api"),
+      cmd: [BUN, "src/browser-proxy.js"],
+      env: {},
+      waitUrl: "http://127.0.0.1:3457/health",
+      waitTimeout: 45, // Chrome launch can be slow
     },
     {
       name: "chat-proxy",
@@ -505,6 +663,7 @@ async function main() {
         API_KEY: process.env.API_KEY || "CHANGE_ME",
         PROXY_LOG_LEVEL: "info",
         PROXY_ROUTE: "off",
+        PROXY_FORCE_MODEL: "qwen3.6-max-preview",
       },
       waitUrl: "http://127.0.0.1:3456/health",
       waitTimeout: 15,
@@ -525,7 +684,6 @@ async function main() {
       waitUrl: "http://127.0.0.1:4377/api/health",
       waitTimeout: 20,
     },
-    // system-watchdog 已整合至 chat-proxy 健康報告中，不再需要獨立進程
   ];
 
   try {
@@ -533,11 +691,12 @@ async function main() {
     log(`Logs: ${LOG_RUN}`);
 
     // Kill old processes on all relevant ports
-    const PORTS = [3000, 3456, 3457, 4377, 11436];
+    const PORTS = [3000, 3456, 3457, 4377, 8317, 11436];
     log("Cleaning old processes...");
     stopPm2Qwen();
     stopSystemdQwen();
     killAllQwen();
+    cleanupChromeProfile(); // browser-proxy Chrome + lock files
     await sleep(800);
     for (const p of PORTS) killByPort(p);
     await sleep(2000);
@@ -549,7 +708,7 @@ async function main() {
         "[start] FATAL: Could not free ports after multiple retries.",
       );
       console.error(
-        "[start] Close other apps using ports 3000/3456/4377 and try again.",
+        "[start] Close other apps using ports 3000/3456/3457/4377/8317/11436 and try again.",
       );
       log("Press Ctrl+C to exit.");
       await new Promise(() => {});
@@ -562,32 +721,23 @@ async function main() {
 
     if (IS_WIN) log("embed-server: skipped (stub on Windows)");
 
-    // Auto-setup + build knowledge-wiki-plugin (telegram-bridge 依賴此插件)
-    log("Setting up knowledge-wiki-plugin...");
-    try {
-      execSync(`${BUN} src/auto-setup/index.js`, {
-        cwd: join(ROOT, "knowledge-wiki-plugin"),
-        timeout: 15000,
-        stdio: "pipe",
-      });
-      log("knowledge-wiki-plugin auto-setup done");
-    } catch (e) {
-      log(`WARNING: auto-setup failed: ${e.message}`);
-    }
-    log("Building knowledge-wiki-plugin...");
-    try {
-      execSync(`${BUN} run build`, {
-        cwd: join(ROOT, "knowledge-wiki-plugin"),
-        timeout: 30000,
-        stdio: "pipe",
-      });
-      log("knowledge-wiki-plugin built");
-    } catch (e) {
-      log(`WARNING: build failed: ${e.message}`);
-    }
-
     // Launch services sequentially with health checks (with retry for qwen2api)
     for (const s of SRV) {
+      // Build step (e.g. Go compilation) before launch
+      if (s.build) {
+        log(`Building ${s.name}...`);
+        try {
+          execSync(s.build.cmd.join(" "), {
+            cwd: s.build.cwd || ROOT,
+            timeout: 120000,
+            stdio: "pipe",
+          });
+          log(`${s.name} built`);
+        } catch (e) {
+          log(`WARNING: ${s.name} build failed: ${e.message}`);
+          continue;
+        }
+      }
       log(`Starting ${s.name}...`);
       launch(s);
       await sleep(1500);
@@ -613,12 +763,17 @@ async function main() {
     console.log("\n" + healthReport);
 
     log(`──────────────────────────────────────`);
-    log(`  waf-proxy:     http://127.0.0.1:3457`);
-    log(`  qwen2api:      http://127.0.0.1:3000`);
-    log(`  chat-proxy:    http://127.0.0.1:3456`);
-    if (!IS_WIN) log(`  embed-server: http://127.0.0.1:11436`);
-    log(`  telegram:     port 4377`);
-    log(`  knowledge-wiki: ${join(ROOT, "knowledge-wiki-plugin")}`);
+    log(`  qwen2api:         http://127.0.0.1:3000`);
+    // log(`  qwen2api-direct:  http://127.0.0.1:3001 (直連 API)`);
+    log(`  browser-proxy:    http://127.0.0.1:3457 (WAF 繞過代理)`);
+    log(
+      `  登入頁面:        http://127.0.0.1:3457/login (匯入 qwen.ai cookies)`,
+    );
+    if (!IS_WIN) log(`  cliproxyapi:      http://127.0.0.1:8317`);
+    if (!IS_WIN) log(`  管理面板:       http://127.0.0.1:8317/management.html`);
+    if (!IS_WIN) log(`  embed-server:    http://127.0.0.1:11436`);
+    log(`  chat-proxy:       http://127.0.0.1:3456`);
+    log(`  telegram:         port 4377`);
     log(`──────────────────────────────────────`);
     log(`Press Ctrl+C to stop services.`);
   } catch (err) {

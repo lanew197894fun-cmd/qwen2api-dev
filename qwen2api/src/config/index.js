@@ -2,8 +2,8 @@ const dotenv = require("dotenv");
 dotenv.config();
 
 /**
- * 解析API_KEY環境變數，支援逗號分隔的多個key
- * @returns {Object} 包含apiKeys陣列和adminKey的物件
+ * 解析 API_KEY 環境變數，支援逗號分隔的多個 key
+ * @returns {Object} 包含 apiKeys 陣列和 adminKey 的物件
  */
 const parseApiKeys = () => {
   const apiKeyEnv = process.env.API_KEY;
@@ -32,7 +32,9 @@ const config = {
     parseInt(process.env.BATCH_LOGIN_CONCURRENCY) || 5,
   ),
   simpleModelMap: process.env.SIMPLE_MODEL_MAP === "true" ? true : false,
-  listenAddress: process.env.LISTEN_ADDRESS || "127.0.0.1",
+  listenAddress:
+    process.env.LISTEN_ADDRESS ||
+    (process.env.TAILSCALE_IP ? "0.0.0.0" : "127.0.0.1"),
   listenPort: process.env.SERVICE_PORT || 3000,
   searchInfoMode: process.env.SEARCH_INFO_MODE === "table" ? "table" : "text",
   outThink: process.env.OUTPUT_THINK === "true" ? true : false,
@@ -45,13 +47,19 @@ const config = {
   logDir: process.env.LOG_DIR || "./logs",
   maxLogFileSize: parseInt(process.env.MAX_LOG_FILE_SIZE) || 10,
   maxLogFiles: parseInt(process.env.MAX_LOG_FILES) || 5,
-  // 自定義反代URL配置
+  // 自定義反代 URL 配置
   qwenChatProxyUrl: process.env.QWEN_CHAT_PROXY_URL || "https://chat.qwen.ai",
   qwenCliProxyUrl: process.env.QWEN_CLI_PROXY_URL || "https://portal.qwen.ai",
   // 代理配置
   proxyUrl: process.env.PROXY_URL || null,
-  // 加密配置：設為 64 字元 HEX 或 Base64 編碼的 32-byte 金鑰
-  encryptionEnabled: !!process.env.ENCRYPTION_KEY,
+  // chat 請求重試配置（運行時可被 web UI 覆蓋，見 src/utils/data-persistence.js#loadSettings）
+  chatRetryCount: Math.max(0, parseInt(process.env.CHAT_RETRY_COUNT, 10) || 1),
+  chatRetryBackoffMs: Math.max(
+    0,
+    parseInt(process.env.CHAT_RETRY_BACKOFF_MS, 10) || 400,
+  ),
+  // 關閉 API Key 驗證（開發/內部環境）
+  authDisabled: process.env.AUTH_DISABLED === "true",
 };
 
 module.exports = config;

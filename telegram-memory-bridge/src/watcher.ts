@@ -3,7 +3,7 @@
 // 防抖 3s，避免批次寫入時重複執行
 
 import { watch } from "fs";
-import type { Indexer, IndexerPaths } from "./indexer";
+import type { Indexer, IndexerPaths } from "./indexer.ts";
 
 export class DirWatcher {
   private indexer: Indexer;

@@ -1,7 +1,7 @@
 // Telegram Memory Bridge — lock.ts
 // 防雙開：PID lock + 本地埠檢查 + 跨裝置檢查（僅 master 模式使用）
 
-import { hostname, homedir } from "os";
+import { hostname } from "os";
 import { resolve } from "path";
 import {
   readFileSync,
@@ -11,8 +11,9 @@ import {
   mkdirSync,
 } from "fs";
 import { execSync } from "child_process";
+import { OPENCODE_DIR } from "../../config/paths.js";
 
-const pidDir = resolve(homedir(), ".opencode");
+const pidDir = resolve(OPENCODE_DIR, "pids");
 const pidFile = resolve(pidDir, "telegram-bridge.pid");
 
 // 確保目錄存在

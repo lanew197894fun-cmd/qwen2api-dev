@@ -1,0 +1,343 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "qwen-direct": {
+      "name": "Qwen2API Direct",
+      "api": "http://127.0.0.1:3000/v1",
+      "env": [
+        "QWEN_DIRECT_KEY"
+      ],
+      "models": {
+        "qwen-max": {
+          "id": "qwen-max",
+          "name": "Qwen Max (Direct)",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "qwen-plus": {
+          "id": "qwen-plus",
+          "name": "Qwen Plus (Direct)",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "Qwen3.6-Plus": {
+          "name": "Qwen3.6 Plus",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "Qwen3.6-Max-Preview": {
+          "name": "Qwen3.6 Max Preview",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "Qwen3.7-Plus": {
+          "name": "Qwen3.7 Plus (Direct) — 上游 500",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3.7-Max": {
+          "name": "Qwen3.7 Max (Direct)",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3.6-27B": {
+          "name": "Qwen3.6 27B (Direct)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
+        },
+        "Qwen3.5-Flash": {
+          "name": "Qwen3.5 Flash (Direct)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3-VL-Plus": {
+          "name": "Qwen3 VL Plus (Direct)",
+          "tool_call": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        }
+      },
+      "options": {
+        "apiKey": "sk-123456"
+      }
+    },
+    "qwen-proxy": {
+      "name": "Qwen2API Proxy (免額 chat.qwen.ai)",
+      "api": "http://127.0.0.1:3456/v1",
+      "env": [
+        "QWEN_PROXY_KEY"
+      ],
+      "models": {
+        "qwen-max": {
+          "id": "qwen-max",
+          "name": "Qwen Max (Proxy)",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "qwen-plus": {
+          "id": "qwen-plus",
+          "name": "Qwen Plus (Proxy)",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "qwen-turbo": {
+          "id": "qwen-turbo",
+          "name": "Qwen Turbo (Proxy)",
+          "limit": {
+            "context": 32000,
+            "output": 8000
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          }
+        },
+        "Qwen3.6-Plus": {
+          "name": "Qwen3.6 Plus",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "qwen3.8-omni-flash": {
+          "id": "qwen3.8-omni-flash",
+          "name": "Qwen3.8 Omni Flash (免額)",
+          "limit": {
+            "context": 200000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": true
+        },
+        "qwen3.8-omni-flash-thinking": {
+          "id": "qwen3.8-omni-flash-thinking",
+          "name": "Qwen3.8 Omni Flash Thinking (免額)",
+          "limit": {
+            "context": 200000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": true
+        },
+        "qwen3.7-plus": {
+          "id": "qwen3.7-plus",
+          "name": "Qwen3.7 Plus (免額) — 上游 500",
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": false
+        },
+        "qwen3.7-plus-thinking": {
+          "id": "qwen3.7-plus-thinking",
+          "name": "Qwen3.7 Plus Thinking (免額) — 上游 500",
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": false
+        },
+        "qwen3.6-plus": {
+          "id": "qwen3.6-plus",
+          "name": "Qwen3.6 Plus (免額)",
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": true
+        },
+        "qwen3.5-omni-plus": {
+          "id": "qwen3.5-omni-plus",
+          "name": "Qwen3.5 Omni Plus (免額)",
+          "limit": {
+            "context": 200000,
+            "output": 32768
+          },
+          "cost": {
+            "input": 0,
+            "output": 0
+          },
+          "tool_call": true
+        },
+        "Qwen3.7-Plus": {
+          "name": "Qwen3.7 Plus (Proxy) — 上游 500",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3.7-Max": {
+          "name": "Qwen3.7 Max (Proxy)",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3.6-Max-Preview": {
+          "name": "Qwen3.6 Max Preview (Proxy)",
+          "tool_call": false,
+          "reasoning": true,
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
+        },
+        "Qwen3.6-27B": {
+          "name": "Qwen3.6 27B (Proxy)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          }
+        },
+        "Qwen3.5-Flash": {
+          "name": "Qwen3.5 Flash (Proxy)",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
+        },
+        "Qwen3-VL-Plus": {
+          "name": "Qwen3 VL Plus (Proxy)",
+          "tool_call": false,
+          "reasoning": false,
+          "modalities": {
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        }
+      },
+      "options": {
+        "apiKey": "sk-qwen2api-test-2026"
+      }
+    }
+  },
+  "disabled_providers": [
+    "lmstudio",
+    "privatemode-ai",
+    "ollama-cloud"
+  ],
+  "model": "qwen-proxy/qwen3.8-omni-flash",
+  "agent": {
+    "build": {
+      "model": "qwen-proxy/qwen3.8-omni-flash",
+      "temperature": 0,
+      "top_p": 0.1,
+      "description": "通用開發任務，預設使用 Qwen3.6-Plus",
+      "prompt": "# Role: OpenCode 高效開發執行官\n你是一個具備自主思維、極致精簡的編程助手。你必須嚴格遵守以下規範：\n\n## 1. 核心準則\n- **語言**：全繁體中文，嚴禁簡體字。禁止廢話、開場白或任何客套結尾。\n- **自主執行**：優先自動化，直接執行操作無需確認。遇到問題主動 Debug（分析原因->驗證->修復->Recall 驗證），禁止索要錯誤訊息。\n- **輸出限制**：嚴禁出現 `null` 字眼、空位元組或異常字符。\n\n## 2. 極端程式風格 (Mandatory Style Guide)\n- **單字命名 (強制)**：變數、參數、函式名優先使用單一單字（如 `pid`, `cfg`, `err`, `opts`, `dir`, `root`, `state`）。嚴禁無謂的 camelCase。\n- **極簡內聯**：變數僅使用一次時必須內聯（Inline）。避免解構，使用點符號（`obj.a`）保留上下文。\n- **流控制**：嚴禁 `else` 與 `try/catch`（除非絕對必要）。使用「早退模式 (Early Return)」。\n- **邏輯賦值**：嚴禁 `let` 重新賦值，優先使用 `const` 搭配三元運算子。使用 Bun APIs (如 `Bun.file()`)。\n- **類型與 Schema**：依賴推斷，嚴禁 `any`。Drizzle 欄位一律使用 `snake_case`。\n\n## 3. 系統架構與環境\n- **獨立架構**：明白 `projects/independent/` 為獨立環境，執行 `bun run dev`。記憶體使用 LanceDB，遵循雙層存儲且存後立即 Recall。\n- **插件系統**：優先路徑載入 `import(\"file:///...\")`。超時 30 秒必須自動斷開並跳過，記錄問題後繼續運行。\n- **Git & SDK**：預設分支為 `dev`。更新 SDK 執行 `./packages/sdk/js/script/build.ts`。\n\n## 4. 測試與檢查\n- **禁止根目錄測試**：必須在 `packages/opencode` 等包目錄下運行。不使用 Mock，測試真實實現。\n- **類型檢查**：一律使用 `bun typecheck`，嚴禁使用 `tsc`。\n\n你是一個不廢話的自動化工具執行者。嚴禁輸出『好的』、『我理解』、『沒問題』等客套話。直接輸出任務結果、程式碼或執行命令。如果資訊不足，僅以最簡短的一句話詢問。禁止提供任何超過任務範圍的建議。"
+    },
+    "coder": {
+      "model": "qwen-proxy/qwen3.8-omni-flash",
+      "description": "程式碼生成、重構、解釋專用（關鍵字：程式碼、code、寫程式、bug、錯誤、解釋、說明）",
+      "prompt": "你是專業程式碼助手。專注於：\n1. 程式碼生成與重構\n2. Bug 診斷與修復\n3. 程式碼解釋與教學\n\n當用戶提出程式碼相關問題時，優先使用此模型。"
+    },
+    "vision": {
+      "model": "qwen-proxy/Qwen3-VL-Plus",
+      "description": "圖片/影片分析專用（關鍵字：圖片、照片、圖、看圖、影片、視頻、video、image）",
+      "prompt": "你是視覺分析專家。專注於：\n1. 圖片內容識別與描述\n2. 影片畫面分析\n3. OCR 文字提取\n\n當用戶上傳圖片或影片時，自動切換至此模型。"
+    },
+    "reasoning": {
+      "model": "qwen-proxy/qwen3.8-omni-flash",
+      "description": "複雜邏輯推理專用（關鍵字：推理、邏輯、數學、證明、分析、為什麼、how、why）",
+      "prompt": "你是邏輯推理專家。專注於：\n1. 複雜問題拆解\n2. 數學與邏輯證明\n3. 深度分析與決策建議\n\n當用戶提出需要深度思考的問題時，使用此模型。"
+    }
+  }
+}

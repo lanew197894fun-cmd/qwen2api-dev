@@ -1,13 +1,50 @@
 // Telegram Memory Bridge — peer-puller.ts
 // 桌機 bridge 偵測到筆電上線時，自動拉取新記憶/知識/維基/教訓
 // 🔒 安全：寫入後驗證內容 hash 一致，才對來源端發起 cleanup
+// 🔄 穩定性：內建指數退避重試機制，應對網路波動
 
 import { readFile, writeFile, mkdir, rename } from "fs/promises";
 import { existsSync, readdirSync, statSync } from "fs";
 import { resolve } from "path";
 import { createHash } from "crypto";
-import type { MemStore } from "./store";
-import type { MemEntry } from "./types";
+import type { MemStore } from "./store.ts";
+import type { MemEntry } from "./types.ts";
+
+/** 指數退避重試 fetch（含 HTTP 5xx 重試） */
+async function fetchWithRetry(
+  url: string,
+  opts: RequestInit & { signal?: AbortSignal },
+  maxRetries = 3,
+): Promise<Response> {
+  let lastErr: Error | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, opts);
+      // 重試伺服器錯誤（5xx）或特定客戶端錯誤（429 Too Many Requests）
+      if ((res.status >= 500 || res.status === 429) && attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000;
+        console.log(
+          `[pull]   🔄 HTTP ${res.status} 重試 ${url} (${attempt + 1}/${maxRetries})，${delay}ms 後重試...`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err as Error;
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+        console.log(
+          `[pull]   🔄 網路異常重試 ${url} (${attempt + 1}/${maxRetries})，${delay}ms 後重試...`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw (
+    lastErr || new Error(`Fetch failed after ${maxRetries} retries: ${url}`)
+  );
+}
 
 interface PullResult {
   memory: number;
@@ -46,7 +83,7 @@ export async function pullFromPeer(
 
   // ── 拉取記憶 ──
   try {
-    const listRes = await fetch(`${base}/api/list`, {
+    const listRes = await fetchWithRetry(`${base}/api/list`, {
       signal: AbortSignal.timeout(8000),
     });
     if (listRes.ok) {
@@ -74,9 +111,12 @@ export async function pullFromPeer(
         );
         for (const e of newEntries) {
           try {
-            const contentRes = await fetch(`${base}/api/entry/${e.id}`, {
-              signal: AbortSignal.timeout(5000),
-            });
+            const contentRes = await fetchWithRetry(
+              `${base}/api/entry/${e.id}`,
+              {
+                signal: AbortSignal.timeout(5000),
+              },
+            );
             let content = e.summary;
             if (contentRes.ok) {
               const body = (await contentRes.json()) as { content: string };
@@ -119,7 +159,7 @@ export async function pullFromPeer(
   ]) {
     if (!section.localDir) continue;
     try {
-      const listRes = await fetch(`${base}/api/${section.remote}`, {
+      const listRes = await fetchWithRetry(`${base}/api/${section.remote}`, {
         signal: AbortSignal.timeout(8000),
       });
       if (!listRes.ok) continue;
@@ -138,7 +178,7 @@ export async function pullFromPeer(
       );
       for (const rel of newFiles) {
         try {
-          const readRes = await fetch(
+          const readRes = await fetchWithRetry(
             `${base}/api/read?type=${section.remote}&path=${encodeURIComponent(rel)}`,
             { signal: AbortSignal.timeout(10000) },
           );
@@ -188,7 +228,7 @@ export async function pullFromPeer(
   // ── 通知來源端清理已驗證的檔案 ──
   if (synced.length > 0) {
     try {
-      const cleanupRes = await fetch(`${base}/api/cleanup`, {
+      const cleanupRes = await fetchWithRetry(`${base}/api/cleanup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ files: synced }),

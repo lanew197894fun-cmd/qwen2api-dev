@@ -2,14 +2,45 @@
 // 追蹤 AI API 延遲 + 錯誤率 + 系統負載 + 佇列深度，動態調整節奏
 // 無依賴，單例模組，可從 store/bot/processor 共用
 
-import { loadavg, cpus } from "os";
+import { cpus } from "os";
+
+// ── Windows 相容 CPU 負載偵測 ──
+// os.loadavg() 在 Windows 永遠回傳 [0,0,0]（Bun 也受影響）
+// 改用 CPU 使用率採樣作為替代方案
+let _cpuSamples: number[] = [];
+let _lastCPUTime = getCPUTotal();
+function getCPUTotal(): number {
+  try {
+    return cpus().reduce((s, c) => {
+      const t = c.times;
+      return s + t.user + t.nice + t.sys + t.idle + t.irq;
+    }, 0);
+  } catch {
+    return 0;
+  }
+}
+function sampleCPU(): number {
+  try {
+    const now = getCPUTotal();
+    const idle = cpus().reduce((s, c) => s + c.times.idle, 0);
+    const prevIdle = _lastCPUTime === 0 ? idle : idle;
+    const totalDiff = now - _lastCPUTime;
+    const idleDiff = idle - prevIdle;
+    _lastCPUTime = now;
+    if (totalDiff <= 0)
+      return _cpuSamples.length > 0 ? _cpuSamples[_cpuSamples.length - 1] : 0.3;
+    return 1 - idleDiff / totalDiff;
+  } catch {
+    return 0.3;
+  }
+}
 
 // ── 狀態 ──
 
 const apiLatencies: number[] = [];
 const errorAt: number[] = [];
 let inflight = 0;
-let queueDepth = 0; // semaphore 等待佇列深度
+let queueDepth = 0;
 const MAX_SAMPLES = 20;
 
 // ── API ──
@@ -61,17 +92,25 @@ export function suggest(): Suggestion {
 
   // ── pollMs ──
   let pollMs = 2000;
-  if (avg > 25_000 || load > 0.8 || recentErr >= 3) pollMs = 10_000;
-  else if (avg > 15_000 || load > 0.65 || recentErr >= 2) pollMs = 6_000;
-  else if (avg > 8_000 || load > 0.5 || recentErr >= 1) pollMs = 4_000;
+  // 🐛 FIX: 進一步提高延遲閾值以適應 Max/Thinking 模型的長推理時間 (40-90s)
+  if (avg > 90_000 || load > 0.95 || recentErr >= 4) pollMs = 15_000;
+  else if (avg > 45_000 || load > 0.85 || recentErr >= 3) pollMs = 8_000;
+  else if (avg > 20_000 || load > 0.7 || recentErr >= 2) pollMs = 5_000;
 
   // ── skipBg ──
-  const skipBg = load > 0.7 || avg > 18_000 || recentErr >= 2;
+  // P0 修復：收緊 queueDepth 保護閾值，避免 semaphore 滿載時仍接受請求
+  // 原邏輯允許 queueDepth < 15 時繼續，但實際上 semaphore 在 depth >= 5 時已接近飽和
+  const isBusyButHealthy = inflight > 0 && recentErr === 0 && queueDepth < 5;
+  const skipBg =
+    !isBusyButHealthy &&
+    (load > 0.9 || avg > 90_000 || recentErr >= 4 || queueDepth >= 10);
 
   // ── maxConc ──
-  let maxConc = 3;
-  if (avg > 18_000 || load > 0.7) maxConc = 1;
-  else if (avg > 10_000 || load > 0.5) maxConc = 2;
+  let maxConc = 4; // P0: 提高基礎併發數以適應筆電低負載環境
+  // 🐛 FIX: 進一步放寬併發限制，避免長推理任務時完全阻塞新請求
+  if (avg > 120_000 || load > 0.95)
+    maxConc = 2; // 極端延遲才降級
+  else if (avg > 60_000 || load > 0.85) maxConc = 3;
 
   // ── modelTier — 依據負載 + 佇列深度動態降級 ──
   // 佇列深度權重：每 5 個排隊 +1 級降級
@@ -97,6 +136,7 @@ export function suggest(): Suggestion {
   info.push(`maxc=${maxConc}`);
   info.push(`tier=${modelTier}`);
   if (skipAIfIfTrivial) info.push("skip-ai");
+  if (totalPenalty >= 1) info.push(`penalty=${totalPenalty}`);
 
   return {
     pollMs,
@@ -108,19 +148,20 @@ export function suggest(): Suggestion {
   };
 }
 
-// ── 系統負載偵測 ──
+// ── 系統負載偵測（跨平台：Windows + Linux/macOS） ──
 
 let lastLoadCheck = 0;
 let cachedLoad = 0.3;
 
 function getLoad(): number {
   const now = Date.now();
-  if (now - lastLoadCheck < 10_000) return cachedLoad; // 10s 快取
+  if (now - lastLoadCheck < 10_000) return cachedLoad;
   lastLoadCheck = now;
   try {
-    const [load1] = loadavg();
-    const cores = cpus().length;
-    cachedLoad = cores > 0 ? load1 / cores : 0.3;
+    const load = sampleCPU();
+    _cpuSamples.push(load);
+    if (_cpuSamples.length > 5) _cpuSamples.shift();
+    cachedLoad = _cpuSamples.reduce((a, b) => a + b, 0) / _cpuSamples.length;
   } catch {
     cachedLoad = 0.3;
   }
@@ -128,6 +169,9 @@ function getLoad(): number {
 }
 
 // ── 主動監控服務 ──
+// P33 修復：使用 globalThis 跨模組儲存 interval ID
+// 熱重載時新模組可清除舊模組殘留的 interval，防止泄漏
+const GOV_MONITOR_KEY = "__governorMonitorInterval";
 
 let monitorInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -136,26 +180,40 @@ let monitorInterval: ReturnType<typeof setInterval> | null = null;
  * @param intervalMs 採集間隔（預設 10000ms）
  */
 export function startMonitoring(intervalMs = 10_000): void {
+  // 清除熱重載殘留的舊 interval
+  const existing = (globalThis as any)[GOV_MONITOR_KEY];
+  if (existing) {
+    clearInterval(existing);
+    console.warn("[governor] 清除殘留監控 interval (hot-reload)");
+  }
+
   if (monitorInterval) {
     console.warn("[governor] 監控已啟動，忽略重複呼叫");
     return;
   }
 
   console.log(`[governor] 啟動主動監控，間隔 ${intervalMs}ms`);
-  monitorInterval = setInterval(() => {
+  const id = setInterval(() => {
     const s = suggest();
-    // 僅在狀態變化時記錄，避免日誌洪水
-    console.log(`[governor:tick] ${s.info}`);
+    // 已禁用常規 tick 日誌，僅在 debug 模式下開啟
+    // console.log(`[governor:tick] ${s.info}`);
   }, intervalMs);
+  monitorInterval = id;
+  (globalThis as any)[GOV_MONITOR_KEY] = id;
 }
 
 /**
  * 停止 Governor 主動監控
  */
 export function stopMonitoring(): void {
+  const id = (globalThis as any)[GOV_MONITOR_KEY];
+  if (id) {
+    clearInterval(id);
+    (globalThis as any)[GOV_MONITOR_KEY] = null;
+  }
   if (monitorInterval) {
     clearInterval(monitorInterval);
     monitorInterval = null;
-    console.log("[governor] 停止主動監控");
   }
+  console.log("[governor] 停止主動監控");
 }

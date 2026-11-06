@@ -4,37 +4,82 @@
 import { resolve } from "path";
 import { readFile } from "fs/promises";
 import { existsSync, readFileSync } from "fs";
-import { FileProvider } from "../../knowledge-wiki-plugin/src/provider/file-provider";
+import { FileProvider } from "../../knowledge-wiki-plugin/src/provider/file-provider.ts";
+// 使用集中管理的跨裝置路徑
+import {
+  OPENCODE_DIR,
+  KNOWLEDGE_DIR,
+  WIKI_DIR,
+  LESSON_DIR,
+} from "../../config/paths.js";
 
 let provider: FileProvider | null = null;
 let initialized = false;
+let initializing = false;
 
 export async function initKnowledgeTools(
   dir: string,
   knowledgePath?: string,
   wikiPath?: string,
+  lessonPath?: string,
 ) {
   if (initialized) return;
-  provider = new FileProvider();
-  await provider.init({
-    dir,
-    cfg: {
-      knowledgePath: knowledgePath || resolve(dir, ".opencode", "knowledge"),
-      wikiPath: wikiPath || resolve(dir, ".wiki"),
-    },
-  });
-  initialized = true;
+  if (initializing) {
+    // 等待其他請求完成初始化
+    while (initializing) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return;
+  }
+  initializing = true;
+  try {
+    const kbPath = knowledgePath || KNOWLEDGE_DIR;
+    const wkPath = wikiPath || WIKI_DIR;
+    const lsPath = lessonPath || LESSON_DIR;
+
+    provider = new FileProvider();
+    await provider.init({
+      dir,
+      cfg: {
+        knowledgePath: kbPath,
+        wikiPath: wkPath,
+        lessonPath: lsPath,
+      },
+    });
+    initialized = true;
+  } catch (err) {
+    console.error("[knowledge-tools] 初始化失敗:", (err as Error).message);
+    throw err;
+  } finally {
+    initializing = false;
+  }
 }
 
-function getProvider(): FileProvider {
-  if (!provider) throw new Error("Knowledge tools not initialized");
+async function getProvider(): Promise<FileProvider> {
+  if (!provider) {
+    // Lazy init: 嘗試自動初始化（使用預設路徑）
+    console.warn("[knowledge-tools] Provider 未初始化，嘗試自動初始化...");
+    const defaultDir = resolve(__dirname, "..");
+    try {
+      await initKnowledgeTools(defaultDir);
+    } catch (err) {
+      console.error(
+        "[knowledge-tools] 自動初始化失敗:",
+        (err as Error).message,
+      );
+      throw new Error("Knowledge tools initialization failed");
+    }
+  }
+  if (!provider) {
+    throw new Error("Knowledge tools not initialized after retry");
+  }
   return provider;
 }
 
 // ── Knowledge tools ──
 
 export async function knowledgeSave(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const title = args.title || "untitled";
   const content = args.content || "";
   if (!content) return { ok: false, output: "", error: "content required" };
@@ -66,7 +111,7 @@ export async function knowledgeSave(args: Record<string, string>) {
 }
 
 export async function knowledgeRead(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const title = args.title || "";
   if (!title) return { ok: false, output: "", error: "title required" };
 
@@ -79,7 +124,7 @@ export async function knowledgeRead(args: Record<string, string>) {
 }
 
 export async function knowledgeIndex(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const entries = await p.listKnowledge(
     args.category,
     args.sortBy || "date",
@@ -87,7 +132,8 @@ export async function knowledgeIndex(args: Record<string, string>) {
   );
   if (entries.length === 0) return { ok: true, output: "📭 知識庫為空" };
   const lines = entries.map(
-    (e, i) => `${i + 1}. ${e.title} [${e.category}] ${e.createdAt}`,
+    (e: any, i: number) =>
+      `${i + 1}. ${e.title} [${e.category}] ${e.createdAt}`,
   );
   return {
     ok: true,
@@ -96,7 +142,7 @@ export async function knowledgeIndex(args: Record<string, string>) {
 }
 
 export async function knowledgeDeduplicate(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const threshold = parseFloat(args.threshold || "0.9");
   const dryRun = args.dryRun !== "false";
   const { groups } = await p.deduplicate(threshold, dryRun);
@@ -112,7 +158,7 @@ export async function knowledgeDeduplicate(args: Record<string, string>) {
 // ── Lesson tools ──
 
 export async function lessonSave(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const title = args.title || "untitled";
   const text = `${title} ${args.scenario || ""} ${args.mistake || ""}`;
   const severity = args.severity || p.detectSeverity(text);
@@ -146,11 +192,11 @@ export async function lessonSave(args: Record<string, string>) {
 }
 
 export async function lessonList(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const entries = await p.listLessons(args.severity);
   if (entries.length === 0) return { ok: true, output: "📭 尚無教訓" };
   const lines = entries.map(
-    (e) => `[${e.severity}] ${e.title} (${e.createdAt})`,
+    (e: any) => `[${e.severity}] ${e.title} (${e.createdAt})`,
   );
   return {
     ok: true,
@@ -161,7 +207,7 @@ export async function lessonList(args: Record<string, string>) {
 // ── Wiki tools ──
 
 export async function wikiSave(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const title = args.title || "untitled";
   const content = args.content || "";
   if (!content) return { ok: false, output: "", error: "content required" };
@@ -184,11 +230,12 @@ export async function wikiSave(args: Record<string, string>) {
 }
 
 export async function wikiList(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const entries = await p.listWiki(args.category, parseInt(args.limit || "20"));
   if (entries.length === 0) return { ok: true, output: "📭 維基為空" };
   const lines = entries.map(
-    (e, i) => `${i + 1}. ${e.title} [${e.category}] ${e.createdAt}`,
+    (e: any, i: number) =>
+      `${i + 1}. ${e.title} [${e.category}] ${e.createdAt}`,
   );
   return {
     ok: true,
@@ -197,7 +244,7 @@ export async function wikiList(args: Record<string, string>) {
 }
 
 export async function wikiRead(args: Record<string, string>) {
-  const p = getProvider();
+  const p = await getProvider();
   const title = args.title || "";
   if (!title) return { ok: false, output: "", error: "title required" };
   const entry = await p.readWiki(title, args.category);

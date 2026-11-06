@@ -5,7 +5,7 @@
 import { readdir, readFile, writeFile, mkdir, stat } from "fs/promises";
 import { existsSync, renameSync } from "fs";
 import { resolve, dirname, relative } from "path";
-import type { MemStore } from "./store";
+import type { MemStore } from "./store.ts";
 
 // ── 型別 ──
 

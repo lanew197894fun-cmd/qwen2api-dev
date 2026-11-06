@@ -28,13 +28,12 @@ import {
 import { join, basename } from "node:path";
 import { existsSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { makeLogger } from "./color.js";
 
-// ─── 路徑常數 ───
-const ROOT = "/home/reamaster/opencode-manager/projects/.opencode";
-const LESSON_DIR = join(ROOT, "skill", "lesson-learned");
-const WIKI_DIR = join(ROOT, "wiki");
+// ─── 路徑 ───
+import { OPENCODE_DIR, LESSON_DIR, WIKI_DIR } from "./config/paths.js";
 const KNOWLEDGE_AUTOSAVE = join(
-  ROOT,
+  OPENCODE_DIR,
   "skill",
   "knowledge-autosave",
   "scripts",
@@ -43,30 +42,7 @@ const KNOWLEDGE_AUTOSAVE = join(
 const LESSON_INDEX = join(LESSON_DIR, "index.md");
 const WIKI_INDEX = join(WIKI_DIR, "wiki-index-full.json");
 
-// ─── PROXY_LOG_LEVEL 感知日誌 ───
-const LOG_LV = (() => {
-  const raw = process.env.PROXY_LOG_LEVEL;
-  if (
-    raw &&
-    { silent: 0, error: 1, warn: 2, info: 3, debug: 4 }[raw] !== undefined
-  )
-    return { silent: 0, error: 1, warn: 2, info: 3, debug: 4 }[raw];
-  return 1; // 預設 error
-})();
-const alog = {
-  debug: (...a) => {
-    if (LOG_LV >= 4) console.log("[auto-judge]", ...a);
-  },
-  info: (...a) => {
-    if (LOG_LV >= 3) console.log("[auto-judge]", ...a);
-  },
-  warn: (...a) => {
-    if (LOG_LV >= 2) console.warn("[auto-judge]", ...a);
-  },
-  error: (...a) => {
-    if (LOG_LV >= 1) console.error("[auto-judge]", ...a);
-  },
-};
+const alog = makeLogger("auto-judge", "warning");
 
 // ─── 分類對應 ───
 const CATEGORIES = {
@@ -500,7 +476,7 @@ async function writeWiki({ title, content, fix, source }) {
 
   // 嘗試透過 knowledge-autosave 同步（非同步，不阻塞）
   if (existsSync(KNOWLEDGE_AUTOSAVE)) {
-    const kbPath = join(ROOT, "knowledge");
+    const kbPath = join(OPENCODE_DIR, "knowledge");
     try {
       execSync(
         `node "${KNOWLEDGE_AUTOSAVE}" --kb "${kbPath}" --title "${title}" --content "${fullContent}" --category "${category}" --source "${source || "auto-detect"}" --wiki`,

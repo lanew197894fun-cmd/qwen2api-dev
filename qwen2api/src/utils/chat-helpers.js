@@ -5,16 +5,23 @@ const { getLatestModels } = require("../models/models-map.js");
 const accountManager = require("./account.js");
 const CacheManager = require("./img-caches.js");
 
+// 硬編碼模型名稱映射 (上游 API 需要完整版本號碼)
+// 當 getLatestModels 失敗時作為後備
+const HARDCODED_MODEL_MAP = {
+  "qwen-plus": "qwen3.6-plus",
+  "qwen-max": "qwen3-max",
+  "qwen-turbo": "qwen3-turbo",
+  "qwen2.5-plus": "qwen2.5-plus",
+  "qwen3-plus": "qwen3.6-plus",
+  "qwen3-max": "qwen3-max",
+  "qwen3-turbo": "qwen3-turbo",
+  "qwen-coder-plus": "qwen3-coder-plus",
+  "qwen3-coder-plus": "qwen3-coder-plus",
+  "qvq-plus": "qvq-72b-preview",
+  "qvq-72b-preview": "qvq-72b-preview",
+};
+
 const MODEL_SUFFIXES = [
-  // -coder 複合變體（必須排在單一後綴之前，以最長匹配優先）
-  "-thinking-search-coder",
-  "-thinking-coder",
-  "-search-coder",
-  "-image-edit-coder",
-  "-image-coder",
-  "-video-coder",
-  "-deep-research-coder",
-  "-coder",
   "-thinking-search",
   "-image-edit",
   "-deep-research",
@@ -28,7 +35,7 @@ const DATA_URI_REGEX = /^data:(.+);base64,(.*)$/i;
 const HTTP_URL_REGEX = /^https?:\/\//i;
 
 /**
- * 拆分模型字尾
+ * 拆分模型後綴
  * @param {string} model - 原始模型名稱
  * @returns {{ baseModel: string, suffix: string }} 拆分結果
  */
@@ -51,42 +58,6 @@ const splitModelSuffix = (model) => {
 };
 
 /**
- * Claude CLI 相容模型反向映射表
- * 將 Claude CLI 使用的 Anthropic 風格 ID 映射回 Qwen 原始 ID
- */
-const CLAUDE_TO_QWEN_MAP = {
-  "claude-sonnet-4-5": "Qwen3.6-Max-Preview",
-  "claude-opus-4-1": "Qwen3.7-Max",
-  "claude-sonnet-4": "Qwen3.6-Plus",
-  "claude-haiku-3-5": "Qwen3.5-Flash",
-  "claude-sonnet-4-coding": "Qwen3-Coder",
-};
-
-/**
- * 通用 Qwen 模型別名映射表
- * 將使用者傳入的常見模型名稱映射到上游 API 接受的實際 ID
- */
-const QWEN_ALIAS_MAP = {
-  "qwen-max": "Qwen3.7-Max",
-  "qwen-plus": "Qwen3.7-Plus",
-  "qwen-turbo": "Qwen3.6-Plus",
-  "qwen2.5-72b": "Qwen3.7-Plus",
-  "qwen2.5-32b": "Qwen3.7-Plus",
-  "qwen2.5-14b": "Qwen3.6-Plus",
-  "qwen2.5-7b": "Qwen3.6-Plus",
-  "qwen2.5-3b": "Qwen3.5-Flash",
-  "qwen2.5-1.5b": "Qwen3.5-Flash",
-  "qwen3-max": "Qwen3.7-Max",
-  "qwen3-plus": "Qwen3.7-Plus",
-  "qwen3.7-max": "Qwen3.7-Max",
-  "qwen3.7-plus": "Qwen3.7-Plus",
-  "qwen3.6-plus": "Qwen3.6-Plus",
-  "qwen-coder": "Qwen3-Coder",
-  "qwen-vl": "Qwen3.7-Plus",
-  "qwen-vl-max": "Qwen3.7-Max",
-};
-
-/**
  * 根據模型別名匹配原始模型
  * @param {Array<object>} models - 原始模型列表
  * @param {string} modelName - 輸入模型名稱
@@ -100,12 +71,6 @@ const findMatchedModel = (models, modelName) => {
     return undefined;
   }
 
-  // 先檢查是否為 Claude 相容 ID 或 Qwen 別名，若是則轉換為 Qwen ID
-  const qwenId =
-    CLAUDE_TO_QWEN_MAP[normalizedModelName] ||
-    QWEN_ALIAS_MAP[normalizedModelName];
-  const searchName = qwenId || modelName;
-
   return models.find((model) => {
     const aliases = [
       model?.id,
@@ -117,9 +82,7 @@ const findMatchedModel = (models, modelName) => {
     return aliases
       .filter(Boolean)
       .some(
-        (alias) =>
-          String(alias).trim().toLowerCase() ===
-          String(searchName).trim().toLowerCase(),
+        (alias) => String(alias).trim().toLowerCase() === normalizedModelName,
       );
   });
 };
@@ -174,7 +137,7 @@ const getMediaDescriptor = (item) => {
 
 /**
  * 構造規範化媒體內容項
- * @param {string} mediaType - 媒體型別
+ * @param {string} mediaType - 媒體類型
  * @param {string} url - 媒體連結
  * @returns {object} 規範化後的內容項
  */
@@ -230,7 +193,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
     }
 
     const buffer = Buffer.from(base64Content, "base64");
-    const uploadAccount = await accountManager.getAccount();
+    const uploadAccount = accountManager.getAccount();
     const uploadResult = await uploadFileToQwenOss(
       buffer,
       filename,
@@ -249,7 +212,7 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
     return buildNormalizedMediaItem(mediaType, uploadResult.file_url);
   } catch (error) {
     logger.error(
-      `${mediaType === "video" ? "影片" : "圖片"}上傳失敗`,
+      `${mediaType === "video" ? "視頻" : "圖片"}上傳失敗`,
       "UPLOAD",
       "",
       error,
@@ -259,10 +222,10 @@ const normalizeMediaContentItem = async (item, imgCacheManager) => {
 };
 
 /**
- * 判斷聊天型別
+ * 判斷聊天類型
  * @param {string} model - 模型名稱
- * @param {boolean} search - 是否搜尋模式
- * @returns {string} 聊天型別 ('search' 或 't2t')
+ * @param {boolean} search - 是否搜索模式
+ * @returns {string} 聊天類型 ('search' 或 't2t')
  */
 const isChatType = (model) => {
   if (!model) return "t2t";
@@ -301,47 +264,49 @@ const isThinkingEnabled = (model, enable_thinking, thinking_budget) => {
     thinking_config.thinking_enabled = true;
   }
 
-  if (
-    thinking_budget &&
-    Number(thinking_budget) !== Number.NaN &&
-    Number(thinking_budget) > 0 &&
-    Number(thinking_budget) < 38912
-  ) {
-    thinking_config.budget = Number(thinking_budget);
+  // 2026-10-21 Fix：原寫入 .budget（上游不認識）→ 客戶端 thinking_budget 完全無效。
+  // 改寫 .thinking_budget，思考等級即可由客戶端調整：
+  //   low≈2048 / medium≈8192~16384 / high=81920（預設）
+  const b = Number(thinking_budget);
+  if (Number.isFinite(b) && b > 0 && b <= 81920) {
+    thinking_config.thinking_budget = Math.round(b);
   }
 
   return thinking_config;
 };
 
 /**
- * 解析模型名稱,移除特殊字尾
+ * 解析模型名稱,移除特殊後綴
  * @param {string} model - 原始模型名稱
  * @returns {string} 解析後的模型名稱
  */
 const parserModel = async (model) => {
-  if (!model) return "qwen3-coder-plus";
+  if (!model) return "qwen3.6-plus";
 
   try {
-    const { baseModel, suffix } = splitModelSuffix(model);
+    const { baseModel } = splitModelSuffix(model);
     const latestModels = await getLatestModels();
+    const matchedModel = findMatchedModel(latestModels, baseModel);
 
-    // -coder 變體（上游回傳空內容）→ 導向獨立 Qwen3-Coder 模型
-    // 保留使用者的 coder 意圖，而非直接降級為一般模型
-    if (suffix.includes("coder")) {
-      const coderModel = findMatchedModel(latestModels, "Qwen3-Coder");
-      if (coderModel?.id) return coderModel.id;
-      // 找不到獨立 coder 模型才降級為 baseModel（不丟失後綴）
+    // qwen3.7 系列有問題（空內容/限制），禁止解析到
+    if (matchedModel?.id?.includes("3.7")) {
+      const mapped = HARDCODED_MODEL_MAP[baseModel];
+      return mapped || baseModel || "qwen3.6-plus";
     }
 
-    const matchedModel = findMatchedModel(latestModels, baseModel);
     if (matchedModel?.id) return matchedModel.id;
-    // 未匹配但別名存在 → 回傳別名對應的上游 ID（快取可能過期，上游仍接受）
-    const aliasId = QWEN_ALIAS_MAP[baseModel.toLowerCase().trim()];
-    if (aliasId) return aliasId;
+
+    // 後備: 硬編碼映射
+    const mapped = HARDCODED_MODEL_MAP[baseModel];
+    if (mapped) return mapped;
+
     return baseModel;
   } catch (e) {
     const { baseModel } = splitModelSuffix(model);
-    return baseModel || "qwen3-coder-plus";
+    // 後備: 硬編碼映射
+    const mapped = HARDCODED_MODEL_MAP[baseModel];
+    if (mapped) return mapped;
+    return baseModel || "qwen3.6-plus";
   }
 };
 
@@ -363,44 +328,39 @@ const extractTextFromContent = (content) => {
 };
 
 /**
- * 格式化單條歷史訊息為 XML turn 標籤
+ * 格式化訊息為文本（包含角色標註）
  * @param {object} message - 單條訊息
- * @returns {string} 格式化後的 turn 片段
+ * @returns {string} 格式化後的訊息文本
  */
 const formatSingleMessage = (message) => {
   const role = message.role;
   const content = extractTextFromContent(message.content);
-  // 嚴格過濾空內容，避免產生空 turn 標籤導致驗證失敗
-  if (!content || !content.trim()) return null;
-  const escaped = content.replace(/]]&gt;/g, "]]&gt;");
-  return `  <turn role="${role}"><![CDATA[${escaped}]]&gt;</turn>`;
+  return content.trim() ? `${role}:${content}` : "";
 };
 
 /**
- * 格式化歷史訊息為結構化 XML 區塊
+ * 格式化歷史訊息為文本前綴
  * @param {Array} messages - 訊息陣列(不包含最後一條)
- * @returns {string} 格式化後的歷史訊息區塊
+ * @returns {string} 格式化後的歷史訊息
  */
 const formatHistoryMessages = (messages) => {
   const formattedParts = [];
 
   for (let message of messages) {
     const formatted = formatSingleMessage(message);
-    // 過濾 null 值，確保不產生空標籤
-    if (formatted !== null && formatted !== undefined && formatted !== "") {
+    if (formatted) {
       formattedParts.push(formatted);
     }
   }
 
-  if (formattedParts.length === 0) return "";
-  return "<history>\n" + formattedParts.join("\n") + "\n</history>";
+  return formattedParts.length > 0 ? formattedParts.join(";") : "";
 };
 
 /**
  * 解析訊息格式,處理圖片上傳和訊息結構
  * @param {Array} messages - 原始訊息陣列
  * @param {object} thinking_config - 思考配置
- * @param {string} chat_type - 聊天型別
+ * @param {string} chat_type - 聊天類型
  * @returns {Promise<Array>} 解析後的訊息陣列
  */
 const parserMessages = async (messages, thinking_config, chat_type) => {
@@ -408,41 +368,11 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
     const feature_config = thinking_config;
     const imgCacheManager = new CacheManager();
 
-    // 過濾無效訊息（role 缺失或 content 完全為空）
-    const validMessages = messages.filter((msg) => {
-      if (!msg || !msg.role) return false;
-      if (typeof msg.content === "string" && !msg.content.trim()) return false;
-      if (Array.isArray(msg.content)) {
-        const hasText = msg.content.some(
-          (item) => item.type === "text" && item.text?.trim(),
-        );
-        const hasMedia = msg.content.some((item) => isMediaContentItem(item));
-        if (!hasText && !hasMedia) return false;
-      }
-      return true;
-    });
-
-    if (validMessages.length === 0) {
-      logger.warn("所有訊息均為無效內容，返回預設提示", "PARSER");
-      return [
-        {
-          role: "user",
-          content: "請輸入有效內容",
-          chat_type: "t2t",
-          extra: {},
-          feature_config: {
-            output_schema: "phase",
-            thinking_enabled: false,
-          },
-        },
-      ];
-    }
-
-    // 如果只有一條有效訊息,使用原有邏輯處理（不標註角色）
-    if (validMessages.length <= 1) {
-      logger.network("單條有效訊息，使用原格式處理", "PARSER");
+    // 如果只有一條訊息,使用原有邏輯處理（不標註角色）
+    if (messages.length <= 1) {
+      logger.network("單條訊息，使用原格式處理", "PARSER");
       return await processOriginalLogic(
-        validMessages,
+        messages,
         thinking_config,
         chat_type,
         imgCacheManager,
@@ -450,11 +380,11 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
     }
 
     // 多條訊息的情況:分離歷史訊息和最後一條訊息
-    logger.network("多條有效訊息，格式化處理並標註角色", "PARSER");
-    const historyMessages = validMessages.slice(0, -1);
-    const lastMessage = validMessages[validMessages.length - 1];
+    logger.network("多條訊息，格式化處理並標註角色", "PARSER");
+    const historyMessages = messages.slice(0, -1);
+    const lastMessage = messages[messages.length - 1];
 
-    // 格式化歷史訊息為文本字首
+    // 格式化歷史訊息為文本前綴
     const historyText = formatHistoryMessages(historyMessages);
 
     // 處理最後一條訊息
@@ -481,23 +411,17 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
       }
     }
 
-    // 組合最終內容:歷史文本 + 當前訊息（結構化 XML 格式）
+    // 組合最終內容:歷史文本 + 目前訊息（帶角色標註）
     let combinedText = "";
     if (historyText) {
-      combinedText = historyText + "\n\n";
+      combinedText = historyText + ";";
     }
-    // 新增最後一條訊息，帶角色標註（強制輸出 <current> 確保結構完整）
-    // 若無文本內容，使用空格佔位，避免 CDATA 完全空白
-    const safeText = lastMessageText.trim() || " ";
-    const escapedCurr = safeText.replace(/\]\]>/g, "]]&gt;");
-    combinedText +=
-      '<current role="' +
-      lastMessageRole +
-      '"><![CDATA[' +
-      escapedCurr +
-      "]]&gt;</current>";
+    // 新增最後一條訊息，帶角色標註
+    if (lastMessageText.trim()) {
+      combinedText += `${lastMessageRole}:${lastMessageText}`;
+    }
 
-    // 如果有圖片,建立包含文本和圖片的content陣列
+    // 如果有圖片,創建包含文本和圖片的content陣列
     if (finalContent.length > 0) {
       finalContent.unshift({
         type: "text",
@@ -532,14 +456,10 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
     }
   } catch (e) {
     logger.error("訊息解析失敗", "PARSER", "", e);
-    logger.error(
-      `解析錯誤詳情: ${e.message}\n堆疊: ${e.stack}\n輸入訊息數: ${messages?.length || 0}`,
-      "PARSER",
-    );
     return [
       {
         role: "user",
-        content: "直接返回字串: '聊天曆史處理有誤...'",
+        content: "直接回傳字符串: '聊天歷史處理有誤...'",
         chat_type: "t2t",
         extra: {},
         feature_config: {
@@ -555,7 +475,7 @@ const parserMessages = async (messages, thinking_config, chat_type) => {
  * 原有的單條訊息處理邏輯
  * @param {Array} messages - 訊息陣列
  * @param {object} thinking_config - 思考配置
- * @param {string} chat_type - 聊天型別
+ * @param {string} chat_type - 聊天類型
  * @param {object} imgCacheManager - 圖片快取管理器
  * @returns {Promise<Array>} 處理後的訊息陣列
  */

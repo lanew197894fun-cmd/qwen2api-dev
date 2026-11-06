@@ -17,15 +17,18 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { OPENCODE_DIR } from "./config/paths.js";
+import { makeLogger } from "./color.js";
+const log = makeLogger("self-learning", "secondary");
 
-// ─── 路徑常數 ───
-const HOME = process.env.HOME || process.env.USERPROFILE || "~";
-const BASE = path.join(HOME, ".opencode", "models");
+// ─── 路徑常數（集中管理，跨裝置相容）───
+const BASE = path.join(OPENCODE_DIR, "models");
 const DIRS = {
   style: path.join(BASE, "style"),
   knowledge: path.join(BASE, "knowledge"),
   behavior: path.join(BASE, "behavior"),
   finetune: path.join(BASE, "fine-tuned", "personal-model"),
+  shadow: path.join(BASE, "shadow-examples"), // ⚠️ 已棄用：影子範例已遷移至核心蒸餾系統（Distillation）
 };
 
 const METRICS_FILE = path.join(BASE, "metrics.json");
@@ -214,9 +217,13 @@ const SKIP_EXT = new Set([
   ".map",
 ]);
 
+// 🐛 FIX: 限制最大掃描檔案數，避免大型專案導致阻塞
+const MAX_SCAN_FILES = 500;
+
 const scan = (root) => {
   const files = [];
   const walk = (dir) => {
+    if (files.length >= MAX_SCAN_FILES) return; // 提前退出
     let entries;
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -224,6 +231,7 @@ const scan = (root) => {
       return;
     }
     for (const e of entries) {
+      if (files.length >= MAX_SCAN_FILES) return; // 檢查限制
       if (SKIP.has(e.name) || e.name.startsWith(".")) continue;
       const fp = path.join(dir, e.name);
       if (e.isDirectory()) walk(fp);
@@ -254,12 +262,20 @@ class Metrics {
       improvements: [],
       nextMilestone: "收集 10 筆互動後進行模式識別",
       interactions: { accepted: 0, edited: 0, rejected: 0 },
+      stalls: { total: 0, timeouts: 0, stallRate: 0 },
       lastUpdated: Date.now(),
     };
   }
 
   _load() {
-    return read(METRICS_FILE);
+    const raw = read(METRICS_FILE);
+    if (!raw) return null;
+    // 資料遷移：確保所有必要欄位存在（相容舊版 schema）
+    if (!raw.stalls) raw.stalls = { total: 0, timeouts: 0, stallRate: 0 };
+    if (!raw.interactions)
+      raw.interactions = { accepted: 0, edited: 0, rejected: 0 };
+    if (typeof raw.dataPoints !== "number") raw.dataPoints = 0;
+    return raw;
   }
 
   save() {
@@ -271,11 +287,17 @@ class Metrics {
     return this.d;
   }
 
-  record(feedback) {
+  record(feedback, stallType) {
     const d = this.d;
     if (feedback === "accepted") d.interactions.accepted++;
     else if (feedback === "edited") d.interactions.edited++;
     else if (feedback === "rejected") d.interactions.rejected++;
+    if (stallType === "timeout") d.stalls.timeouts++;
+    if (stallType === "stall" || stallType === "timeout") d.stalls.total++;
+    d.stalls.stallRate =
+      d.dataPoints > 0
+        ? +((d.stalls.total / d.dataPoints) * 100).toFixed(1)
+        : 0;
     d.dataPoints =
       d.interactions.accepted + d.interactions.edited + d.interactions.rejected;
     d.accuracy =
@@ -409,6 +431,9 @@ const analyzeImport = (content) => {
  * @param {string} projectPath - 專案路徑
  * @returns {object} 風格統計
  */
+// 🐛 FIX: 限制單次分析最大行數，避免記憶體爆炸與長時間卡頓
+const MAX_ANALYSIS_LINES = 50000;
+
 export const learnCodeStyle = async (projectPath) => {
   initDirs();
   if (!fs.existsSync(projectPath))
@@ -419,11 +444,20 @@ export const learnCodeStyle = async (projectPath) => {
 
   let allContent = "";
   const codeLines = [];
+  let totalChars = 0;
+  // 🐛 FIX: 加入早期退出機制，避免讀取過多檔案導致超時
   for (const fp of files) {
+    if (codeLines.length >= MAX_ANALYSIS_LINES) break;
     try {
       const c = fs.readFileSync(fp, "utf-8");
+      // 限制單檔大小，避免單一巨大檔案卡住
+      if (c.length > 1024 * 1024) continue; // 跳過 >1MB 檔案
       allContent += c + "\n";
-      codeLines.push(...c.split("\n"));
+      const lines = c.split("\n");
+      codeLines.push(...lines);
+      totalChars += c.length;
+      // 若總字元數超過 2MB，提前退出
+      if (totalChars > 2 * 1024 * 1024) break;
     } catch {
       /* 跳過二進位或無法讀取的檔案 */
     }
@@ -528,10 +562,11 @@ export const learnProblemSolving = (tools = []) => {
 };
 
 /**
- * 記錄一次互動與反饋
+ * 記錄一次互動與反饋（含路由效能元數據）
  * @param {string} prompt - 用戶提示
  * @param {string} response - 回應內容
  * @param {'accepted'|'edited'|'rejected'} feedback - 反饋
+ * @param {object} meta - 元數據（modelUsed, routingScore, taskType, latencyMs, isCognitive, shadowCompared）
  * @returns {object} 更新後的指標
  */
 export const recordInteraction = (
@@ -543,6 +578,10 @@ export const recordInteraction = (
   initDirs();
   const m = new Metrics();
 
+  // 停滯偵測：高 latency 或 timeout 視為停滯事件
+  const isStall = meta.isTimeout === true;
+  const isSlow = !isStall && (meta.latencyMs || 0) > 30000; // >30s 但非 timeout 視為慢回應
+
   const log = {
     ts: new Date().toISOString(),
     prompt: (prompt || "").slice(0, 200),
@@ -551,14 +590,79 @@ export const recordInteraction = (
     modelUsed: meta.modelUsed || "unknown",
     routingScore: meta.routingScore || null,
     taskType: meta.taskType || "general",
+    latencyMs: meta.latencyMs || 0,
+    isCognitive: meta.isCognitive || false,
+    shadowCompared: meta.shadowCompared || false,
+    isStall: isStall,
+    isSlow: isSlow,
   };
 
   const logFile = path.join(DIRS.behavior, "interactions.jsonl");
   fs.appendFileSync(logFile, JSON.stringify(log) + "\n", "utf-8");
 
-  m.record(feedback);
+  const stallType = isStall ? "timeout" : isSlow ? "stall" : null;
+  m.record(feedback, stallType);
   m.save();
   return m.get();
+};
+
+/**
+ * 記錄停滯事件（供外面直接呼叫，不經過完整互動記錄）
+ * @param {object} info - { model, latencyMs, isTimeout, taskType, prompt }
+ */
+export const recordStallEvent = (info = {}) => {
+  initDirs();
+  const m = new Metrics();
+  const log = {
+    ts: new Date().toISOString(),
+    type: info.isTimeout ? "timeout" : "stall",
+    model: info.model || "unknown",
+    latencyMs: info.latencyMs || 0,
+    taskType: info.taskType || "general",
+    prompt: (info.prompt || "").slice(0, 100),
+  };
+  const logFile = path.join(DIRS.behavior, "stalls.jsonl");
+  fs.appendFileSync(logFile, JSON.stringify(log) + "\n", "utf-8");
+  const stallType = info.isTimeout ? "timeout" : "stall";
+  m.record("rejected", stallType);
+  m.save();
+  return m.get();
+};
+
+/**
+ * 取得停滯統計摘要
+ * @returns {{ total: number, timeouts: number, stallRate: number, perModel: object }}
+ */
+export const getStallStats = () => {
+  const m = new Metrics();
+  const stallFile = path.join(DIRS.behavior, "stalls.jsonl");
+  const perModel = {};
+  let total = 0;
+  let timeouts = 0;
+  if (fs.existsSync(stallFile)) {
+    try {
+      const raw = fs.readFileSync(stallFile, "utf-8");
+      for (const line of raw.trim().split("\n").filter(Boolean)) {
+        try {
+          const e = JSON.parse(line);
+          total++;
+          if (e.type === "timeout") timeouts++;
+          const mod = e.model || "unknown";
+          if (!perModel[mod])
+            perModel[mod] = { total: 0, timeouts: 0, stalls: 0 };
+          perModel[mod].total++;
+          if (e.type === "timeout") perModel[mod].timeouts++;
+          else perModel[mod].stalls++;
+        } catch {}
+      }
+    } catch {}
+  }
+  return {
+    total,
+    timeouts,
+    stallRate: total > 0 ? +((total / m.get().dataPoints) * 100).toFixed(1) : 0,
+    perModel,
+  };
 };
 
 /**
@@ -573,6 +677,7 @@ export const getLearningMetrics = () => {
     responseStyle: read(path.join(DIRS.style, "response-style.json")),
     knowledge: read(path.join(DIRS.knowledge, "project-knowledge.json")),
     preferences: read(path.join(DIRS.behavior, "preferences.json")),
+    stalls: getStallStats(),
   };
 };
 
@@ -713,6 +818,159 @@ export const getInteractions = () => {
 };
 
 // ═══════════════════════════════════════════════
+// 影子模式（Shadow Mode）— 已遷移至核心蒸餾系統
+// ═══════════════════════════════════════════════
+//
+// ⚠️ 已棄用（DEPRECATED）：影子範例功能已移至 OpenCode 核心蒸餾系統
+//    （projects/system/packages/opencode/src/distillation/）
+//    使用 LanceDB 向量搜尋取代檔案式關鍵字比對，提供：
+//    • 語義向量召回（取代關鍵字比對）
+//    • Provider 插拔式儲存後端（LanceDB / 檔案式備援）
+//    • Bus 訂閱 compaction 事件自動捕捉
+//    當 memory-lancedb-pro 已註冊時，直接使用其 globalThis 上的 Provider，
+//    無需動態 import 核心模組，路徑無關，更可靠。
+//
+//    保留以下函數僅供向下相容，新程式碼請勿使用。
+// ============================================================================
+
+/** ShadowStoreRegistry 的 globalThis key，與核心蒸餾系統一致 */
+const GLOBAL_SHADOW_KEY = "__opencode_shadow_store_provider__";
+
+/**
+ * 取得已註冊的影子儲存 Provider（memory-lancedb-pro 初始化時註冊）
+ * 等同於核心 ShadowStoreRegistry.get()，避免動態 import 的路徑依賴。
+ */
+function getShadowProvider() {
+  try {
+    return /** @type {import("../../../../system/packages/opencode/src/distillation/provider").IShadowStoreProvider | undefined} */ (
+      globalThis[/** @type {keyof typeof globalThis} */ (GLOBAL_SHADOW_KEY)]
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 儲存影子範例（大模型的黃金標準回應）
+ *
+ * @deprecated 已棄用，請改用 OpenCode 蒸餾系統的 Distillation.storeShadow()
+ *             見 projects/system/packages/opencode/src/distillation/
+ * @param {string} prompt - 用戶提示
+ * @param {string} shadowResponse - 大模型生成的優質回應
+ * @param {object} meta - 元數據（modelUsed, taskType, similarityScore）
+ * @returns {{ status: string, id: string }}
+ */
+export const storeShadowExample = async (prompt, shadowResponse, meta = {}) => {
+  // 優先使用已註冊的 LanceDB Provider（由 memory-lancedb-pro 提供）
+  const provider = getShadowProvider();
+  if (provider && typeof provider.storeShadow === "function") {
+    const result = await provider.storeShadow({
+      sessionID: meta.sessionID || "standalone",
+      prompt,
+      shadowResponse,
+      modelUsed: meta.modelUsed,
+      taskType: meta.taskType,
+      similarityScore: meta.similarityScore ?? null,
+    });
+    return { status: "stored", id: result.id };
+  }
+
+  // 備援：本地檔案式儲存（已棄用）
+  initDirs();
+  const id = `shadow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const example = {
+    id,
+    ts: new Date().toISOString(),
+    prompt: (prompt || "").slice(0, 500),
+    shadowResponse,
+    modelUsed: meta.modelUsed || "unknown",
+    taskType: meta.taskType || "general",
+    similarityScore: meta.similarityScore || null,
+    usageCount: 0,
+  };
+
+  const fp = path.join(DIRS.shadow, `${id}.json`);
+  write(fp, example);
+  return { status: "stored", id };
+};
+
+/**
+ * 召回影子範例（用於 Few-Shot 注入）
+ *
+ * @deprecated 已棄用，請改用 OpenCode 蒸餾系統的 Distillation.recallShadow()
+ *             見 projects/system/packages/opencode/src/distillation/
+ * @param {string} currentPrompt - 當前用戶提示
+ * @param {number} [limit=3] - 召回數量
+ * @param {string} [taskType] - 過濾任務類型
+ * @returns {Promise<Array<{prompt: string, shadowResponse: string, similarityScore: number}>>}
+ */
+export const getShadowExamples = async (currentPrompt, limit = 3, taskType) => {
+  // 優先使用已註冊的 LanceDB Provider（由 memory-lancedb-pro 提供）
+  const provider = getShadowProvider();
+  if (provider && typeof provider.recallShadow === "function") {
+    return await provider.recallShadow(currentPrompt, limit, taskType);
+  }
+
+  // 備援：本地檔案式召回（已棄用）
+  initDirs();
+  if (!fs.existsSync(DIRS.shadow)) return [];
+
+  const files = fs.readdirSync(DIRS.shadow).filter((f) => f.endsWith(".json"));
+  const examples = [];
+
+  for (const file of files) {
+    try {
+      const data = read(path.join(DIRS.shadow, file));
+      if (!data) continue;
+      if (taskType && data.taskType !== taskType) continue;
+
+      const score = calculateSimilarity(currentPrompt, data.prompt);
+      examples.push({ ...data, matchScore: score });
+    } catch {
+      continue;
+    }
+  }
+
+  const sorted = examples
+    .sort((a, b) => b.matchScore - a.matchScore)
+    .slice(0, limit);
+
+  for (const ex of sorted) {
+    try {
+      const fp = path.join(DIRS.shadow, `${ex.id}.json`);
+      const data = read(fp);
+      if (data) {
+        data.usageCount = (data.usageCount || 0) + 1;
+        write(fp, data);
+      }
+    } catch {}
+  }
+
+  return sorted.map(({ prompt, shadowResponse, matchScore }) => ({
+    prompt,
+    shadowResponse,
+    similarityScore: matchScore,
+  }));
+};
+
+/**
+ * 計算兩段文字的簡單相似度（基於關鍵字重疊）
+ *
+ * @deprecated 已棄用。核心蒸餾系統使用 LanceDB 向量相似度（cosine similarity）。
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} 0-1 之間的分數
+ */
+export const calculateSimilarity = (a, b) => {
+  if (!a || !b) return 0;
+  const tokensA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
+  const tokensB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
+  const intersection = [...tokensA].filter((t) => tokensB.has(t));
+  const union = new Set([...tokensA, ...tokensB]);
+  return union.size > 0 ? intersection.length / union.size : 0;
+};
+
+// ═══════════════════════════════════════════════
 // 個性化人格系統（專業水平 × 角色情境）
 // ═══════════════════════════════════════════════
 
@@ -737,15 +995,15 @@ const PRO_LEVELS = {
   },
   4: {
     label: "🎯 專業嚴謹",
-    desc: "正式用語，結構清晰，技術精準",
+    desc: "正式用語，直接精準",
     prompt:
-      "使用正式專業的用語，回答結構清晰分明（開頭→分析→結論）。技術名詞精準不模糊，適合開發者與技術人員閱讀。",
+      "使用正式專業的用語，直接切入重點，必要時才分點。技術名詞精準不模糊，適合開發者閱讀。",
   },
   5: {
     label: "🏛️ 學術權威",
-    desc: "極致嚴謹，文獻等級，完整論述",
+    desc: "極致嚴謹，論證有據",
     prompt:
-      "採用學術級別的嚴謹語氣。結構包含問題定義、方法論、分析論證、結論。所有技術宣稱必須有依據，使用精確定義的專業詞彙。適合專家審閱等級。",
+      "採用學術級別的嚴謹語氣：先給結論，再給論證依據，用詞精確。不鋪陳背景、不重述問題。適合專家審閱。",
   },
 };
 
@@ -1236,7 +1494,9 @@ const getDirSize = (dir) => {
       }
     };
     if (fs.existsSync(dir)) walk(dir);
-  } catch {}
+  } catch (e) {
+    log.warn("計算目錄大小失敗:", e?.message);
+  }
   return size < 1024
     ? `${size} B`
     : size < 1048576

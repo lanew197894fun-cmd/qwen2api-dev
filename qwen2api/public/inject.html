@@ -1,0 +1,876 @@
+<!doctype html>
+<html lang="zh-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cookie / Token 手動注入</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        padding: 2rem 1rem;
+      }
+      .container {
+        max-width: 800px;
+        width: 100%;
+      }
+      h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+      }
+      .sub {
+        color: #94a3b8;
+        font-size: 0.875rem;
+        margin-bottom: 1.5rem;
+      }
+      .card {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+      }
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 1rem;
+      }
+      .card-header h2 {
+        font-size: 1rem;
+        font-weight: 600;
+        margin: 0;
+      }
+      label {
+        display: block;
+        font-size: 0.875rem;
+        font-weight: 500;
+        color: #cbd5e1;
+        margin-bottom: 0.375rem;
+      }
+      input,
+      textarea,
+      select {
+        width: 100%;
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        color: #e2e8f0;
+        padding: 0.625rem 0.75rem;
+        font-size: 0.875rem;
+        font-family: "SF Mono", "Fira Code", monospace;
+        transition: border-color 0.15s;
+      }
+      input:focus,
+      textarea:focus,
+      select:focus {
+        outline: none;
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+      }
+      textarea {
+        min-height: 180px;
+        resize: vertical;
+        tab-size: 2;
+      }
+      .row {
+        display: flex;
+        gap: 1rem;
+      }
+      .row > * {
+        flex: 1;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        padding: 0.625rem 1.25rem;
+        border-radius: 8px;
+        font-size: 0.875rem;
+        font-weight: 500;
+        border: none;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .btn-primary {
+        background: #3b82f6;
+        color: #fff;
+      }
+      .btn-primary:hover {
+        background: #2563eb;
+      }
+      .btn-primary:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .btn-outline {
+        background: transparent;
+        border: 1px solid #334155;
+        color: #94a3b8;
+      }
+      .btn-outline:hover {
+        border-color: #475569;
+        color: #e2e8f0;
+      }
+      .btn-danger {
+        background: #ef4444;
+        color: #fff;
+      }
+      .btn-danger:hover {
+        background: #dc2626;
+      }
+      .btn-sm {
+        padding: 0.375rem 0.75rem;
+        font-size: 0.75rem;
+      }
+      .actions {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 0.25rem;
+        flex-wrap: wrap;
+      }
+      .badge {
+        display: inline-block;
+        padding: 0.125rem 0.5rem;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+      }
+      .badge-green {
+        background: #166534;
+        color: #86efac;
+      }
+      .badge-yellow {
+        background: #854d0e;
+        color: #fde68a;
+      }
+      .badge-gray {
+        background: #334155;
+        color: #94a3b8;
+      }
+      .badge-blue {
+        background: #1e40af;
+        color: #93c5fd;
+      }
+      .msg {
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        font-size: 0.875rem;
+        margin-bottom: 0.75rem;
+        display: none;
+      }
+      .msg-success {
+        display: block;
+        background: #14532d;
+        border: 1px solid #166534;
+        color: #86efac;
+      }
+      .msg-error {
+        display: block;
+        background: #450a0a;
+        border: 1px solid #7f1d1d;
+        color: #fca5a5;
+      }
+      .msg-info {
+        display: block;
+        background: #0c4a6e;
+        border: 1px solid #075985;
+        color: #7dd3fc;
+      }
+      code {
+        background: #0f172a;
+        padding: 0.125rem 0.375rem;
+        border-radius: 4px;
+        font-size: 0.8125rem;
+      }
+      .hint {
+        font-size: 0.75rem;
+        color: #64748b;
+        margin-top: 0.375rem;
+      }
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.8125rem;
+      }
+      .table th {
+        text-align: left;
+        padding: 0.5rem 0.75rem;
+        color: #94a3b8;
+        font-weight: 500;
+        border-bottom: 1px solid #334155;
+      }
+      .table td {
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid #1e293b;
+      }
+      .table tr:hover td {
+        background: #1e293b;
+      }
+      .step {
+        display: flex;
+        gap: 0.75rem;
+        align-items: flex-start;
+        padding: 0.6rem 0;
+      }
+      .step-num {
+        flex-shrink: 0;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        background: #3b82f6;
+        color: #fff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .step-content {
+        flex: 1;
+      }
+      .step-content p {
+        margin-bottom: 0.25rem;
+      }
+      .apikey-bar {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 0.5rem 0.75rem;
+        margin-bottom: 1rem;
+      }
+      .apikey-bar input {
+        border: none;
+        background: transparent;
+        padding: 0;
+        font-size: 0.8125rem;
+        flex: 1;
+      }
+      .apikey-bar input:focus {
+        box-shadow: none;
+      }
+      .hidden {
+        display: none;
+      }
+      .inline-input {
+        margin-top: 0.5rem;
+      }
+      .exp-countdown {
+        font-size: 0.75rem;
+        color: #fde68a;
+      }
+      .stat-row {
+        display: flex;
+        gap: 1rem;
+        flex-wrap: wrap;
+        margin-top: 0.25rem;
+      }
+      .stat-item {
+        font-size: 0.75rem;
+        color: #94a3b8;
+      }
+      .stat-item strong {
+        color: #e2e8f0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>🔑 Cookie / Token 手動注入</h1>
+      <p class="sub">
+        從瀏覽器 DevTools 貼上 Qwen cookies 和 token，即時更新帳戶認證
+      </p>
+
+      <div id="msg" class="msg"></div>
+
+      <!-- API Key 管理 -->
+      <div class="apikey-bar">
+        <span style="font-size: 0.75rem; color: #94a3b8; white-space: nowrap"
+          >🔑 API Key</span
+        >
+        <input
+          id="apikeyInput"
+          type="password"
+          placeholder="輸入 Admin API Key（自動儲存）"
+        />
+        <button
+          class="btn btn-sm btn-outline"
+          onclick="document.getElementById('apikeyInput').value='';localStorage.removeItem('apikey');showMsg('API Key 已清除','info')"
+        >
+          清除
+        </button>
+        <span id="apikeyStatus" style="font-size: 0.75rem; color: #22c55e"
+          >已儲存</span
+        >
+      </div>
+
+      <!-- 操作步驟 -->
+      <div class="card">
+        <h2 style="font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem">
+          📖 操作步驟
+        </h2>
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <p>在瀏覽器打開 <code>chat.qwen.ai</code> 並登入</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <p>
+              安裝
+              <a
+                href="https://editcookie.com/#start"
+                target="_blank"
+                style="color: #60a5fa"
+                >EditCookie</a
+              >
+              擴充功能（已有可略過）
+            </p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <p>
+              在 <code>chat.qwen.ai</code> 點 EditCookie 圖示 → 按右上
+              <strong>Export</strong> → 會<strong>下載一個 .json</strong> 檔
+            </p>
+            <p style="font-size: 0.75rem; color: #60a5fa; margin-top: 0.125rem">
+              下載的 .json 直接用下方「📂 選擇 JSON 檔」載入，或拖進 Cookies 輸入框
+            </p>
+            <p style="font-size: 0.75rem; color: #60a5fa; margin-top: 0.125rem">
+              Qwen access token 不在 cookies 裡！F12 → Console 執行
+              <code>localStorage.getItem('token')</code>，把輸出貼到下方 Token 欄
+            </p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-content"><p>選取要更新的帳戶 → 按「注入」</p></div>
+        </div>
+
+        <details
+          style="
+            margin-top: 0.75rem;
+            font-size: 0.8125rem;
+            color: #94a3b8;
+            cursor: pointer;
+          "
+        >
+          <summary>📋 使用 DevTools 的傳統方法</summary>
+          <div
+            style="
+              margin-top: 0.5rem;
+              padding-left: 1rem;
+              border-left: 2px solid #334155;
+            "
+          >
+            <div class="step" style="padding: 0.4rem 0">
+              <div
+                class="step-num"
+                style="width: 20px; height: 20px; font-size: 0.65rem"
+              >
+                2
+              </div>
+              <div class="step-content">
+                <p>
+                  打開 DevTools → <strong>Application</strong> →
+                  <strong>Cookies</strong> → 選 <code>chat.qwen.ai</code>
+                </p>
+              </div>
+            </div>
+            <div class="step" style="padding: 0.4rem 0">
+              <div
+                class="step-num"
+                style="width: 20px; height: 20px; font-size: 0.65rem"
+              >
+                3
+              </div>
+              <div class="step-content">
+                <p>右鍵 → Copy All → 貼到下方 cookies 文字框</p>
+                <p
+                  style="
+                    font-size: 0.7rem;
+                    color: #60a5fa;
+                    margin-top: 0.125rem;
+                  "
+                >
+                  token 不在 cookies 裡，請另從 localStorage 複製（見上方說明）
+                </p>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- 注入表單 -->
+      <div class="card">
+        <div class="card-header">
+          <h2>📝 注入表單</h2>
+          <button
+            class="btn btn-sm btn-outline"
+            onclick="fillFromSelected()"
+            title="從所選帳戶填入現有資料再更新"
+          >
+            📋 填入現有值
+          </button>
+        </div>
+
+        <div class="row" style="margin-bottom: 1rem">
+          <div>
+            <label for="email">選擇帳戶</label>
+            <select id="email"></select>
+            <div class="hint">選擇既有帳戶，或選「自訂」輸入新名稱</div>
+          </div>
+        </div>
+
+        <!-- 自訂帳戶名稱（僅在選自訂時顯示） -->
+        <div id="customEmailGroup" class="hidden" style="margin-bottom: 1rem">
+          <label for="customEmail">新帳戶名稱</label>
+          <input
+            id="customEmail"
+            type="text"
+            placeholder="例如 qwen-free-3"
+            class="inline-input"
+          />
+          <div class="hint">輸入新帳戶標識，將自動建立</div>
+        </div>
+
+        <div style="margin-bottom: 1rem">
+          <label for="token"
+            >Token（JWT，必填 — Qwen access token 在 localStorage，不在 cookies）</label
+          >
+          <input id="token" type="text" placeholder="eyJhbGciOiJIUzI1NiIs..." />
+          <div class="hint">
+            F12 → Console，執行 <code>localStorage.getItem('token')</code> → 把印出的字串整個貼上（效期約 15 分鐘）
+          </div>
+        </div>
+
+        <div style="margin-bottom: 1rem">
+          <label for="cookies">Cookies（貼上 EditCookie Export 的 JSON）</label>
+          <textarea
+            id="cookies"
+            placeholder='[{&#10;  "domain": ".qwen.ai",&#10;  "name": "cna",&#10;  "value": "xxx"&#10;}, ...]'
+          ></textarea>
+          <div class="hint">
+            EditCookie → Export 現在會直接下載 .json（不再複製）。按下方「選擇 JSON 檔」或直接把檔案拖進輸入框 → 內容會自動填入
+          </div>
+          <div style="display: flex; gap: 0.5rem; margin-bottom: 0.375rem; align-items: center">
+            <button type="button" class="btn btn-sm btn-outline" id="btnPickFile">📂 選擇 JSON 檔</button>
+            <span id="fileDropHint" style="font-size: 0.75rem; color: #64748b">或把 .json 拖進輸入框</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" id="btnInject" onclick="inject()">
+            ⬇️ 注入
+          </button>
+          <button class="btn btn-outline" onclick="loadAccounts()">
+            🔄 重新整理
+          </button>
+          <button class="btn btn-outline" onclick="clearForm()">🗑️ 清空</button>
+        </div>
+      </div>
+
+      <!-- 帳戶列表 -->
+      <div class="card">
+        <div class="card-header">
+          <h2>📋 現有帳戶</h2>
+          <span
+            id="refreshStatus"
+            style="font-size: 0.75rem; color: #64748b"
+          ></span>
+        </div>
+        <div id="accountList"><p style="color: #64748b">載入中...</p></div>
+      </div>
+
+      <!-- 常見問題 -->
+      <details class="card" style="cursor: pointer">
+        <summary style="font-size: 0.875rem; font-weight: 500; color: #94a3b8">
+          🔧 常見問題
+        </summary>
+        <div
+          style="
+            margin-top: 0.75rem;
+            font-size: 0.8125rem;
+            color: #94a3b8;
+            line-height: 1.6;
+          "
+        >
+          <p>
+            <strong>Q: 注入後服務需要重啟嗎？</strong
+            ><br />不需要，立即生效。下次請求就會使用新的 cookies/token。
+          </p>
+          <p style="margin-top: 0.75rem">
+            <strong>Q: cookies 多久過期？</strong><br /><code>ssxmod_itna</code>
+            每 15 分鐘重新整理，但系統內建 SSXMOD 管理器會自動處理。<code
+              >token</code
+            >
+            過期後需重新注入。
+          </p>
+          <p style="margin-top: 0.75rem">
+            <strong>Q: 為什麼要注入 cookies？</strong><br />新鮮的
+            <code>acw_tc</code>、<code>ssxmod_itna</code> 等 cookies 能幫助繞過
+            WAF 阻擋，提升請求成功率。
+          </p>
+          <p style="margin-top: 0.75rem">
+            <strong>Q: 注入後還是 500 / 光說不做事？</strong><br />不能只貼
+            cookies！Qwen access token 在瀏覽器 localStorage（鍵 <code>token</code>），請 F12 → Console 執行
+            <code>localStorage.getItem('token')</code> → 把輸出貼到 Token 欄。沒有 token，免額路徑必定全滅（refresh 端點
+            <code>auth.qwen.ai</code> 目前全方法 405）。
+          </p>
+          <p style="margin-top: 0.75rem">
+            <strong>Q: API Key 是什麼？</strong><br />本機開發預設 <code>AUTH_DISABLED=true</code>，不需要任何 API Key；若伺服器關閉了 <code>AUTH_DISABLED</code>，需輸入伺服器
+            <code>.env</code> 中的 <code>ADMIN_KEY</code>。
+          </p>
+        </div>
+      </details>
+    </div>
+
+    <script>
+      const API_BASE = "/api";
+
+      // ── API Key 管理 ──
+      const apikeyInput = document.getElementById("apikeyInput");
+      const apikeyStatus = document.getElementById("apikeyStatus");
+
+      // 載入 localStorage 的 key
+      const savedKey = localStorage.getItem("apikey");
+      if (savedKey) {
+        apikeyInput.value = savedKey;
+        apikeyStatus.textContent = "✅ 已儲存";
+        apikeyStatus.style.color = "#22c55e";
+      } else {
+        apikeyStatus.textContent = "⚠️ 未設定";
+        apikeyStatus.style.color = "#facc15";
+      }
+
+      // 即時儲存
+      apikeyInput.addEventListener("input", () => {
+        const val = apikeyInput.value.trim();
+        if (val) {
+          localStorage.setItem("apikey", val);
+          apikeyStatus.textContent = "✅ 已儲存";
+          apikeyStatus.style.color = "#22c55e";
+        } else {
+          localStorage.removeItem("apikey");
+          apikeyStatus.textContent = "⚠️ 未設定";
+          apikeyStatus.style.color = "#facc15";
+        }
+      });
+
+      function getApiKey() {
+        const key = apikeyInput.value.trim();
+        if (!key) {
+          showMsg("請先在上方輸入 Admin API Key", "error");
+          return null;
+        }
+        return key;
+      }
+
+      // ── HTTP 請求 ──
+      async function api(path, opts = {}) {
+        const key = getApiKey();
+        if (!key) throw new Error("Missing API Key");
+        const headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${key}`,
+        };
+        const resp = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+        if (resp.status === 401 || resp.status === 403) {
+          apikeyStatus.textContent = "❌ 無效";
+          apikeyStatus.style.color = "#ef4444";
+          showMsg("API Key 無效，請重新輸入", "error");
+          throw new Error("Unauthorized");
+        }
+        return resp.json();
+      }
+
+      // ── 訊息顯示 ──
+      function showMsg(text, type = "info") {
+        const el = document.getElementById("msg");
+        el.textContent = text;
+        el.className = `msg msg-${type}`;
+        if (type !== "info")
+          setTimeout(() => {
+            el.className = "msg";
+          }, 8000);
+      }
+
+      // ── 自訂帳戶切換 ──
+      document.getElementById("email").addEventListener("change", function () {
+        const group = document.getElementById("customEmailGroup");
+        if (this.value === "__custom__") {
+          group.classList.remove("hidden");
+          document.getElementById("customEmail").focus();
+        } else {
+          group.classList.add("hidden");
+        }
+      });
+
+      // ── 填入現有值（選既有帳戶時方便重新整理）──
+      async function fillFromSelected() {
+        const sel = document.getElementById("email");
+        const email = sel.value;
+        if (!email || email === "__custom__") {
+          showMsg("請先選擇一個既有帳戶", "info");
+          return;
+        }
+        try {
+          const data = await api("/injectCookies/accounts");
+          // 完整資料要撈帳戶細節，這裡從列表已有資訊無法拿到完整 cookies
+          // 實務上最常見的情境是只需更新 token + cookies，不需要填入舊值
+          // 此功能保留按鈕但更多作為視覺提示
+          showMsg(`已選擇 ${email}，貼上新的 token/cookies 後按注入`, "info");
+        } catch (err) {
+          showMsg(`無法取得帳戶資訊：${err.message}`, "error");
+        }
+      }
+
+      // ── 載入帳戶列表 ──
+      let refreshTimer = null;
+
+      async function loadAccounts() {
+        try {
+          const data = await api("/injectCookies/accounts");
+          const sel = document.getElementById("email");
+          const list = document.getElementById("accountList");
+          const currentVal = sel.value;
+
+          // 更新下拉
+          sel.innerHTML = '<option value="">-- 選擇帳戶 --</option>';
+          const customOpt = document.createElement("option");
+          customOpt.value = "__custom__";
+          customOpt.textContent = "✏️ 自訂新帳戶...";
+          sel.appendChild(customOpt);
+
+          if (data.accounts.length > 0) {
+            const grp = document.createElement("optgroup");
+            grp.label = "現有帳戶";
+            for (const acc of data.accounts) {
+              const opt = document.createElement("option");
+              opt.value = acc.email;
+              opt.textContent = acc.email;
+              grp.appendChild(opt);
+            }
+            sel.appendChild(grp);
+          }
+
+          // 回復選擇
+          if (currentVal) {
+            const exists = [...sel.options].some((o) => o.value === currentVal);
+            if (exists) sel.value = currentVal;
+          }
+
+          // 帳戶列表
+          if (!data.accounts || data.accounts.length === 0) {
+            list.innerHTML = '<p style="color:#64748b;">尚無帳戶</p>';
+            return;
+          }
+
+          let html =
+            '<table class="table"><thead><tr><th>帳戶</th><th>Token</th><th>過期</th><th>Cookies</th></tr></thead><tbody>';
+          for (const acc of data.accounts) {
+            let expiresDisplay = "—";
+            let expiresClass = "";
+            if (acc.tokenExpires) {
+              const exp = new Date(acc.tokenExpires);
+              const now = new Date();
+              const diff = exp - now;
+              expiresDisplay = exp.toLocaleString("zh-TW");
+              if (diff < 0) {
+                expiresDisplay += " ⚠️ 已過期";
+                expiresClass = "badge-yellow";
+              } else if (diff < 86400000) {
+                const hours = Math.floor(diff / 3600000);
+                const mins = Math.floor((diff % 3600000) / 60000);
+                expiresDisplay += ` (${hours}h${mins}m)`;
+                expiresClass = "badge-yellow";
+              } else {
+                const days = Math.floor(diff / 86400000);
+                expiresDisplay += ` (${days}d)`;
+                expiresClass = "badge-green";
+              }
+            }
+            const ck =
+              acc.cookieCount > 0
+                ? `<span class="badge badge-green">${acc.cookieCount}</span>`
+                : `<span class="badge badge-gray">0</span>`;
+            const tk = acc.hasToken
+              ? `<span class="badge badge-green">✅</span>`
+              : `<span class="badge badge-yellow">❌</span>`;
+            html += `<tr><td><code>${acc.email}</code></td><td>${tk}</td><td style="font-size:.7rem" class="${expiresClass}">${expiresDisplay}</td><td>${ck}</td></tr>`;
+          }
+          html += "</tbody></table>";
+          list.innerHTML = html;
+
+          document.getElementById("refreshStatus").textContent =
+            `🕐 ${new Date().toLocaleTimeString("zh-TW")} 更新`;
+        } catch (err) {
+          if (
+            err.message !== "Unauthorized" &&
+            err.message !== "Missing API Key"
+          ) {
+            document.getElementById("accountList").innerHTML =
+              `<p style="color:#fca5a5">載入失敗：${err.message}</p>`;
+          }
+        }
+      }
+
+      // ── 注入 ──
+      async function inject() {
+        const btn = document.getElementById("btnInject");
+        btn.disabled = true;
+        btn.textContent = "⏳ 注入中...";
+
+        try {
+          let email = document.getElementById("email").value;
+          if (email === "__custom__" || !email) {
+            email = document.getElementById("customEmail").value.trim();
+            if (!email) {
+              showMsg("請選擇帳戶或輸入新帳戶名稱", "error");
+              btn.disabled = false;
+              btn.textContent = "⬇️ 注入";
+              return;
+            }
+          }
+
+          const token = document.getElementById("token").value.trim();
+          const cookiesRaw = document.getElementById("cookies").value.trim();
+
+          if (!token && !cookiesRaw) {
+            showMsg("至少要提供 token 或 cookies 其中之一", "error");
+            btn.disabled = false;
+            btn.textContent = "⬇️ 注入";
+            return;
+          }
+
+          let cookies = null;
+          if (cookiesRaw) {
+            try {
+              cookies = JSON.parse(cookiesRaw);
+              if (!Array.isArray(cookies)) {
+                if (typeof cookies === "object" && cookies !== null) {
+                  cookies = Object.entries(cookies).map(([name, value]) => ({
+                    name,
+                    value,
+                  }));
+                } else {
+                  throw new Error("格式錯誤");
+                }
+              }
+            } catch (_) {
+              showMsg("cookies 格式錯誤，請貼上有效的 JSON 陣列", "error");
+              btn.disabled = false;
+              btn.textContent = "⬇️ 注入";
+              return;
+            }
+          }
+
+          const result = await api("/injectCookies", {
+            method: "POST",
+            body: JSON.stringify({ email, token, cookies }),
+          });
+
+          if (result.success) {
+            const label =
+              result.action === "created"
+                ? "✅ 新帳戶建立成功"
+                : "🔄 帳戶更新成功";
+            let detail = `${email}（token ${result.tokenUpdated ? "✅" : "❌"}，cookies ${result.cookieCount} 個）`;
+            if (result.expires) {
+              const exp = new Date(result.expires);
+              detail += `，過期 ${exp.toLocaleString("zh-TW")}`;
+            }
+            showMsg(`${label}：${detail}`, "success");
+            document.getElementById("token").value = "";
+            document.getElementById("cookies").value = "";
+            document.getElementById("customEmail").value = "";
+            loadAccounts();
+          } else {
+            showMsg(`注入失敗：${result.error || "未知錯誤"}`, "error");
+          }
+        } catch (err) {
+          if (
+            err.message !== "Missing API Key" &&
+            err.message !== "Unauthorized"
+          ) {
+            showMsg(`請求失敗：${err.message}`, "error");
+          }
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "⬇️ 注入";
+        }
+      }
+
+      function clearForm() {
+        document.getElementById("token").value = "";
+        document.getElementById("cookies").value = "";
+        document.getElementById("email").value = "";
+        document.getElementById("customEmail").value = "";
+        document.getElementById("customEmailGroup").classList.add("hidden");
+        document.getElementById("msg").className = "msg";
+      }
+
+      // ── 載入 .json 檔案（EditCookie 匯出檔）──
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = ".json,application/json";
+      fileInput.style.display = "none";
+      document.body.appendChild(fileInput);
+
+      const cookiesBox = document.getElementById("cookies");
+      const loadJsonFile = (file) => {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            JSON.parse(reader.result);
+            cookiesBox.value = reader.result;
+            showMsg(`已載入 ${file.name}（${Math.round(file.size / 1024)} KB）`, "success");
+          } catch (_) {
+            showMsg("JSON 格式錯誤", "error");
+          }
+        };
+        reader.readAsText(file);
+      };
+      document.getElementById("btnPickFile").addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", () => {
+        loadJsonFile(fileInput.files[0]);
+        fileInput.value = "";
+      });
+      cookiesBox.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        cookiesBox.style.borderColor = "#3b82f6";
+      });
+      cookiesBox.addEventListener("dragleave", () => {
+        cookiesBox.style.borderColor = "#334155";
+      });
+      cookiesBox.addEventListener("drop", (e) => {
+        e.preventDefault();
+        cookiesBox.style.borderColor = "#334155";
+        loadJsonFile(e.dataTransfer.files[0]);
+      });
+
+      // ── 定時重新整理（每 15 秒） ──
+      loadAccounts();
+      setInterval(loadAccounts, 15000);
+    </script>
+  </body>
+</html>

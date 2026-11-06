@@ -1,9 +1,6 @@
 const { isJson, generateUUID } = require("../utils/tools.js");
-const {
-  countTokens,
-  createUsageObject,
-} = require("../utils/precise-tokenizer.js");
-const { sendChatRequest, getUpstreamHealth } = require("../utils/request.js");
+const { createUsageObject } = require("../utils/precise-tokenizer.js");
+const { sendChatRequest } = require("../utils/request.js");
 const {
   createToolCallStreamParser,
   parseToolCallsFromText,
@@ -12,39 +9,64 @@ const accountManager = require("../utils/account.js");
 const config = require("../config/index.js");
 const axios = require("axios");
 const { logger } = require("../utils/logger");
-
-// ─── 全域併發限制：保護 waf-proxy 不被大量請求淹沒 ───
-const MAX_CONCURRENT_OUTGOING = parseInt(
-  process.env.QWEN_MAX_CONCURRENT || "2",
-  10,
-);
-let outgoingActive = 0;
-const outgoingQueue = [];
-
-function acquireOutgoing() {
-  return new Promise((resolve) => {
-    if (outgoingActive < MAX_CONCURRENT_OUTGOING) {
-      outgoingActive++;
-      resolve();
-    } else {
-      outgoingQueue.push(resolve);
-    }
-  });
-}
-
-function releaseOutgoing() {
-  if (outgoingQueue.length > 0) {
-    const next = outgoingQueue.shift();
-    next();
-  } else {
-    outgoingActive--;
-  }
-}
+const {
+  assertNoUpstreamFailure,
+  isWafChallengeError,
+  chatBreakerState,
+  noteChatChallenge,
+} = require("../utils/upstream-error.js");
 
 /**
- * 設定響應頭
- * @param {object} res - Express 響應物件
- * @param {boolean} stream - 是否流式響應
+ * 把上游失敗原因對應成 HTTP 回應
+ * @param {string} code - 上層錯誤碼（waf_challenge / waf_breaker_open 等）
+ * @returns {{status: number, body: Object, retryAfter: number}|null} 可直接寫入的錯誤回應
+ */
+function buildUpstreamErrorResponse(code) {
+  if (!code || !String(code).startsWith("waf_")) return null;
+  const isOpen = code === "waf_breaker_open";
+  const retryAfter = Number(process.env.CHAT_CHALLENGE_RETRY_AFTER) || 30;
+  if (!isOpen) noteChatChallenge();
+  return {
+    status: 503,
+    retryAfter,
+    body: {
+      error: {
+        message: isOpen
+          ? "Qwen 上游繁忙，触发风控验证（被挤爆啦），請稍後重试 / Qwen chat challenge: upstream busy, retry later"
+          : "Qwen 上游繁忙，触发风控验证（被挤爆啦），請稍後重试 / Qwen chat challenge: upstream busy, retry later",
+        type: "upstream_waf_challenge",
+        code: isOpen ? "waf_breaker_open" : "upstream_waf_challenge",
+        retry_after_seconds: retryAfter,
+      },
+    },
+  };
+}
+
+// ═══ ⚡ SSE 安全寫入 — 檢查 res.destroyed/res.writable/writableEnded，避免 client 斷線後 hang ═══
+// 注意：res.write() 的錯誤（如 write after end）不會同步拋出，
+// 而是經 internal _write 回調非同步發成 'error' 事件；
+// 無 listener 會成為 uncaughtException（見 server.js）。故 res 必須掛 error handler，見 pipeUpstream。
+const safeWrite = (res, data) => {
+  try {
+    if (!res.destroyed && !res.writableEnded && res.writable) {
+      res.write(data);
+      return true;
+    }
+  } catch {
+    /* client 已斷線 */
+  }
+  return false;
+};
+const safeEnd = (res) => {
+  try {
+    if (!res.destroyed && !res.writableEnded) res.end();
+  } catch {}
+};
+
+/**
+ * 設定回應頭
+ * @param {object} res - Express 回應物件
+ * @param {boolean} stream - 是否流式回應
  */
 const setResponseHeaders = (res, stream) => {
   try {
@@ -79,9 +101,9 @@ const getImageMarkdownListFromDelta = (delta) => {
 };
 
 /**
- * 判斷 tool_choice 是否要求強制呼叫工具
+ * 判斷 tool_choice 是否要求強制調用工具
  * @param {string|Object} toolChoice - OpenAI tool_choice
- * @returns {boolean} 是否需要至少一次工具呼叫
+ * @returns {boolean} 是否需要至少一次工具調用
  */
 const requiresToolCall = (toolChoice) => {
   if (toolChoice === "required") return true;
@@ -97,7 +119,7 @@ const requiresToolCall = (toolChoice) => {
 };
 
 /**
- * 構建 tool_choice=required 重試時追加的強約束提示
+ * 建置 tool_choice=required 重試時追加的強約束提示
  * @param {string|Object} toolChoice - OpenAI tool_choice
  * @returns {string} 重試提示詞
  */
@@ -113,16 +135,33 @@ const buildRequiredRetryHint = (toolChoice) => {
 };
 
 /**
- * 處理流式響應
- * @param {object} res - Express 響應物件
- * @param {object} response - 上游響應流
+ * 處理流式回應
+ * @param {object} res - Express 回應物件
+ * @param {object} response - 上游回應流
  * @param {boolean} enable_thinking - 是否啟用思考模式
- * @param {boolean} enable_web_search - 是否啟用網路搜尋
+ * @param {boolean} enable_web_search - 是否啟用網絡搜索
  * @param {object} requestBody - 原始請求體，用於提取prompt資訊
- * @param {object} [options] - 擴充套件選項
- * @param {boolean} [options.has_tools] - 是否啟用工具呼叫解析
+ * @param {object} [options] - 擴展選項
+ * @param {boolean} [options.has_tools] - 是否啟用工具調用解析
  * @param {string|Object} [options.tool_choice] - OpenAI tool_choice 控制項
  */
+/**
+ * 安全累計 stats——任何異常都吞掉，不影響回應給客戶端
+ * @param {Object} account - 目前帳戶物件（含 email）
+ * @param {Object} usage - { prompt_tokens, completion_tokens }
+ */
+const attributeChatUsage = (account, usage) => {
+  if (!account || !account.email || !usage) return;
+  try {
+    accountManager.accumulateStats(account.email, "chat", {
+      input: Number(usage.prompt_tokens) || 0,
+      output: Number(usage.completion_tokens) || 0,
+    });
+  } catch (e) {
+    // 靜默——stats 累計失敗不應中斷回應
+  }
+};
+
 const handleStreamResponse = async (
   res,
   response,
@@ -131,15 +170,6 @@ const handleStreamResponse = async (
   requestBody = null,
   options = {},
 ) => {
-  // P0-2: 客戶端斷線偵測
-  const abortController = new AbortController();
-  res.on("close", () => {
-    if (!res.writableEnded) {
-      abortController.abort();
-      logger.info("客戶端斷線，中止上游請求", "CHAT");
-    }
-  });
-
   try {
     const message_id = generateUUID();
     let web_search_info = null;
@@ -158,8 +188,14 @@ const handleStreamResponse = async (
       completion_tokens: 0,
       total_tokens: 0,
     };
-    // P0: 移除 completionContent，改用增量 token 計數器以避免記憶體洩漏
-    let completionTokenCount = 0;
+    let completionContent = ""; // 收集完整的回覆內容用於token估算
+    // 上游中途回 error 幀時的錯誤物件（非 WAF）。pipeUpstream 內捕獲，
+    // 外層讀取後改寫為 SSE error 事件結束串流，不當正常 stop。
+    let streamFailure = null;
+
+    // ═══ <think> 標籤流解析狀態（fallback：當上游無 phase 欄位時使用） ═══
+    let thinkActive = false;
+    let thinkBuf = "";
 
     // 提取prompt文本用於token估算
     let promptText = "";
@@ -177,12 +213,13 @@ const handleStreamResponse = async (
     }
 
     /**
-     * 寫一個標準 OpenAI 文本增量（content）
+     * 寫一個標準 OpenAI 文本增量（使用 safeWrite 避免 client 斷線 hang）
      * @param {string} text - 文本內容
      */
     const writeContentDelta = (text) => {
       if (!text) return;
-      res.write(
+      safeWrite(
+        res,
         `data: ${JSON.stringify({
           id: `chatcmpl-${message_id}`,
           object: "chat.completion.chunk",
@@ -199,13 +236,13 @@ const handleStreamResponse = async (
     };
 
     /**
-     * 寫一個 reasoning 增量（OpenAI 標準 reasoning_content）
-     * 讓 AI SDK 正確識別為 reasoning part，而非一般文字
-     * @param {string} text - reasoning 內容
+     * 寫一個 reasoning_content 增量（OpenAI 思考模式標準欄位）
+     * @param {string} text - 思考文本內容
      */
     const writeReasoningDelta = (text) => {
       if (!text) return;
-      res.write(
+      safeWrite(
+        res,
         `data: ${JSON.stringify({
           id: `chatcmpl-${message_id}`,
           object: "chat.completion.chunk",
@@ -213,7 +250,7 @@ const handleStreamResponse = async (
           choices: [
             {
               index: 0,
-              delta: { reasoning_content: text },
+              delta: { content: "", reasoning_content: text },
               finish_reason: null,
             },
           ],
@@ -222,10 +259,10 @@ const handleStreamResponse = async (
     };
 
     /**
-     * 寫一個工具呼叫增量，按 OpenAI 規範分片：
+     * 寫一個工具調用增量，按 OpenAI 規範分片（使用 safeWrite）
      *   1) 頭塊：包含 index/id/type 與 function.name + 空 arguments
-     *   2) 多個引數塊：function.arguments 切片
-     * @param {Array<Object>} calls - 已完成的工具呼叫列表
+     *   2) 多個參數塊：function.arguments 切片
+     * @param {Array<Object>} calls - 已完成的工具調用列表
      */
     const writeToolCallsDelta = (calls) => {
       if (!calls || calls.length === 0) return;
@@ -256,7 +293,7 @@ const handleStreamResponse = async (
             },
           ],
         };
-        res.write(`data: ${JSON.stringify(headerDelta)}\n\n`);
+        if (!safeWrite(res, `data: ${JSON.stringify(headerDelta)}\n\n`)) return;
 
         const argsString = call.function.arguments || "";
         for (
@@ -284,22 +321,69 @@ const handleStreamResponse = async (
               },
             ],
           };
-          res.write(`data: ${JSON.stringify(argDelta)}\n\n`);
+          if (!safeWrite(res, `data: ${JSON.stringify(argDelta)}\n\n`)) return;
         }
       }
     };
 
     /**
-     * 處理一個 SSE data 段（已剝離 'data: ' 字首）
+     * 輸出內容增量：若有工具解析器則先過濾 <tool_call> 塊
+     * 2026-10-23 Fix：原本 toolParser 只宣告從未 push，
+     * 串流模式下 <tool_call> XML 被當成純文字直接吐給 client
+     * → 客戶端看不到 tool_calls，只能看到一堆 XML 字串。
+     * @param {string} text - 內容增量
+     */
+    const emitContent = (text) => {
+      if (!text) return;
+      if (!toolParser) {
+        writeContentDelta(text);
+        return;
+      }
+      const r = toolParser.push(text);
+      if (r.textDelta) writeContentDelta(r.textDelta);
+      if (r.completedCalls.length > 0) writeToolCallsDelta(r.completedCalls);
+    };
+
+    /**
+     * 處理一個 SSE data 段（已剝離 'data: ' 前綴）
      * @param {string} dataContent - 原始 data 段
      */
     const processSSEPayload = async (dataContent) => {
       const decodeJson = isJson(dataContent) ? JSON.parse(dataContent) : null;
+      // 2026-10-25 Fix：PHASE-PROBE 原為 info 等級，每個 SSE chunk 都寫一行
+      // → 單次長回覆可產生數千行日誌，磁碟 I/O 拖慢串流本身。
+      // 改為 debug（僅 PROXY_LOG_LEVEL=debug 時輸出），並收斂為每 50 chunk 一次。
+      if (process.env.PROBE_PHASE === "true") {
+        try {
+          const _d = decodeJson?.choices?.[0]?.delta;
+          if (_d && _d.phase !== undefined)
+            logger.debug(`[PHASE-PROBE] phase=${_d.phase}`, "CHAT");
+        } catch {}
+      }
       if (
         decodeJson === null ||
         !decodeJson.choices ||
         decodeJson.choices.length === 0
       ) {
+        // ═══ Fix 2026-07-08: 識別上游業務錯誤（如 RateLimited） ═══
+        if (
+          decodeJson &&
+          decodeJson.success === false &&
+          decodeJson.data &&
+          decodeJson.data.code
+        ) {
+          const code = decodeJson.data.code;
+          const details = decodeJson.data.details || "";
+          upstreamError =
+            code === "RateLimited"
+              ? new Error(`上游額度已達上限 (RateLimited): ${details}`)
+              : new Error(`上游錯誤 (${code}): ${details}`);
+          logger.error(
+            `⬆️ 上游回傳${code === "RateLimited" ? "額度上限" : "錯誤"}: ${code} ${details}`,
+            "CHAT",
+          );
+          receivedExplicitError = true;
+        }
         return;
       }
 
@@ -334,8 +418,7 @@ const handleStreamResponse = async (
           }
         } else if (newImageMarkdownList.length > 0) {
           const imageContent = `${newImageMarkdownList.join("\n\n")}\n\n`;
-          // P0: 增量計算 token
-          completionTokenCount += countTokens(imageContent);
+          completionContent += imageContent;
           newImageMarkdownList.forEach((item) =>
             emittedImageMarkdownSet.add(item),
           );
@@ -343,234 +426,284 @@ const handleStreamResponse = async (
         }
       }
 
-      if (
-        !delta ||
-        !delta.content ||
-        (delta.phase !== "think" && delta.phase !== "answer")
-      ) {
-        return;
-      }
-
-      let content = delta.content;
-
-      if (delta.phase === "think") {
+      // ═══ 1) reasoning_content 先行（標準 OpenAI 思考模式欄位）═══
+      if (delta.reasoning_content) {
+        // Fix: 僅 outThink=true 時將 thinking 加入 content，避免泄漏到最終回應
+        if (config.outThink) {
+          completionContent += delta.reasoning_content;
+        }
         if (!thinking_start) {
           thinking_start = true;
-          // 在 reasoning 開頭嵌入 web_search 資訊
           if (web_search_info) {
-            writeReasoningDelta(
-              `\n\n${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n`,
-            );
+            const rc = `${await accountManager.generateMarkdownTable(web_search_info, config.searchInfoMode)}\n\n${delta.reasoning_content}`;
+            if (config.outThink) writeReasoningDelta(rc);
+          } else if (config.outThink) {
+            writeReasoningDelta(delta.reasoning_content);
           }
+        } else if (config.outThink) {
+          writeReasoningDelta(delta.reasoning_content);
         }
-        // P0: 增量計算 token，避免儲存完整字串
-        completionTokenCount += countTokens(content);
-        writeReasoningDelta(content);
-        return; // thinking 內容只走 reasoning_content，不走 content
+        // 若同時有 content，繼續往下處理（罕見，但仍支援）
+        if (!delta.content) return;
       }
 
-      // delta.phase === "answer"
-      if (!thinking_end && thinking_start) {
-        thinking_end = true;
-        // 切換到 answer 時，flush 在 thinking 期間累積的圖片
-        if (pendingImageMarkdownList.length > 0) {
-          const pendingImageContent = `${pendingImageMarkdownList.join("\n\n")}\n\n`;
-          completionTokenCount += countTokens(pendingImageContent);
-          pendingImageMarkdownList.forEach((item) =>
-            emittedImageMarkdownSet.add(item),
-          );
-          pendingImageMarkdownList = [];
-          writeContentDelta(pendingImageContent);
+      // ═══ 2) content 處理 ═══
+      if (!delta.content) return;
+      let rawContent = delta.content;
+      completionContent += rawContent;
+
+      // ═══ No phase — parse <think> tags from content (fallback for non-reasoning upstreams) ═══
+      if (thinkActive) {
+        const endIdx = rawContent.indexOf("</think>");
+        if (endIdx >= 0) {
+          thinkBuf += rawContent.slice(0, endIdx);
+          if (config.outThink && thinkBuf.trim()) writeReasoningDelta(thinkBuf);
+          thinkActive = false;
+          thinkBuf = "";
+          const rest = rawContent.slice(endIdx + 8);
+          if (rest) {
+            emitContent(rest);
+            completionContent += rest;
+          }
+        } else {
+          thinkBuf += rawContent;
         }
-      }
-
-      completionTokenCount += countTokens(content);
-
-      if (toolParser) {
-        const parsed = toolParser.push(content);
-        if (parsed.textDelta) writeContentDelta(parsed.textDelta);
-        if (parsed.completedCalls.length > 0)
-          writeToolCallsDelta(parsed.completedCalls);
       } else {
-        writeContentDelta(content);
+        const startIdx = rawContent.indexOf("<think>");
+        if (startIdx >= 0) {
+          const preThink = rawContent.slice(0, startIdx);
+          if (preThink) {
+            emitContent(preThink);
+            completionContent += preThink;
+          }
+          const postThink = rawContent.slice(startIdx + 7);
+          if (postThink.includes("</think>")) {
+            const endIdx2 = postThink.indexOf("</think>");
+            const thinkText = postThink.slice(0, endIdx2);
+            if (config.outThink && thinkText.trim())
+              writeReasoningDelta(thinkText);
+            const after = postThink.slice(endIdx2 + 8);
+            if (after) {
+              emitContent(after);
+              completionContent += after;
+            }
+          } else {
+            thinkBuf = postThink;
+            thinkActive = true;
+          }
+        } else {
+          // 純文字：若已有 reasoning 先關閉，輸出延遲的圖片
+          if (thinking_start && !thinking_end) {
+            thinking_end = true;
+            if (pendingImageMarkdownList.length > 0) {
+              const imgBlock = pendingImageMarkdownList.join("\n\n") + "\n\n";
+              rawContent = imgBlock + rawContent;
+              completionContent += imgBlock;
+              pendingImageMarkdownList = [];
+            }
+          }
+          emitContent(rawContent);
+        }
       }
     };
 
     /**
-     * 把一個上游響應流接入解析與轉發管線，等其結束
-     * @param {object} upstreamResponse - axios stream 響應
-     * @param {AbortController} [abortController] - 客戶端斷線中止控制器
+     * 把一個上游回應流接入解析與轉發管線，等其結束
+     * 內建 idle timeout（30s 無資料視為結束）與 keepalive
+     * @param {object} upstreamResponse - axios stream 回應
      * @returns {Promise<void>} 流處理完成的 Promise
      */
-    const pipeUpstream = (upstreamResponse, abortController = null) =>
+    const pipeUpstream = (upstreamResponse) =>
       new Promise((resolve, reject) => {
         const decoder = new TextDecoder("utf-8");
-        // P1: 改用 Buffer 物件避免字串拼接記憶體洩漏
-        let buffer = Buffer.alloc(0);
-        let processing = false;
-        const queue = [];
-        const MAX_QUEUE_SIZE = 3000; // P0-1: 降低佇列上限，更早觸發背壓保護
-        const DROP_THRESHOLD = 2000; // P2: 佇列達到 66% 時開始丟棄舊數據
-        let isPaused = false;
-        let drainTimer = null; // P21: 防止 resume 後再次快速填滿
+        let buffer = "";
+        let idleTimer = null;
+        let keepaliveTimer = null;
+        let finished = false;
+        let hasDataArrived = false;
 
-        // 非同步處理佇列，避免阻塞 stream data 事件
-        const processQueue = async () => {
-          if (processing || queue.length === 0) return;
-          processing = true;
+        // ═══ Fix 3: client 斷線時立即清理上游，不等到下筆資料 ═══
+        const cleanup = () => {
+          if (finished) return;
+          finished = true;
+          clearTimers();
+          res.removeListener("close", onResClose);
+          upstreamResponse.removeListener("data", onData);
+          upstreamResponse.removeListener("end", onEnd);
+          upstreamResponse.removeListener("error", onError);
           try {
-            // P22: 批次處理，避免單個 chunk 處理過慢導致整體卡住
-            const batchSize = Math.min(queue.length, 50);
-            for (let i = 0; i < batchSize; i++) {
-              const item = queue.shift();
-              if (!item) break;
-              try {
-                await processSSEPayload(item);
-              } catch (error) {
-                logger.error("流式資料處理錯誤", "CHAT", "", error);
-              }
-            }
-          } finally {
-            processing = false;
-            // P12: 若佇列低於閾值且曾暫停，立即恢復上游
-            if (isPaused && queue.length < DROP_THRESHOLD) {
-              isPaused = false;
-              upstreamResponse.resume();
-              logger.info(
-                `🔄 佇列降至 ${queue.length} (<${DROP_THRESHOLD})，恢復上游 stream`,
-                "CHAT",
-              );
-              // P21: 設定冷卻時間，避免瞬間再次填滿
-              if (drainTimer) clearTimeout(drainTimer);
-              drainTimer = setTimeout(() => {
-                drainTimer = null;
-              }, 2000);
-            }
-            if (queue.length > 0) {
-              setImmediate(processQueue);
-            }
+            upstreamResponse.destroy();
+          } catch {}
+        };
+
+        const onResClose = () => {
+          cleanup();
+          resolve();
+        };
+        res.on("close", onResClose);
+        // res 的 'error'（如 write after end / client 斷線）必須有 listener，
+        // 否則成為未捕獲異常（server.js 只記錄不 exit，但會污染日誌並中斷轉發）
+        res.on("error", (err) => {
+          logger.warn(
+            `回應串流錯誤（非致命）: ${err?.message || err}`,
+            "CHAT",
+          );
+          cleanup();
+          resolve();
+        });
+
+        const clearTimers = () => {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = null;
           }
         };
 
-        upstreamResponse.on("data", (chunk) => {
-          // P0-2: 客戶端斷線時立即中止
-          if (abortController?.signal.aborted) {
-            upstreamResponse.destroy();
+        // ═══ Fix 6: 增加間隔超時至 120s 避免模型產出中斷 ═══
+        // 原 bug: 60s 間隔超時在複雜編碼任務時過早觸發，導致模型產出被截斷
+        // 修復：調高至與 TTFB 一致 (120s)，給模型足夠時間生成長檔案
+        const TTFB_TIMEOUT_MS = 120000;
+        const INTER_CHUNK_TIMEOUT_MS = parseInt(
+          process.env.CHAT_INTER_CHUNK_TIMEOUT_MS || "120000",
+          10,
+        );
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          const timeoutMs = hasDataArrived
+            ? INTER_CHUNK_TIMEOUT_MS
+            : TTFB_TIMEOUT_MS;
+          idleTimer = setTimeout(() => {
+            if (!finished) {
+              const reason = hasDataArrived
+                ? `串流間隔逾時 (${INTER_CHUNK_TIMEOUT_MS / 1000}s)`
+                : `上游首字節逾時 (${TTFB_TIMEOUT_MS / 1000}s)`;
+              logger.warn(reason + "，強制結束", "CHAT");
+              cleanup();
+              resolve();
+            }
+          }, timeoutMs);
+        };
+
+        // 15 秒 keepalive 心跳（維持 client 連線）
+        // 原 bug：res.write() 的 write-after-end 是非同步 error 事件，try/catch 攔不住
+        const KEEPALIVE_INTERVAL_MS = 15000;
+        keepaliveTimer = setInterval(() => {
+          safeWrite(res, ": keepalive\n\n");
+        }, KEEPALIVE_INTERVAL_MS);
+
+        resetIdle();
+
+        const onData = async (chunk) => {
+          if (finished) return;
+          // ═══ Fix 3: 檢查 client 是否已斷線，斷線則清理上游 stream ═══
+          if (res.destroyed) {
+            cleanup();
+            resolve();
             return;
           }
+          if (!hasDataArrived) hasDataArrived = true; // 首 byte 已抵達，切換至間隔超時
+          resetIdle(); // 有資料就重設 idle timer
 
-          // P1: 使用 Buffer.concat 避免字串拼接
-          buffer = Buffer.concat([buffer, chunk]);
+          const decodeText = decoder.decode(chunk, { stream: true });
+          buffer += decodeText;
 
+          const chunks = [];
           let startIndex = 0;
+
           while (true) {
             const dataStart = buffer.indexOf("data: ", startIndex);
             if (dataStart === -1) break;
             const dataEnd = buffer.indexOf("\n\n", dataStart);
             if (dataEnd === -1) break;
-            // P1: 使用 subarray 避免底層記憶體共享
-            const dataChunk = buffer
-              .subarray(dataStart + 6, dataEnd)
-              .toString("utf-8")
-              .trim();
-            if (dataChunk) {
-              // P2: 背壓控制 - 佇列滿時暫停上游而非丟棄數據
-              // 丟棄數據會導致客戶端收到不完整回應，改為暫停上游等待消費
-              if (queue.length >= MAX_QUEUE_SIZE && !isPaused) {
-                isPaused = true;
-                upstreamResponse.pause();
-                logger.warn(
-                  `⏸️ 佇列達上限 ${MAX_QUEUE_SIZE}，暫停上游等待消費`,
-                  "CHAT",
-                );
-              }
-              queue.push(dataChunk);
-            }
+            const dataChunk = buffer.substring(dataStart, dataEnd).trim();
+            chunks.push(dataChunk);
             startIndex = dataEnd + 2;
           }
 
           if (startIndex > 0) {
-            buffer = buffer.subarray(startIndex);
+            buffer = buffer.substring(startIndex);
           }
 
-          // P1: 定期重置 buffer 避免長期持有大塊記憶體
-          if (buffer.length > 1024 * 1024) {
-            buffer = Buffer.from(buffer);
-          }
-
-          // P0-1: 背壓控制 - 已在上方 dataChunk 處理時暫停，此處僅記錄狀態
-          // 移除重複的 pause 邏輯，避免競態條件
-
-          if (!processing) {
-            setImmediate(processQueue);
-          }
-        });
-
-        upstreamResponse.on("end", () => {
-          logger.debug(`上游 stream 結束，佇列剩餘: ${queue.length}`, "CHAT");
-          // P23: 強制刷新殘留佇列，避免最後幾個 chunk 遺失導致客戶端卡住
-          const flushRemaining = async () => {
-            while (queue.length > 0) {
-              const item = queue.shift();
-              try {
-                await processSSEPayload(item);
-              } catch (error) {
-                logger.error("流式資料處理錯誤 (flush)", "CHAT", "", error);
-              }
-            }
-            logger.debug("佇列已清空，resolve pipeUpstream", "CHAT");
-            resolve();
-          };
-          flushRemaining();
-        });
-
-        upstreamResponse.on("error", (err) => {
-          logger.error(`流式響應讀取錯誤: ${err.message}`, "CHAT", "", err);
-          // 僅在回應尚未結束時嘗試發送錯誤訊息
-          if (!res.writableEnded) {
+          for (const item of chunks) {
             try {
-              res.write(
-                `data: ${JSON.stringify({
-                  id: `chatcmpl-${message_id}`,
-                  object: "chat.completion.chunk",
-                  created: Math.round(new Date().getTime() / 1000),
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {},
-                      finish_reason: "error",
-                    },
-                  ],
-                })}\n\n`,
-              );
-              res.end();
-            } catch (_) {
-              /* response may already be closed */
+              const raw = item.replace("data: ", "");
+              // ═══ Fix 2026-10-18: Qwen 白天尖峰會回 HTTP 200 + challenge 幀
+              // {ret:['FAIL_SYS_USER_VALIDATE','...被挤爆啦...']}，沒有 choices。
+              // 舊邏輯只認 HTTP 403/503，challenge 幀被靜默吞掉 → 表現為「上游空白」。
+              // 這裡先偵測，明確丟出讓 client 收到 503 + Retry-After。
+              if (raw !== "[DONE]") {
+                let payload = null;
+                try {
+                  payload = JSON.parse(raw);
+                } catch (_) {
+                  payload = null;
+                }
+                if (payload) assertNoUpstreamFailure(payload);
+              }
+              await processSSEPayload(raw);
+            } catch (error) {
+              if (isWafChallengeError(error)) {
+                logger.warn(
+                  `[WAF] ${error.message}（熔斷 strikes=${chatBreakerState().strikes}）`,
+                  "CHAT",
+                );
+                // 交給外層 reject，讓 client 拿到 503 + Retry-After
+                cleanup();
+                reject(error);
+                return;
+              }
+              logger.error("流式資料處理錯誤", "CHAT", "", error);
+              // ═══ Fix 2026-11-05: 上游錯誤幀不再靜默吞掉 ═══
+              // 舊邏輯只記 log 然後繼續吃 chunk：client（opencode）收到殘缺／空串流，
+              // 結尾仍被當正常 stop 存檔，污染對話歷史與壓縮摘要。
+              // 改為停止讀取上游，把錯誤記到 streamFailure，由外層寫 SSE error 幀結束。
+              streamFailure = error;
+              cleanup();
+              resolve();
             }
           }
-          reject(err); // 改為 reject，讓呼叫者感知錯誤
-        });
+        };
+        upstreamResponse.on("data", onData);
+
+        const onEnd = () => {
+          cleanup();
+          resolve();
+        };
+        upstreamResponse.on("end", onEnd);
+
+        const onError = (err) => {
+          cleanup();
+          reject(err);
+        };
+        upstreamResponse.on("error", onError);
       });
 
-    // P0-2: 傳遞 abortController 給 pipeUpstream
-    await pipeUpstream(response, options.abortController || null);
+    await pipeUpstream(response);
 
-    // 🐛 FIX: 串流結束後檢查上游健康狀態，若擁塞則記錄警告
-    try {
-      if (typeof getUpstreamHealth === "function") {
-        const health = getUpstreamHealth();
-        if (health?.congested) {
-          logger.warn(
-            `⚠️ 串流結束時上游仍標記為擁塞 (lastCheck: ${new Date(health.lastCheck).toISOString()})`,
-            "CHAT",
-          );
-        }
-      }
-    } catch (e) {
-      logger.debug(`getUpstreamHealth check failed: ${e.message}`, "CHAT");
+    if (streamFailure) {
+      // 上游中途回錯誤幀：寫 OpenAI 標準 SSE error 事件給 client，再 [DONE] 結束。
+      // opencode 的 Zod union 可解析 error 物件（lesson 2026-11-04-2020），
+      // 本回合明確標記失敗，殘缺內容不會當正常 stop 存檔、不污染 compaction。
+      safeWrite(
+        res,
+        `data: ${JSON.stringify({
+          error: {
+            message: streamFailure?.message || "Upstream error",
+            type: "upstream_error",
+            code: streamFailure?.code || "upstream_error",
+          },
+        })}\n\n`,
+      );
+      safeWrite(res, `data: [DONE]\n\n`);
+      safeEnd(res);
+      return;
     }
 
-    // tool_choice="required" 強校驗：未觸發任何工具呼叫則追加更強提示重試一次
+    // tool_choice="required" 強校驗：未觸發任何工具調用則追加更強提示重試一次
     if (
       hasTools &&
       toolParser &&
@@ -578,34 +711,28 @@ const handleStreamResponse = async (
       requiresToolCall(toolChoice)
     ) {
       const retryHint = buildRequiredRetryHint(toolChoice);
-      // P2-1: 重試時保留 requestId 以維持冪等性
       const retryBody = {
         ...requestBody,
-        requestId: requestBody.requestId,
         messages: [
           ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
           { role: "system", content: retryHint },
         ],
       };
       logger.warning?.(
-        "tool_choice=required 首次未觸發工具呼叫，等待 2s 後重試",
+        "tool_choice=required 首次未觸發工具調用，進行一次重試",
         "CHAT",
       );
-      await new Promise((r) => setTimeout(r, 2000));
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
-          await pipeUpstream(
-            retryResp.response,
-            options.abortController || null,
-          );
+          await pipeUpstream(retryResp.response);
         }
       } catch (e) {
         logger.error("required 模式重試失敗", "CHAT", "", e);
       }
     }
 
-    // flush 工具呼叫解析器中的殘留內容
+    // flush 工具調用解析器中的殘留內容
     if (toolParser) {
       const tail = toolParser.flush();
       if (tail.textDelta) writeContentDelta(tail.textDelta);
@@ -613,9 +740,9 @@ const handleStreamResponse = async (
         writeToolCallsDelta(tail.completedCalls);
     }
 
-    // 處理最終的搜尋資訊（僅在 thinking 未發生時才補在結尾）
+    // 處理最終的搜索資訊
     if (
-      !thinking_start &&
+      (config.outThink === false || !enable_thinking) &&
       web_search_info &&
       config.searchInfoMode === "text"
     ) {
@@ -626,27 +753,35 @@ const handleStreamResponse = async (
       writeContentDelta(`\n\n---\n${webSearchTable}`);
     }
 
-    // P0: 使用增量 token 計數器計算最終使用量，避免傳遞大字串
+    // 計算最終的token使用量
     if (
       totalTokens.prompt_tokens === 0 &&
       totalTokens.completion_tokens === 0
     ) {
-      const promptTokens = countTokens(
-        requestBody?.messages
-          ? JSON.stringify(requestBody.messages)
-          : promptText,
+      totalTokens = createUsageObject(
+        requestBody?.messages || promptText,
+        completionContent,
+        null,
       );
-      totalTokens = {
-        prompt_tokens: promptTokens,
-        completion_tokens: completionTokenCount,
-        total_tokens: promptTokens + completionTokenCount,
-      };
-      logger.debug(
-        `流式使用tiktoken增量計算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
+      logger.info(
+        `流式使用tiktoken計算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
         "CHAT",
       );
     } else {
-      logger.debug(
+      // ═══ Fix 12: 上游回傳空內容時記錄除錯資訊 ═══
+      const _hasStreamContent =
+        totalTokens.completion_tokens > 0 ||
+        completionContent.trim().length > 0;
+      if (
+        !_hasStreamContent &&
+        (totalTokens.prompt_tokens > 0 || promptText.length > 0)
+      ) {
+        logger.warn(
+          `⬆️ [串流] 上游回傳空內容: model=${requestBody?.model || "?"} prompt_tokens=${totalTokens.prompt_tokens} completion_tokens=${totalTokens.completion_tokens} 請檢查模型名稱與 Token 權限`,
+          "CHAT",
+        );
+      }
+      logger.info(
         `流式使用上游真實Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
         "CHAT",
       );
@@ -660,9 +795,15 @@ const handleStreamResponse = async (
     totalTokens.total_tokens =
       totalTokens.prompt_tokens + totalTokens.completion_tokens;
 
+    // Daily stats 累計——一次性歸屬到主請求帳戶
+    // 注：tool_choice=required retry 走的可能是另一個帳戶，但 retry 路徑罕見，
+    // 全歸屬主帳戶是可接受的精度損失（PR #3wg.1 epic notes 已記）
+    attributeChatUsage(options.currentAccount, totalTokens);
+
     const finishReason =
       toolParser && toolParser.hasEmittedAnyCall() ? "tool_calls" : "stop";
-    res.write(
+    safeWrite(
+      res,
       `data: ${JSON.stringify({
         id: `chatcmpl-${message_id}`,
         object: "chat.completion.chunk",
@@ -677,7 +818,8 @@ const handleStreamResponse = async (
       })}\n\n`,
     );
 
-    res.write(
+    safeWrite(
+      res,
       `data: ${JSON.stringify({
         id: `chatcmpl-${message_id}`,
         object: "chat.completion.chunk",
@@ -687,28 +829,85 @@ const handleStreamResponse = async (
       })}\n\n`,
     );
 
-    res.write(`data: [DONE]\n\n`);
-    res.end();
+    safeWrite(res, `data: [DONE]\n\n`);
+    safeEnd(res);
   } catch (error) {
+    // ═══ Fix 2026-10-18: chat challenge → 503 + Retry-After（可重試的過載）═══
+    // 舊邏輯一律 500「Service error」，client 不知道何時重試 → 立刻重試 hammer Qwen。
+    // 對齊原作者 81b75ad：503 + Retry-After: 30，訊息說明上游繁忙。
+    if (isWafChallengeError(error)) {
+      const retryAfter = Number(error.retryAfter) || 30;
+      logger.warn(
+        `[WAF] 回 503 + Retry-After=${retryAfter}（Qwen 尖峰風控，稍後重試）`,
+        "CHAT",
+      );
+      if (!res.headersSent) {
+        try {
+          res.set("Retry-After", String(retryAfter));
+          res.status(503).json({
+            error: {
+              message: error.message,
+              type: "upstream_waf_challenge",
+              code: error.code,
+              retry_after_seconds: retryAfter,
+            },
+          });
+        } catch (_) {}
+      } else {
+        // SSE 已開始：寫 OpenAI 標準 error 幀 + [DONE] 收尾，
+        // 不能靜默 return（client 會一直等，且殘缺串流被當正常結束存檔）
+        safeWrite(
+          res,
+          `data: ${JSON.stringify({
+            error: {
+              message: error.message,
+              type: "upstream_waf_challenge",
+              code: error.code || "upstream_waf_challenge",
+              retry_after_seconds: retryAfter,
+            },
+          })}\n\n`,
+        );
+        safeWrite(res, `data: [DONE]\n\n`);
+        safeEnd(res);
+      }
+      return;
+    }
     logger.error("聊天處理錯誤", "CHAT", "", error);
-    try {
-      res.status(500).json({ error: "服務錯誤!!!" });
-    } catch (_) {
-      /* response already started */
+    // ═══ Fix 10: 若 headers 已送出，不應再 res.status(500) ═══
+    // 原 bug: SSE 串流開始後，catch 嘗試發送 JSON error response，
+    // 但 content-type 已是 text/event-stream，發送會失敗且客戶端看到不完整串流
+    if (!res.headersSent) {
+      try {
+        res.status(500).json({ error: "Service error" });
+      } catch (_) {}
+    } else {
+      // SSE 已開始：補寫 error 幀 + [DONE] 收尾，避免 client 掛死
+      safeWrite(
+        res,
+        `data: ${JSON.stringify({
+          error: {
+            message: error?.message || "Service error",
+            type: "upstream_error",
+            code: "upstream_error",
+          },
+        })}\n\n`,
+      );
+      safeWrite(res, `data: [DONE]\n\n`);
+      safeEnd(res);
     }
   }
 };
 
 /**
- * 處理非流式響應（從流式資料累積完整響應）
- * @param {object} res - Express 響應物件
- * @param {object} response - 上游響應流
+ * 處理非流式回應（從流式資料累積完整回應）
+ * @param {object} res - Express 回應物件
+ * @param {object} response - 上游回應流
  * @param {boolean} enable_thinking - 是否啟用思考模式
- * @param {boolean} enable_web_search - 是否啟用網路搜尋
+ * @param {boolean} enable_web_search - 是否啟用網絡搜索
  * @param {string} model - 模型名稱
  * @param {object} requestBody - 原始請求體，用於提取prompt資訊
- * @param {object} [options] - 擴充套件選項
- * @param {boolean} [options.has_tools] - 是否啟用工具呼叫解析
+ * @param {object} [options] - 擴展選項
+ * @param {boolean} [options.has_tools] - 是否啟用工具調用解析
  */
 const handleNonStreamResponse = async (
   res,
@@ -720,8 +919,9 @@ const handleNonStreamResponse = async (
   options = {},
 ) => {
   try {
-    let answerContent = "";
-    let thinkingContent = "";
+    let fullContent = ""; // only content + images, NO reasoning_content
+    let reasoningContent = "";
+    let contentForToken = ""; // for token estimation (includes reasoning tokens)
     let web_search_info = null;
     let thinking_start = false;
     let thinking_end = false;
@@ -754,16 +954,94 @@ const handleNonStreamResponse = async (
     }
 
     /**
-     * 把一個上游響應流讀完並累積到 fullContent
-     * @param {object} upstreamResponse - axios stream 響應
+     * 把一個上游回應流讀完並累積到 fullContent
+     * 內建 idle timeout（30s 無資料視為結束）
+     * @param {object} upstreamResponse - axios stream 回應
      * @returns {Promise<void>} 流處理完成的 Promise
      */
     const accumulateUpstream = (upstreamResponse) =>
       new Promise((resolve, reject) => {
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
+        let idleTimer = null;
+        let finished = false;
+        let hasDataArrived = false;
+        let upstreamError = null;
+        let receivedExplicitError = false;
 
-        upstreamResponse.on("data", (chunk) => {
+        // ═══ Fix 3: client 斷線時立即清理上游（非串流也適用） ═══
+        const cleanup = () => {
+          if (finished) return;
+          finished = true;
+          clearIdle();
+          res.removeListener("close", onResClose);
+          upstreamResponse.removeListener("data", onData);
+          upstreamResponse.removeListener("end", onEnd);
+          upstreamResponse.removeListener("error", onError);
+          try {
+            upstreamResponse.destroy();
+          } catch {}
+        };
+
+        const onResClose = () => {
+          cleanup();
+          resolve();
+        };
+        res.on("close", onResClose);
+        // res 的 'error'（如 write after end / client 斷線）必須有 listener，
+        // 否則成為未捕獲異常（server.js 只記錄不 exit，但會污染日誌並中斷轉發）
+        res.on("error", (err) => {
+          logger.warn(
+            `回應串流錯誤（非致命）: ${err?.message || err}`,
+            "CHAT",
+          );
+          cleanup();
+          resolve();
+        });
+
+        const clearIdle = () => {
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
+        };
+
+        // ═══ 兩段式超時（同 pipeUpstream，INTER_CHUNK 120s） ═══
+        const TTFB_TIMEOUT_MS = 120000;
+        const INTER_CHUNK_TIMEOUT_MS = parseInt(
+          process.env.CHAT_INTER_CHUNK_TIMEOUT_MS || "120000",
+          10,
+        );
+        const resetIdle = () => {
+          clearIdle();
+          const timeoutMs = hasDataArrived
+            ? INTER_CHUNK_TIMEOUT_MS
+            : TTFB_TIMEOUT_MS;
+          idleTimer = setTimeout(() => {
+            if (!finished) {
+              const reason = hasDataArrived
+                ? `非流式間隔逾時 (${INTER_CHUNK_TIMEOUT_MS / 1000}s)`
+                : `上游首字節逾時 (${TTFB_TIMEOUT_MS / 1000}s)`;
+              logger.warn(reason + "，強制結束", "CHAT");
+              cleanup();
+              resolve();
+            }
+          }, timeoutMs);
+        };
+
+        resetIdle();
+
+        const onData = async (chunk) => {
+          if (finished) return;
+          // ═══ Fix 3: 檢查 client 是否已斷線 ═══
+          if (res.destroyed) {
+            cleanup();
+            resolve();
+            return;
+          }
+          if (!hasDataArrived) hasDataArrived = true;
+          resetIdle();
+
           const decodeText = decoder.decode(chunk, { stream: true });
           buffer += decodeText;
 
@@ -795,6 +1073,29 @@ const handleNonStreamResponse = async (
                 !decodeJson.choices ||
                 decodeJson.choices.length === 0
               ) {
+                // ═══ Fix 2026-07-08: 識別上游業務錯誤（如 RateLimited） ═══
+                // 上游 success:false 且 data.code 為錯誤碼時，記錄明確錯誤，
+                // 避免被當成「空內容」靜默丟棄，讓用戶誤以為是對話停滯。
+                if (
+                  decodeJson &&
+                  decodeJson.success === false &&
+                  decodeJson.data &&
+                  decodeJson.data.code
+                ) {
+                  const code = decodeJson.data.code;
+                  const details = decodeJson.data.details || "";
+                  if (code === "RateLimited") {
+                    upstreamError = new Error(
+                      `上游額度已達上限 (RateLimited): ${details}`,
+                    );
+                    logger.error(`⬆️ 上游回傳額度上限: ${details}`, "CHAT");
+                  } else {
+                    upstreamError = new Error(`上游錯誤 (${code}): ${details}`);
+                    logger.error(`⬆️ 上游回傳錯誤: ${code} ${details}`, "CHAT");
+                  }
+                  // 標記已收到明確錯誤，結束累積（但仍繼續讀完流避免掛起）
+                  receivedExplicitError = true;
+                }
                 continue;
               }
 
@@ -829,69 +1130,98 @@ const handleNonStreamResponse = async (
                     }
                   }
                 } else if (newImageMarkdownList.length > 0) {
-                  answerContent += `${newImageMarkdownList.join("\n\n")}\n\n`;
+                  const imgBlock = `${newImageMarkdownList.join("\n\n")}\n\n`;
+                  fullContent += imgBlock;
+                  contentForToken += imgBlock;
                   newImageMarkdownList.forEach((it) =>
                     appendedImageMarkdownSet.add(it),
                   );
                 }
               }
 
-              if (
-                !delta ||
-                !delta.content ||
-                (delta.phase !== "think" && delta.phase !== "answer")
-              ) {
+              if (!delta || (!delta.content && !delta.reasoning_content))
                 continue;
+
+              // ═══ 1) reasoning_content 先行 ═══
+              if (delta.reasoning_content) {
+                contentForToken += delta.reasoning_content; // for token estimation
+                if (!thinking_start) {
+                  thinking_start = true;
+                  if (web_search_info) {
+                    const table = await accountManager.generateMarkdownTable(
+                      web_search_info,
+                      config.searchInfoMode,
+                    );
+                    reasoningContent += table + "\n\n";
+                  }
+                }
+                reasoningContent += delta.reasoning_content;
+                if (!delta.content) continue;
               }
 
-              let content = delta.content;
+              // ═══ 2) content ═══
+              let rawContent = delta.content;
+              if (!rawContent) continue;
 
-              if (delta.phase === "think") {
-                thinking_start = true;
-                thinkingContent += content;
-                continue; // thinking 不進 answerContent
-              }
-
-              // delta.phase === "answer"
+              // 從 reasoning 切換到 content 時，輸出延遲的圖片
               if (!thinking_end && thinking_start) {
                 thinking_end = true;
-                // flush pending images on transition
                 if (pendingImageMarkdownList.length > 0) {
-                  answerContent += `${pendingImageMarkdownList.join("\n\n")}\n\n`;
+                  const pendingImg =
+                    pendingImageMarkdownList.join("\n\n") + "\n\n";
+                  fullContent += pendingImg;
+                  contentForToken += pendingImg;
                   pendingImageMarkdownList.forEach((it) =>
                     appendedImageMarkdownSet.add(it),
                   );
                   pendingImageMarkdownList = [];
                 }
               }
-
-              answerContent += content;
+              fullContent += rawContent;
+              contentForToken += rawContent;
             } catch (error) {
               logger.error("非流式資料處理錯誤", "CHAT", "", error);
             }
           }
-        });
+        };
+        upstreamResponse.on("data", onData);
 
-        upstreamResponse.on("end", () => resolve());
-        upstreamResponse.on("error", (err) => {
-          logger.error(
-            "非流式響應讀取錯誤，以已累積資料繼續處理",
-            "CHAT",
-            "",
-            err,
-          );
-          logger.error(`錯誤詳情: ${err.message}\n堆疊: ${err.stack}`, "CHAT");
+        const onEnd = () => {
+          cleanup();
           resolve();
-        });
+        };
+        upstreamResponse.on("end", onEnd);
+
+        const onError = (err) => {
+          cleanup();
+          reject(err);
+        };
+        upstreamResponse.on("error", onError);
       });
 
     await accumulateUpstream(response);
 
-    // 工具呼叫解析：從 answerContent 抽取 <tool_call> 塊
-    let assistantContent = answerContent;
+    // ═══ fallback: <think> 標籤提取（僅上游無 reasoning_content 時使用） ═══
+    // Fix: 始終從 content 中移除 <think> 標籤，避免 thinking 混入最終回應
+    // outThink=true 時同時保留到 reasoning_content 欄位
+    if (!reasoningContent && fullContent.includes("<think>")) {
+      const cleaned = fullContent.replace(
+        /<think>[\s\S]*?<\/think>/g,
+        (match) => {
+          const thinkText = match.replace(/<\/?think>/g, "").trim();
+          if (thinkText && config.outThink)
+            reasoningContent += thinkText + "\n";
+          return "";
+        },
+      );
+      fullContent = cleaned.trim();
+    }
+
+    // 工具調用解析：從 fullContent 抽取 <tool_call> 塊
+    let assistantContent = fullContent;
     let toolCalls = [];
     if (hasTools) {
-      const parsed = parseToolCallsFromText(answerContent);
+      const parsed = parseToolCallsFromText(fullContent);
       assistantContent = parsed.cleanedText;
       toolCalls = parsed.toolCalls;
     }
@@ -899,31 +1229,27 @@ const handleNonStreamResponse = async (
     // tool_choice="required" 強校驗：未觸發則重試一次
     if (hasTools && toolCalls.length === 0 && requiresToolCall(toolChoice)) {
       const retryHint = buildRequiredRetryHint(toolChoice);
-      // P2-1: 重試時保留 requestId 以維持冪等性
       const retryBody = {
         ...requestBody,
-        requestId: requestBody.requestId,
         messages: [
           ...(Array.isArray(requestBody?.messages) ? requestBody.messages : []),
           { role: "system", content: retryHint },
         ],
       };
       logger.warning?.(
-        "tool_choice=required 首次未觸發工具呼叫，等待 2s 後重試",
+        "tool_choice=required 首次未觸發工具調用，進行一次重試",
         "CHAT",
       );
-      await new Promise((r) => setTimeout(r, 2000));
       try {
         const retryResp = await sendChatRequest(retryBody);
         if (retryResp.status && retryResp.response) {
-          const before = answerContent;
+          const before = fullContent;
           await accumulateUpstream(retryResp.response);
-          const retriedText = answerContent.slice(before.length);
+          const retriedText = fullContent.slice(before.length);
           const parsedRetry = parseToolCallsFromText(retriedText);
           if (parsedRetry.toolCalls.length > 0) {
             toolCalls = parsedRetry.toolCalls;
-            assistantContent =
-              parseToolCallsFromText(answerContent).cleanedText;
+            assistantContent = parseToolCallsFromText(fullContent).cleanedText;
           }
         }
       } catch (e) {
@@ -931,9 +1257,9 @@ const handleNonStreamResponse = async (
       }
     }
 
-    // 處理最終的搜尋資訊（僅在 thinking 未發生時才補在結尾）
+    // 處理最終的搜索資訊
     if (
-      !thinking_start &&
+      (config.outThink === false || !enable_thinking) &&
       web_search_info &&
       config.searchInfoMode === "text"
     ) {
@@ -944,11 +1270,6 @@ const handleNonStreamResponse = async (
       assistantContent += `\n\n---\n${webSearchTable}`;
     }
 
-    // 合併 thinking + answer 用於 token 估算
-    const fullContent = thinkingContent
-      ? `${thinkingContent}\n\n${assistantContent}`
-      : assistantContent;
-
     // 計算最終的token使用量
     if (
       totalTokens.prompt_tokens === 0 &&
@@ -956,15 +1277,31 @@ const handleNonStreamResponse = async (
     ) {
       totalTokens = createUsageObject(
         requestBody?.messages || promptText,
-        fullContent,
+        contentForToken,
         null,
       );
-      logger.debug(
+      logger.info(
         `非流式使用tiktoken計算 - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
         "CHAT",
       );
     } else {
-      logger.debug(
+      // ═══ Fix 12: 上游回傳空內容時記錄除錯資訊 ═══
+      // 當上游 API 回傳 HTTP 200 但 completion=0 且 prompt>0，
+      // 表示 Qwen API 成功接收請求但回傳空白回應（可能模型不可用、Token 無權限、WAF 靜默阻擋）
+      const _upstreamHasContent =
+        totalTokens.completion_tokens > 0 ||
+        contentForToken.trim().length > 0 ||
+        !!(toolCalls?.length > 0);
+      if (
+        !_upstreamHasContent &&
+        (totalTokens.prompt_tokens > 0 || promptText.length > 0)
+      ) {
+        logger.warn(
+          `⬆️ 上游回傳空內容: model=${model} prompt_tokens=${totalTokens.prompt_tokens} completion_tokens=${totalTokens.completion_tokens} 請檢查模型名稱與 Token 權限`,
+          "CHAT",
+        );
+      }
+      logger.info(
         `非流式使用上游真實Token - Prompt: ${totalTokens.prompt_tokens}, Completion: ${totalTokens.completion_tokens}, Total: ${totalTokens.total_tokens}`,
         "CHAT",
       );
@@ -978,15 +1315,19 @@ const handleNonStreamResponse = async (
     totalTokens.total_tokens =
       totalTokens.prompt_tokens + totalTokens.completion_tokens;
 
+    // Daily stats 累計——一次性歸屬到主請求帳戶（同 stream 分支註釋）
+    attributeChatUsage(options.currentAccount, totalTokens);
+
     const assistantMessage = {
       role: "assistant",
       content: assistantContent || null,
     };
-    if (thinkingContent) {
-      assistantMessage.reasoning_content = thinkingContent;
-    }
     if (toolCalls.length > 0) {
       assistantMessage.tool_calls = toolCalls;
+    }
+    // 當 OUTPUT_THINK=true 且上游有思考內容時，輸出 OpenAI 標準 reasoning_content 欄位
+    if (config.outThink && reasoningContent) {
+      assistantMessage.reasoning_content = reasoningContent.trimEnd();
     }
 
     const bodyTemplate = {
@@ -1005,9 +1346,15 @@ const handleNonStreamResponse = async (
     };
     res.json(bodyTemplate);
   } catch (error) {
-    logger.error("非流式聊天處理錯誤", "CHAT", "", error);
+    // ═══ Fix 2026-07-08: error.message 直接嵌入 log 字串，避免 JSON.stringify(error) 空物件 ═══
+    logger.error(
+      `非流式聊天處理錯誤: ${error?.message || error}`,
+      "CHAT",
+      "",
+      error,
+    );
     res.status(500).json({
-      error: "服務錯誤!!!",
+      error: "Service error",
     });
   }
 };
@@ -1015,43 +1362,36 @@ const handleNonStreamResponse = async (
 /**
  * 主要的聊天完成處理函式
  * @param {object} req - Express 請求物件
- * @param {object} res - Express 響應物件
+ * @param {object} res - Express 回應物件
  */
 const handleChatCompletion = async (req, res) => {
+  res.on("error", (e) => { /* 防止 write after end 成為未捕獲異常 */ });
   const { stream, model } = req.body;
 
   const enable_thinking = req.enable_thinking;
   const enable_web_search = req.enable_web_search;
 
-  // P0: 等待併發許可 — 保護 waf-proxy 不被淹沒
-  await acquireOutgoing();
   try {
     const response_data = await sendChatRequest(req.body);
 
     if (!response_data.status || !response_data.response) {
-      const errDetail = response_data.error || "未知錯誤";
-      const userMsg = response_data.userMessage;
-      res.status(503).json({
-        error: userMsg || `請求傳送失敗: ${errDetail}`,
-        detail: errDetail,
-        hint:
-          errDetail === "no_token"
-            ? "Token 已過期，系統正在背景自動更新（auto-get-token.js）。請稍後再試，或手動執行: cd qwen2api && bun auto-get-token.js"
-            : undefined,
+      // ═══ Fix 2026-10-18: challenge / 熔斷 → 503 + Retry-After（可重試的過載）═══
+      // 舊邏輯一律 500「Request failed」，client 不知道是暫時性問題還是永久故障，
+      // 只能立刻重試 → 在被風控的 IP 上 hammer Qwen，讓封鎖越拖越久。
+      const waf = buildUpstreamErrorResponse(response_data.error);
+      if (waf) {
+        res.set("Retry-After", String(waf.retryAfter));
+        res.status(waf.status).json(waf.body);
+        return;
+      }
+      res.status(500).json({
+        error: "Request failed",
       });
       return;
     }
 
     if (stream) {
       setResponseHeaders(res, true);
-      // P0-2: 傳遞 abortController 以支援客戶端斷線中止
-      const abortController = new AbortController();
-      req.on("close", () => {
-        if (!res.writableEnded) {
-          abortController.abort();
-          logger.info("客戶端請求中斷，中止上游", "CHAT");
-        }
-      });
       await handleStreamResponse(
         res,
         response_data.response,
@@ -1061,7 +1401,7 @@ const handleChatCompletion = async (req, res) => {
         {
           has_tools: req.has_tools,
           tool_choice: req.tool_choice,
-          abortController,
+          currentAccount: response_data.currentAccount,
         },
       );
     } else {
@@ -1073,22 +1413,37 @@ const handleChatCompletion = async (req, res) => {
         enable_web_search,
         model,
         req.body,
-        { has_tools: req.has_tools, tool_choice: req.tool_choice },
+        {
+          has_tools: req.has_tools,
+          tool_choice: req.tool_choice,
+          currentAccount: response_data.currentAccount,
+        },
       );
     }
   } catch (error) {
-    logger.error("聊天處理錯誤", "CHAT", "", error);
-    const isAuth =
-      error.message?.includes("401") ||
-      error.message?.includes("403") ||
-      error.message?.includes("token");
-    res.status(500).json({
-      error: isAuth
-        ? "token無效,請求傳送失敗"
-        : `請求傳送失敗: ${error.message || "未知錯誤"}`,
-    });
-  } finally {
-    releaseOutgoing(); // P0: 釋放併發許可
+    // ═══ Fix 2026-07-08: error.message 直接嵌入 log 字串 ═══
+    logger.error(`聊天處理錯誤: ${error?.message || error}`, "CHAT", "", error);
+    if (!res.headersSent) {
+      try {
+        res.status(500).json({
+          error: "Invalid token, request failed",
+        });
+      } catch (_) {}
+    } else {
+      // SSE 已開始：補寫 error 幀 + [DONE] 收尾，避免 client 掛死
+      safeWrite(
+        res,
+        `data: ${JSON.stringify({
+          error: {
+            message: error?.message || "Service error",
+            type: "upstream_error",
+            code: "upstream_error",
+          },
+        })}\n\n`,
+      );
+      safeWrite(res, `data: [DONE]\n\n`);
+      safeEnd(res);
+    }
   }
 };
 

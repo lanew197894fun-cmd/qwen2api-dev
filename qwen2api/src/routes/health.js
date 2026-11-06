@@ -2,19 +2,8 @@ const express = require("express");
 const router = express.Router();
 const config = require("../config/index.js");
 const { logger } = require("../utils/logger");
-const { gracefulShutdown } = require("../graceful-shutdown");
 const fs = require("fs");
 const path = require("path");
-
-// 動態載入 Redis 客戶端（僅在 redis 模式下可用）
-let redisClient = null;
-try {
-  if (config.dataSaveMode === "redis") {
-    redisClient = require("../utils/redis.js");
-  }
-} catch (err) {
-  logger.warn("Redis 模組載入失敗，健康檢查將跳過 Redis", "HEALTH");
-}
 
 // 健康檢查端點
 router.get("/health", async (req, res) => {
@@ -24,10 +13,6 @@ router.get("/health", async (req, res) => {
     service: "qwen2api",
     version: require("../../package.json").version,
     checks: {},
-    connections: {
-      active: gracefulShutdown.activeCount,
-      shuttingDown: gracefulShutdown.isShuttingDown,
-    },
   };
 
   // 檢查服務基本狀態
@@ -87,29 +72,21 @@ router.get("/health", async (req, res) => {
   }
 
   // 檢查 Redis 連線 (如果配置了 Redis)
-  if (config.dataSaveMode === "redis" && redisClient) {
+  if (config.redisURL && config.dataSaveMode === "redis") {
     try {
-      const status = redisClient.getConnectionStatus();
-      if (status.connected) {
-        healthStatus.checks.redis = {
-          status: "ok",
-          message: "Redis connected",
-          details: status,
-        };
-      } else {
-        healthStatus.status = "warning";
-        healthStatus.checks.redis = {
-          status: "warning",
-          message: `Redis disconnected (status: ${status.status})`,
-          details: status,
-        };
-        logger.warn("Health check Redis disconnected", "HEALTH", { status });
-      }
+      // 這裡應該實際檢查 Redis 連線
+      // 為了簡化，我們假設如果配置了 Redis URL 則嘗試連線
+      // 實際實現應該使用 redis 客戶端進行 ping 檢查
+      healthStatus.checks.redis = {
+        status: "warning",
+        message: "Redis health check not implemented yet",
+        note: "Redis configuration detected but health check not implemented",
+      };
     } catch (error) {
       healthStatus.status = "error";
       healthStatus.checks.redis = {
         status: "error",
-        message: "Redis health check failed",
+        message: "Redis connection failed",
         error: error.message,
       };
       logger.error("Health check Redis failed", "HEALTH", {}, error);

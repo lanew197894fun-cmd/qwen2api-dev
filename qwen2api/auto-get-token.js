@@ -4,14 +4,12 @@ const path = require("path");
 const http = require("http");
 const { execSync, spawn } = require("child_process");
 const readline = require("readline");
-const { encrypt } = require("./src/utils/encryption");
 
 const DATA_FILE = path.join(__dirname, "data/data.json");
 const CHROME_DIR = path.join(__dirname, ".chrome-qwen-profile");
 const DEBUG_PORT = 9223;
 const MAX_WAIT = 180;
 
-// JWT payload 解碼（僅解碼不驗證簽名）
 function decodeJwt(token) {
   try {
     const payload = token.split(".")[1];
@@ -24,12 +22,21 @@ function decodeJwt(token) {
   }
 }
 
-// 日誌輔助
 const log = (msg) => console.log(msg);
 const error = (msg) => console.error(msg);
 
 async function findChrome() {
   const isWin = process.platform === "win32";
+  // 環境變數優先（最高優先級）
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    if (fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH))
+      return process.env.PUPPETEER_EXECUTABLE_PATH;
+    log(
+      `⚠️  PUPPETEER_EXECUTABLE_PATH 指向不存在的路徑: ${process.env.PUPPETEER_EXECUTABLE_PATH}`,
+    );
+  }
+
+  const home = require("os").homedir();
   const paths = isWin
     ? [
         process.env["ProgramFiles"] +
@@ -37,19 +44,46 @@ async function findChrome() {
         process.env["ProgramFiles(x86)"] +
           "\\Google\\Chrome\\Application\\chrome.exe",
         path.join(
-          require("os").homedir(),
+          home,
           "AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
         ),
       ]
     : [
         "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium-browser",
         "/usr/bin/chromium",
         "/snap/bin/chromium",
+        // AnduinOS / Flatpak / 自行安裝的佈局
+        path.join(home, ".local/bin/google-chrome"),
+        "/app/bin/google-chrome",
+        // puppeteer cache（AnduinOS 實際安裝位置）
+        path.join(
+          home,
+          ".cache/puppeteer/chrome/linux-151.0.7922.34/chrome-linux64/chrome",
+        ),
       ];
+
   for (const p of paths) {
     if (fs.existsSync(p)) return p;
   }
+
+  // 動態掃描 puppeteer cache（版本會隨時間變動）
+  const cacheRoot = path.join(home, ".cache/puppeteer/chrome");
+  if (fs.existsSync(cacheRoot)) {
+    const versions = fs
+      .readdirSync(cacheRoot)
+      .filter((d) => d.startsWith("linux-"))
+      .sort()
+      .reverse();
+    for (const v of versions) {
+      for (const rel of ["chrome-linux64/chrome", "chrome-linux/chrome"]) {
+        const cand = path.join(cacheRoot, v, rel);
+        if (fs.existsSync(cand)) return cand;
+      }
+    }
+  }
+
   return null;
 }
 
@@ -91,40 +125,43 @@ async function main() {
   }
   log("✅ Chrome: " + chrome);
 
-  // 嘗試連線已執行的 Chrome
   log("🔗 嘗試連線已執行的 Chrome...");
   let token = await tryExtractToken("http://localhost:9222");
   if (token) {
     log("\n✅ 從已執行的 Chrome 提取 Token 成功！");
-    updateDataFile(token);
-    restartQwen2API();
+    if (updateDataFile(token)) {
+      restartQwen2API();
+      return;
+    }
+    showFinish();
     return;
   }
 
   token = await tryExtractToken(`http://localhost:${DEBUG_PORT}`);
   if (token) {
     log("\n✅ 從 Qwen Chrome Profile 提取 Token 成功！");
-    updateDataFile(token);
-    restartQwen2API();
+    if (updateDataFile(token)) {
+      restartQwen2API();
+      return;
+    }
+    showFinish();
     return;
   }
 
-  // ─── Headless Chrome 模式：無頭啟動，嘗試用快取 session 取得 token ───
-  // 先嘗試 headless 模式（適合背景/SSH 環境），無需使用者互動
-  // 若 headless 成功提取 token，直接更新並重啟，跳過 GUI 流程
-  // 若 headless 失敗（session 過期等），降級到 GUI 模式讓使用者手動登入
   log("📝 未找到已連線 Chrome，啟動 Headless 模式...");
   if (!fs.existsSync(CHROME_DIR)) fs.mkdirSync(CHROME_DIR, { recursive: true });
 
   const headlessToken = await tryHeadlessExtraction(chrome);
   if (headlessToken) {
     log("\n✅ Headless 模式提取 Token 成功！");
-    updateDataFile(headlessToken);
-    restartQwen2API();
+    if (updateDataFile(headlessToken)) {
+      restartQwen2API();
+      return;
+    }
+    showFinish();
     return;
   }
 
-  // ─── GUI 模式降級：開啟 Chrome 視窗，等待使用者手動登入 ───
   log("\n⚠️ Headless 模式無法取得 Token（快取 session 可能已過期）");
   log("📝 降級到 GUI 模式，啟動 Chrome 視窗...");
 
@@ -166,9 +203,11 @@ async function main() {
         const t = await target.evaluate(() => localStorage.getItem("token"));
         if (t && t.startsWith("eyJ")) {
           log("\n✅ Token 提取成功！");
-          updateDataFile(t);
-          await browser.disconnect();
-          restartQwen2API();
+          if (updateDataFile(t)) {
+            restartQwen2API();
+            return;
+          }
+          showFinish();
           return;
         }
       }
@@ -182,25 +221,10 @@ async function main() {
   process.exit(1);
 }
 
-/**
- * Headless Chrome 提取 Token
- * 使用 Puppeteer v25 headless 模式啟動 Chrome，載入已快取的 .chrome-qwen-profile，
- * 導航到 chat.qwen.ai，從 localStorage 提取 token。
- *
- * 流程：
- * 1. 嘗試 headless 啟動（60 秒整體超時保護）
- * 2. 若 Chrome profile 被鎖定 → 自動殺掉殘留 Chrome 行程 → 重試一次
- * 3. 若 headless 成功提取 token → 直接更新並重啟
- * 4. 若 headless 失敗（session 過期等）→ 回傳 null → 降級到 GUI 模式
- *
- * 注意：此方式只在 Chrome profile 仍有有效 session cookie 時才能成功。
- * 若 GitHub/Qwen session 已過期，headless 無法登入，需降級到 GUI 模式。
- */
 async function tryHeadlessExtraction(chromePath, retried = false) {
   let browser;
   let overallTimer;
   try {
-    // ⏱️ 60 秒整體超時保護（避免 Chrome 啟動過久或頁面卡住）
     const timeout = new Promise((_, reject) => {
       overallTimer = setTimeout(
         () => reject(new Error("Headless extraction timeout (60s)")),
@@ -211,9 +235,9 @@ async function tryHeadlessExtraction(chromePath, retried = false) {
     const work = (async () => {
       browser = await puppeteer.launch({
         executablePath: chromePath,
-        headless: true, // Puppeteer v25 新模式，完整支援 JS/Storage
+        headless: true,
         userDataDir: CHROME_DIR,
-        timeout: 30000, // launch 本身超時
+        timeout: 30000,
         args: [
           "--no-first-run",
           "--no-default-browser-check",
@@ -229,7 +253,6 @@ async function tryHeadlessExtraction(chromePath, retried = false) {
         timeout: 20000,
       });
 
-      // 等待 localStorage 可用（頁面有可能非同步初始化）
       await sleep(2000);
 
       const token = await page.evaluate(() => localStorage.getItem("token"));
@@ -254,7 +277,6 @@ async function tryHeadlessExtraction(chromePath, retried = false) {
       } catch {}
     }
 
-    // 🔧 Chrome profile 被鎖定 → 殺掉殘留 Chrome 行程 → 重試一次
     const msg = e.message || "";
     const isLocked =
       msg.includes("profile") ||
@@ -270,7 +292,6 @@ async function tryHeadlessExtraction(chromePath, retried = false) {
       return tryHeadlessExtraction(chromePath, true);
     }
 
-    // headless 失敗，回傳 null 降級到 GUI
     log(
       `⚠️  Headless 提取失敗${isLocked ? "（已重試仍失敗）" : ""}: ${msg.slice(0, 80)}`,
     );
@@ -278,9 +299,6 @@ async function tryHeadlessExtraction(chromePath, retried = false) {
   }
 }
 
-/**
- * 殺掉使用 CHROME_DIR profile 的殘留 Chrome 行程
- */
 function killStaleChrome() {
   const isWin = process.platform === "win32";
   try {
@@ -290,7 +308,6 @@ function killStaleChrome() {
         stdio: "ignore",
       });
     } else {
-      // 只殺使用我們 profile 的 Chrome 行程（避免誤殺其他瀏覽器）
       execSync(
         `ps aux | grep '${CHROME_DIR}' | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true`,
         { timeout: 3000, stdio: "ignore" },
@@ -307,56 +324,110 @@ function updateDataFile(token) {
     data.accounts = [{}];
   }
 
-  // 保留現有密碼，不清空
+  // token 未變則跳過重啟
+  const oldToken = data.accounts[0]?.token || "";
+  if (token === oldToken) {
+    log("📁 Token 未變更，跳過重啟");
+    return false;
+  }
+
   const existingPassword = data.accounts[0]?.password || "";
 
-  // 從 JWT 解碼真實過期時間，而非硬編碼 7 天
   const decoded = decodeJwt(token);
   const expires = decoded?.exp
     ? decoded.exp
     : Math.floor(Date.now() / 1000) + 86400 * 7;
 
   data.accounts[0].email = data.accounts[0].email || "github-user@qwen.ai";
-  data.accounts[0].password = encrypt(existingPassword);
-  data.accounts[0].token = encrypt(token);
+  data.accounts[0].password = existingPassword;
+  data.accounts[0].token = token;
   data.accounts[0].expires = expires;
-  // refresh_method = "browser" 表示此 token 透過 Chrome 瀏覽器取得
-  // 當 token 過期時，系統應重新執行 auto-get-token.js，而非嘗試密碼登入
   data.accounts[0].refresh_method = "browser";
 
-  // 設定 0600 權限後寫入
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });
   log("📁 已更新 data.json，到期: " + new Date(expires * 1000).toISOString());
+  return true;
 }
 
 function checkServer(cb) {
   const req = http.get("http://localhost:3000/v1/models", (res) => {
-    if (res.statusCode === 200) {
+    if (res.statusCode >= 200 && res.statusCode < 500) {
       cb(true);
     } else {
       cb(false);
     }
   });
   req.on("error", () => cb(false));
+  req.setTimeout(5000, () => {
+    req.destroy();
+    cb(false);
+  });
+}
+
+function getPids(port) {
+  const isWin = process.platform === "win32";
+  try {
+    if (isWin) {
+      const out = execSync(
+        `for /f "tokens=5" %a in ('netstat -ano ^| findstr :${port}') do @echo %a`,
+        { timeout: 3000, encoding: "utf8" },
+      );
+      return [
+        ...new Set(
+          out
+            .trim()
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean),
+        ),
+      ];
+    }
+    const out = execSync(`lsof -ti :${port} 2>/dev/null`, {
+      timeout: 3000,
+      encoding: "utf8",
+    }).trim();
+    return out
+      ? [
+          ...new Set(
+            out
+              .split("\n")
+              .map((l) => l.trim())
+              .filter(Boolean),
+          ),
+        ]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function killPids(pids, signal) {
+  for (const pid of pids) {
+    try {
+      execSync(`kill -${signal} ${pid} 2>/dev/null`, { timeout: 3000 });
+    } catch (_) {}
+  }
 }
 
 function killPort(port) {
-  const isWin = process.platform === "win32";
   const p = parseInt(port, 10);
   if (isNaN(p)) return;
-  try {
-    if (isWin) {
-      execSync(
-        `for /f "tokens=5" %a in ('netstat -ano ^| findstr :${p}') do @taskkill /F /PID %a 2>nul`,
-        { timeout: 3000, stdio: "ignore" },
-      );
-    } else {
-      execSync(`kill -9 $(lsof -ti:${p}) 2>/dev/null`, {
-        timeout: 3000,
-        stdio: "ignore",
-      });
-    }
-  } catch (_) {}
+  const pids = getPids(p);
+  if (!pids.length) return;
+  killPids(pids, "TERM");
+  for (let i = 0; i < 5; i++) {
+    const alive = pids.filter((pid) => {
+      try {
+        execSync(`kill -0 ${pid} 2>/dev/null`, { timeout: 1000 });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (!alive.length) return;
+    execSync("sleep 1", { timeout: 1000, stdio: "ignore" });
+  }
+  killPids(pids, 9);
 }
 
 function restartQwen2API() {
@@ -364,11 +435,9 @@ function restartQwen2API() {
   const isWin = process.platform === "win32";
   const BUN = isWin ? "bun.exe" : "bun";
 
-  // 溫柔停止舊服務：發送 SIGTERM，給 5 秒優雅關閉
   log("   停止舊服務（埠 3000）...");
   killPort(3000);
 
-  // 等待埠釋放（最多 10 秒）
   log("   等待埠釋放...");
   for (let i = 0; i < 10; i++) {
     try {
@@ -390,8 +459,6 @@ function restartQwen2API() {
     }
   }
 
-  // ⚠️ 修復：使用 Bun 啟動（與 qwen2api-dev/start.js 一致）
-  //   避免 PM2/Node 啟動方式與 Bun 衝突導致埠被爭搶
   log("🚀 使用 Bun 啟動新服務...");
   const cp = spawn(BUN, ["src/start.js", "--force"], {
     cwd: __dirname,
@@ -401,7 +468,6 @@ function restartQwen2API() {
   });
   cp.unref();
 
-  // 檢查服務狀態
   checkAndFinish();
 }
 
@@ -433,10 +499,15 @@ function checkAndFinish() {
   setTimeout(tryConnect, 3000);
 }
 
+function showFinish() {
+  log(`   📍 ${__dirname}`);
+  log("   ▶️  bun src/start.js --force");
+  finish();
+}
+
 function finish() {
   log("\n\n🎉 所有操作已完成！");
 
-  // AUTO_TRIGGER=true 或無 TTY（背景觸發）→ 直接退出
   if (process.env.AUTO_TRIGGER === "true" || !process.stdin.isTTY) {
     process.exit(0);
   }
