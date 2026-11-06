@@ -6,6 +6,19 @@
 
 Qwen2API 是千問模型的本地 API 代理系統，提供 OpenAI 相容的聊天完成端點，支援工具呼叫（MCP）、模型路由、自我學習、自主進化等進階功能。
 
+## 跨裝置支援
+
+本專案支援 **Linux 與 Windows**（亦相容 macOS），依 `process.platform` 自動切換路徑與啟動方式：
+
+| 平台    | 啟動方式                              | 專案根目錄                     | 對應裝置                  |
+| ------- | ------------------------------------- | ------------------------------ | ------------------------- |
+| Linux   | `bash start.sh` / `bun run dev`       | `~/opencode-manager`           | 筆電（開發機，AnduinOS）   |
+| Windows | `start-desktop.bat` / `start.ps1`     | `D:\opencode\opencode-manager` | 桌機（主力機，Windows 11） |
+
+- 跨裝置是指**本機路徑依平台自動切換**，不是遠端連線（唯一對外：Telegram Bot 綁 `0.0.0.0`，其餘綁 `127.0.0.1`）
+- Windows 下 `start.sh` 等同 `start.ps1`，啟動器 `start.mjs` 內建平台分支與埠清理邏輯
+- 詳細規範見 [AGENTS.md](AGENTS.md)（含裝置對照表與路徑切換規則）
+
 ## 子專案
 
 | 子專案                   | 埠   | 功能                                                       |
@@ -19,7 +32,9 @@ Qwen2API 是千問模型的本地 API 代理系統，提供 OpenAI 相容的聊�
 
 ```bash
 # 一鍵啟動全部服務
-bash start.sh
+bash start.sh              # Linux
+start-desktop.bat          # Windows（背景執行）
+start-desktop.vbs          # Windows（靜默後台）
 
 # 或使用 bun
 bun run dev
